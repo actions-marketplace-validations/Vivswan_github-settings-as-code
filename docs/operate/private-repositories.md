@@ -1,3 +1,7 @@
+---
+order: 230
+---
+
 # Private repositories
 
 When a run manages repositories more private than its own logs, the details it prints become a leak. This page covers the `private-repos` redaction that closes that leak, what a redacted run still shows, and the `private-report` channels that deliver the full detail privately. It matters to anyone whose admin repository is public (or merely less restricted) while some of its multi-repo targets are private or internal.
@@ -18,7 +22,25 @@ The decision comes down to the policy and what the visibility probe finds:
 
 ## What a redacted run still shows
 
-Redaction hides values, not the shape of the outcome. The public surfaces still carry the safe skeleton of each target. The step summary shows, per target, the overall result (`applied`, `partial`, `clean`, `drift`, `failed`, `skipped`), each section's key and status, and the HTTP status code on a failed or skipped section; the `repos-result` output carries `{result, source, skippedSections}` per target, keyed by the placeholder. These are closed enumerations and numeric codes, safe to show, and enough to tell whether the fleet is healthy and which section broke. What they never carry is the slug, a live setting, a desired setting, or an API error message.
+Redaction hides values, not the shape of the outcome. The public surfaces still carry the safe skeleton of each target. The step summary shows, per target, the overall result (`failed`, `drift`, `partial`, `skipped`, `applied`, `clean`, `snapshot`), each section's key and status, and the HTTP status code on a failed or skipped section; the `repos-result` output carries `{result, source, skipped-sections}` per target, keyed by the placeholder. These are closed enumerations and numeric codes, safe to show, and enough to tell whether the fleet is healthy and which section broke. What they never carry is the slug, a live setting, a desired setting, or an API error message.
+
+## One seal, every mode
+
+Every target ends the same way, whichever mode ran it: its lines and its end state go through one channel, which closes open for a shown target and sealed for a hidden one. Only the seal's projections open it, and they render the public view alone. No mode has a redaction path of its own.
+
+| Mode | What the seal holds | What the public view shows |
+|---|---|---|
+| `repository:` apply or check (one target) | the slug, section detail, the transcript | `private repository #1`, section statuses, the one-line result |
+| `repos` / `repos-dir` apply or check | the same, per target | `private repository #N` in target order |
+| `snapshot-file` (one target) | the slug, the notes (a secret's name, a webhook's URL), the file path, the transcript | `private repository #1`, section statuses; the document reaches only the file |
+| `snapshot-dir` | the same, per target | `private repository #N`; the File column reads `hidden (private repository)` |
+
+Two consequences of the shared path:
+
+- The label is `private repository #N` in every mode. A run over one repository is a fleet of one, so its label is `#1`, in the log line, the withheld-report notice, and the `artifact` report heading alike.
+- A hidden target that fails, drifts, or is skipped gets one closed-value annotation (`private repository #N: failed - labels (403). details hidden: ...`), in snapshot mode too. A healthy hidden target says nothing.
+
+The sealed transcript is what a private report mirrors. Snapshot mode rejects `private-report`, so its sealed transcript is never delivered anywhere: the written file is the private record, and the [snapshot guide](snapshot.md#many-repositories) says what to do with it on a public admin repository.
 
 ## Seeing the full detail
 
@@ -40,11 +62,16 @@ The third is to have the run deliver a private report, described next.
 
 ## Delivering a private report
 
-`private-report` sends the full unredacted report for each redacted target through a channel whose access control is not the public run. It defaults to `private-report: none`, which delivers nothing. Any other channel applies only to redacted targets, and only to those the visibility probe proves private or internal: an unknown visibility is redacted from the public view but excluded from delivery, so the report never reaches a repository that might be public. It is rejected alongside `private-repos: show`. The report mirrors the run's log, delivery stays live in `mode: check`, and a delivery failure only warns; it never changes the target's or the run's result.
+`private-report` sends the full unredacted report for each redacted target through a channel whose access control is not the public run; the default, `private-report: none`, sends nothing. Any other channel applies only to redacted targets, and only to those the visibility probe proves private or internal: an unknown visibility is redacted from the public view but excluded from delivery, so the report never reaches a repository that might be public. It is rejected alongside `private-repos: show`. The report mirrors the run's log, delivery stays live in `mode: check`, and a delivery failure only warns; it never changes the target's or the run's result.
 
-`private-report: issue` posts each target's report to a reused issue on that target repository, where the repository's own access control protects it. The action finds the issue by a marker label, replaces the body every run, and opens the issue when the target fails or drifts and closes it when the target is healthy. This needs the PAT to hold `"Issues"` (read and write) on every target repository, on top of the section permissions. Prefer this channel unless your readers lack GitHub access to the targets.
+`private-report: issue` posts each target's report to a reused issue on that target repository, where the repository's own access control protects it. Prefer this channel unless your readers lack GitHub access to the targets.
 
-`private-report: issue-on-failure` is the quiet variant of `issue`. When a target fails (or drifts in check mode) it behaves identically: the reused, marker-labelled report issue is written and opened. On a healthy run it only looks up an open report issue; one left over from an earlier failure is updated with the healthy report and closed, and when there is none, nothing is written - no issue, no label, zero notification noise. A repository that never fails never sees an issue, at the cost that healthy runs' reports are not delivered anywhere; choose `issue` or `artifact` when you need the report mirror on every run.
+- **Which issue:** found by the marker label, or by its exact title when someone removed the label. Either way it must be one of the action's own reports: the body carries the report heading. A same-titled issue you opened by hand is left alone, unless its body pastes a report verbatim.
+- **Whose issue:** the creator does not matter, so a rotated PAT reuses the issue instead of opening a second one. With several reports, an open one wins, then the newest.
+- **Each run:** the body is replaced; the issue opens when the target fails or drifts and closes when it is healthy. The run log announces every write with the placeholder, never the slug: `report: updated issue #7 in private repository #1` (or `created`), and `report: created label "settings-as-code-report" in private repository #1` when the delivery creates the marker label. A write that landed before a later step failed is announced the same way, ahead of the warning.
+- **Permission:** the PAT needs `"Issues"` (read and write) on every target repository, on top of the section permissions.
+
+`private-report: issue-on-failure` is the quiet variant of `issue`. When a target fails (or drifts in check mode) it behaves identically: the reused, marker-labelled report issue is written and opened. On a healthy run it only looks up an open report issue; one left over from an earlier failure is updated with the healthy report and closed, and when there is none, nothing is written - no issue, no label, zero notification noise - and the log says so: `report: nothing to deliver for private repository #1`. A repository that never fails never sees an issue, at the cost that healthy runs' reports are not delivered anywhere; choose `issue` or `artifact` when you need the report mirror on every run.
 
 Two caveats on the quiet variant. If the settings declare a `labels` section, the `settings-as-code-report` marker label is still injected into it, so the apply creates the label even on healthy repositories (a label, not a notification). And if someone removes the marker label while a report issue is open, the healthy path cannot find the issue, so it stays open until the next failing run recreates the label and reclaims it. Everything else matches `issue`: the same delivery gate, the same Issues grant (the healthy lookup is a read; the open and close are writes), and delivery still runs in `mode: check`.
 
@@ -56,9 +83,9 @@ Access control on the artifact channel is key possession, so the key setup matte
 age-keygen -o key.txt
 ```
 
-`key.txt` holds the secret identity; keep it off GitHub. The command also prints the public recipient (`age1...`), which is safe to commit. Pass that recipient as `report-public-key`. It is required when `private-report` is `artifact` and rejected otherwise; a malformed recipient fails the run at startup.
+`key.txt` holds the secret identity; keep it off GitHub. The command also prints the public recipient (`age1...`), safe to commit: pass it as `report-public-key`. It is required when `private-report` is `artifact` and rejected otherwise; a malformed recipient fails the run at startup.
 
-To read a report, download and decrypt. The browser "Download" button gives a ZIP; unzip it, then decrypt with the identity file (or use `gh run download`, which extracts the artifact for you):
+To read a report, download the artifact (the browser gives a ZIP to unzip; `gh run download` extracts it) and decrypt it with the identity file:
 
 ```bash
 gh run download <run-id> -n settings-as-code-private-report

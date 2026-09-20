@@ -1,8 +1,12 @@
+---
+order: 30
+---
+
 # Examples
 
-A cookbook of settings.yml files. Every settings example on this page runs through the real document validation in CI, so the shapes stay current. What each section manages, which token permission it needs, and whether its undeclared entries are deleted or kept is specified in the [README Sections table](../../README.md#sections); the cross-section rules live under [Semantics](../reference/semantics.md). This page shows shapes, not behavior.
+A cookbook of settings.yml files. Every settings example on this page runs through the real document validation in CI, so the shapes stay current. What each section manages, which token permission it needs, and whether its undeclared entries are deleted or kept is specified in the [Sections table](../reference/sections.md); the cross-section rules live under [Semantics](../reference/semantics.md). This page shows shapes, not behavior.
 
-One rule frames everything below: only declared keys are applied or compared. A section, or a field inside one, that the file does not mention is never touched. The rule has edges worth knowing. Some list entries are one full payload: a declared ruleset is applied with a full-payload PUT, so a partial ruleset entry silently narrows the live one; declare each ruleset completely. Labels and milestones work the other way: only the fields you declare are sent, so an omitted description or state is left alone. And two sections bend the rule where the API forces their hand, as the [Sections table](../../README.md#sections) notes: inside a declared `protection` object the classic API requires all four core keys, so apply fills the ones you omit with `null` (see [Classic branch protection](#classic-branch-protection) below), and in the `actions` section, declaring any base permissions key (or `selected_actions`, which infers `allowed_actions: selected`) makes the base PUT carry `enabled: true` unless the file says otherwise, while retention-, cache-, workflow-token-, or access-only declarations leave the base policy alone.
+One rule frames everything below: only declared keys are applied or compared. A section, or a field inside one, that the file does not mention is never touched. The rule has edges worth knowing. Some list entries are one full payload: a declared ruleset is applied with a full-payload PUT, so a partial ruleset entry silently narrows the live one; declare each ruleset completely. Labels and milestones work the other way: only the fields you declare are sent, so an omitted description or state is left alone. And two sections bend the rule where the API forces their hand, as the [Sections table](../reference/sections.md) notes: inside a declared `protection` object the classic API requires all four core keys, so apply fills the ones you omit with `null` (see [Classic branch protection](#classic-branch-protection) below), and in the `actions` section, declaring any base permissions key (or `selected_actions`, which infers `allowed_actions: selected`) makes the base PUT carry `enabled: true` unless the file says otherwise, while retention-, cache-, workflow-token-, or access-only declarations leave the base policy alone.
 
 ## A minimal file
 
@@ -276,15 +280,14 @@ branches:
     protection: null
 ```
 
-Under a multi-repo defaults file, a target's `null` section can instead mean "opt out of the defaults for this repository"; the rules for that merge are in the [multi-repo guide](../operate/multi-repo.md). A few individual fields accept `null` as a value of their own too, such as `pages.cname` to remove a custom domain; the [published schema](../../lib/settings.schema.json) marks those.
+In a `mode: merge` fold, a `null` over a key a lower layer declared removes that key from the merged document instead; the [layering guide](../operate/layering.md) has the rules. A multi-repo `defaults-file` never merges into a target's file, so a `null` there keeps the meanings above. A few individual fields accept `null` as a value of their own too, such as `pages.cname` to remove a custom domain; the [published schema](https://github.com/Vivswan/github-settings-as-code/blob/main/lib/settings.schema.json) marks those.
 
-## Private notes
+## Notes in the file
 
-Unknown top-level sections are hard errors, so a typo cannot silently do nothing (the one exception: under a `sections` allowlist, unknown keys outside the allowlist warn instead of failing, which eases version skew; the [troubleshooting guide](../operate/troubleshooting.md) covers it). Keys starting with an underscore are the escape hatch: they are ignored, which makes them usable as private notes.
+Unknown top-level sections are hard errors, so a typo cannot silently do nothing (the one exception: under a `sections` allowlist, unknown keys outside the allowlist warn instead of failing, which eases version skew; the [troubleshooting guide](../operate/troubleshooting.md) covers it). An underscore key is not an escape hatch: the underscore marks this action's two directives, `_layering` and `_undeclared` (the [layering guide](../operate/layering.md) owns them), and any other underscore key fails validation the same way. A note belongs in a YAML comment:
 
 ```yaml settings
-_owner: platform-team, see runbook RB-112
-
+# owner: platform-team, see runbook RB-112
 labels:
   - name: bug
     color: "d73a4a"
@@ -292,4 +295,4 @@ labels:
 
 ## Where to go next
 
-[Check mode](../operate/check-mode.md) is the safe way to try any of these files against a real repository before applying. [Multi-repo mode](../operate/multi-repo.md) reuses the same documents across a fleet, and [the undeclared policy](../reference/undeclared-policy.md) explains what happens to live resources these files do not declare, and the `undeclared` knob that changes it.
+[Check mode](../operate/check-mode.md) is the safe way to try any of these files against a real repository before applying. [Multi-repo mode](../operate/multi-repo.md) reuses the same documents across a fleet, [layering](../operate/layering.md) folds several files into one, and [the undeclared policy](../reference/undeclared-policy.md) explains what happens to live resources these files do not declare, and the `_undeclared` knob that changes it.

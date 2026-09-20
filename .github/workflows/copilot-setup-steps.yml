@@ -2,7 +2,7 @@
 # job below (it MUST be named copilot-setup-steps) to prepare its
 # development environment before working on this repository. Triggered on
 # edits to itself so changes are validated in CI. Generated once by
-# Vivswan/repo-platform and never overwritten by template
+# the fleet sync and never overwritten by a later
 # sync: add whatever setup the agent needs (dependencies, generated files,
 # environment checks).
 
@@ -21,10 +21,8 @@ permissions:
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
+    # The most Copilot accepts for this job (its documented ceiling); the setup itself takes seconds.
     timeout-minutes: 59
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: oven-sh/setup-bun@v2
-      - name: Install dependencies (bun)
-        run: bun install --frozen-lockfile
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup

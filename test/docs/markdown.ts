@@ -1,20 +1,9 @@
-/**
- * Small markdown helpers shared by the docs contract tests: pull the lines of
- * a named "## heading" section, parse a markdown table's body rows into
- * trimmed cells, and extract fenced code blocks by info string. Kept forgiving
- * of column widths so a reflowed table does not break the tests over
- * whitespace.
- */
-
 /** The contents of every fenced code block whose info string is exactly `info`. */
 export function fencedBlocks(markdown: string, info: string): string[] {
   const blocks: string[] = [];
   const escaped = info.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // Leading whitespace is tolerated and stripped (the README nests fences
-  // inside list items, indenting fence and body alike), and longer fences
-  // close per CommonMark (the closer carries at least the opener's length).
-  // The guides additionally pin their fences to column zero, three backticks
-  // exactly, so this extractor cannot miss a docs/ block.
+  // Leading whitespace is stripped (the README nests fences inside list items) and longer fences close per CommonMark; the guides additionally pin
+  // column-zero triple backticks, so this extractor cannot miss a docs/ block.
   const re = new RegExp(
     `^([ \\t]*)(\`{3,})${escaped}[ \\t]*\\n([\\s\\S]*?)^[ \\t]*\\2\`*[ \\t]*$`,
     "gm",
@@ -44,21 +33,4 @@ export function sectionLines(markdown: string, heading: string, source: string):
   const rest = lines.slice(start + 1);
   const end = rest.findIndex((line) => line.startsWith("## "));
   return end === -1 ? rest : rest.slice(0, end);
-}
-
-/**
- * Parse a markdown table's body rows (skipping the header and the |---| rule)
- * into arrays of trimmed cells.
- */
-export function tableRows(lines: string[]): string[][] {
-  return lines
-    .filter((line) => line.trim().startsWith("|"))
-    .map((line) =>
-      line
-        .split("|")
-        .slice(1, -1)
-        .map((cell) => cell.trim()),
-    )
-    .filter((cells) => cells.length > 0 && !/^-+$/.test(cells[0] ?? ""))
-    .filter((cells) => cells[0] !== "Section" && cells[0] !== "Area" && cells[0] !== "Input");
 }

@@ -1,7 +1,8 @@
 # Check mode, a declared branch that does not exist live: protection probes 404
-# (unprotected), then the advisory branch-existence probe (Contents-gated) also
-# 404s, so the section pins the definitive "branch does not exist" drift line.
-# No write is attempted.
+# (unprotected), then the advisory branch-existence probe (Contents-gated)
+# answers GitHub's definitive "Branch not found", so the section fails with the
+# one missing-branch advice, the same failure apply meets at the PUT without the
+# Contents grant. No write is attempted.
 name: branches-missing-branch-advisory
 settings:
   branches:
@@ -18,10 +19,10 @@ token_permissions:
   contents: read
 expect:
   exit_code: 1
-  result: drift
+  result: failed
   outcomes:
-    branches: drift
+    branches: failed
   summary_contains:
-    - "the branch does not exist on the repo"
+    - "branches[release]: the declared branch does not exist on the repo, so its protection cannot be applied; create the branch, or remove it from the settings file"
   never:
     - "PUT /repos/{repo}/branches/release/protection"

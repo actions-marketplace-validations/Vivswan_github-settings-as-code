@@ -1,10 +1,13 @@
+---
+order: 390
+---
+
 # Incident freeze and unfreeze
 
 During an incident, merges must stop in minutes and be restored just as fast, with both directions on the record. Two profile files and one dispatch workflow do it. The freeze:
 
 ```yaml settings
-# .github/profiles/freeze.yml
-_incident: INC-4471
+# .github/profiles/freeze.yml, incident INC-4471
 
 rulesets:
   - name: incident freeze

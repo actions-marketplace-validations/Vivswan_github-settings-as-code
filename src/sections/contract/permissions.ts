@@ -1,5 +1,3 @@
-/** Fine-grained-PAT permission vocabulary and the grant prose derived from it. */
-
 /** A fine-grained-PAT permission resource under Repository permissions. */
 export type PatResource =
   | "administration"
@@ -20,11 +18,6 @@ export type PatResource =
   | "agent_variables"
   | "checks";
 
-/**
- * The machine-readable permission a section requires. `repo` lists the
- * fine-grained-PAT Repository permissions where ANY one grants access;
- * `org` names the extra Organization permission a section needs (teams).
- */
 export interface SectionPermission {
   /** Fine-grained PAT repository permissions; ANY one of these grants access. */
   readonly repo: readonly [PatResource, ...PatResource[]];
@@ -32,8 +25,25 @@ export interface SectionPermission {
   readonly org?: "members";
 }
 
+// Declarations are distinct literals, so identity cannot group them: compare as sets.
+export function samePermission(
+  a: SectionPermission | "none",
+  b: SectionPermission | "none",
+): boolean {
+  if (a === "none" || b === "none") {
+    return a === b;
+  }
+  const resources = new Set(a.repo);
+  const others = new Set(b.repo);
+  return (
+    a.org === b.org &&
+    resources.size === others.size &&
+    [...resources].every((resource) => others.has(resource))
+  );
+}
+
 /** Human-facing label for each PAT resource, as shown in the token UI. */
-const RESOURCE_LABEL: Record<PatResource, string> = {
+export const RESOURCE_LABEL: Record<PatResource, string> = {
   administration: "Administration",
   issues: "Issues",
   environments: "Environments",
@@ -53,23 +63,41 @@ const RESOURCE_LABEL: Record<PatResource, string> = {
   checks: "Checks",
 };
 
-/** Human-facing label for each PAT organization resource. */
-const RESOURCE_LABEL_ORG: Record<NonNullable<SectionPermission["org"]>, string> = {
+export const RESOURCE_LABEL_ORG: Record<NonNullable<SectionPermission["org"]>, string> = {
   members: "Members",
 };
 
+// Each PAT resource's query parameter on GitHub's pre-filled token form (the generated token-form
+// link, in this order); total over PatResource, so a new resource names its parameter or records a null exemption.
+export const RESOURCE_SLUGS: Record<PatResource, string | null> = {
+  // The form drops unknown parameters silently (the old variables= spelling failed that way), so every
+  // non-null slug was verified against the live token form on 2026-07-28.
+  administration: "administration",
+  issues: "issues",
+  environments: "environments",
+  pages: "pages",
+  actions: "actions",
+  variables: "actions_variables",
+  webhooks: "repository_hooks",
+  checks: "checks",
+  secrets: "secrets",
+  dependabot_secrets: "dependabot_secrets",
+  codespaces_secrets: "codespaces_secrets",
+  // Verified 2026-08-10 against github/docs src/github-apps/data/fpt-2022-11-28/fine-grained-pat-permissions.json, not the live form.
+  agent_secrets: "agent_secrets",
+  agent_variables: "agent_variables",
+  custom_properties: "repository_custom_properties",
+  secret_scanning_alerts: "secret_scanning_alerts",
+  contents: "contents",
+  // A grant alternative of code_scanning_default_setup; it has no verified token-form parameter today.
+  code_scanning_alerts: null,
+};
+
 /**
- * Render a SectionPermission into the grant prose used verbatim in
- * permission errors. `caveat`, when given, is appended after "; ". `access`
- * names the level the advice asks for: section grants keep the "write"
- * default (a section both reads and writes), while a denial on an endpoint
- * with its own permission override passes the level the SECTION needs on
- * that permission (overrideAdviceLevel: read unless a sibling endpoint
- * writes with it), so the advice never asks for a broader grant than the
- * section can use - nor a narrower one than it will need next. The default
- * output is user-facing error prose: the EXPECTED_GRANT snapshot in
- * test/sections/registry.test.ts pins every section's grant character for
- * character, and the README's Sections table mirrors those grants.
+ * `access` defaults to "write" (a section both reads and writes), and a denial on an override endpoint
+ * passes overrideAdviceLevel (./errors.ts) so the advice asks for exactly the level the section needs.
+ * The output is user-facing and parsed: .github/scripts/gen-docs.ts reads each clause by regex into the PAT column
+ * of docs/reference/sections.md, so a reworded clause fails `bun run build:check` until the regex and the docs follow.
  */
 export function grantFor(
   permission: SectionPermission,

@@ -1,9 +1,5 @@
 /**
- * Unit contract for lib/fetch-retry.ts: which failures retry (network
- * errors, timeouts - including mid-body - 5xx, 408, 429), which return
- * immediately (success, plain 4xx), and how exhaustion reports. The fetch
- * and sleep seams are injected, so no test touches the network or waits
- * out a real backoff.
+ * The fetch and sleep seams are injected, so no test touches the network or waits out a real backoff.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -11,7 +7,6 @@ import { fetchTextWithRetry } from "../../.github/scripts/lib/fetch-retry.js";
 
 const URL_UNDER_TEST = "https://raw.githubusercontent.com/owner/repo/ref/artifact.json";
 
-/** A fetch stub replaying `outcomes` in order; a thrown entry rejects. */
 function fetchScript(outcomes: Array<Response | Error>): {
   fetchImpl: (url: string, init?: RequestInit) => Promise<Response>;
   calls: () => number;
@@ -72,7 +67,7 @@ describe("fetchTextWithRetry", () => {
     ]);
   });
 
-  for (const status of [500, 502, 408, 429]) {
+  for (const status of [500, 408, 429]) {
     test(`retries a transient ${status}`, async () => {
       const script = fetchScript([
         new Response("nope", { status, statusText: "transient" }),

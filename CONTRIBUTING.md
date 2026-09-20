@@ -1,54 +1,56 @@
-# Contributing to github-settings-as-code
+# Contributing to GitHub Settings as Code
 
-Thanks for contributing! This document covers the conventions every change in this repository goes through.
-
-CI, settings, and standards files here (including this document above the marker at the bottom) are managed by [Vivswan/repo-platform](https://github.com/vivswan/repo-platform); local edits to managed files are replaced on the next template sync.
-
-## Pull requests
-
-- Changes land through pull requests and are squash-merged; the PR title becomes the commit subject on the default branch.
-- The PR title and every pushed commit subject must be a [Conventional Commit](https://www.conventionalcommits.org/en/v1.0.0/), for example `feat: add X` or `fix(parser): handle Y`. Releases are versioned from these subjects.
-- By opening a pull request, or offering code in an issue or review for inclusion, you agree to the Contributions section of the [LICENSE.md](LICENSE.md), which licenses that code to the licensor - including for relicensing under any terms - unless you conspicuously say otherwise when you submit it.
-
-## CI
-
-- CI gates on a single status check, `all-green`, which needs every gating CI job (the convention is documented in [repo-platform's all-green guide](https://github.com/vivswan/repo-platform/blob/main/docs/all-green.md)).
-- Repository-specific checks live in `.github/workflows/checks.yml`; run the commands it lists locally before pushing.
-- A typography gate enforces plain ASCII punctuation: no curly quotes, em-dashes, or invisible unicode.
-
-## Security
-
-Never report vulnerabilities in issues or pull requests - see [SECURITY.md](SECURITY.md) for the private reporting route.
-
-## Code of conduct
-
-Participation in this project is governed by the [code of conduct](CODE_OF_CONDUCT.md).
-
-<!-- Repository-specific contributing documentation (dev setup, build and
-     test commands, review expectations) goes below this line. It survives template updates via three-way merge. -->
-<!-- repo-platform:local-section -->
+The fleet-wide conventions - Conventional Commit titles, squash merges, the `all-green` gate, and the code of conduct - are in [Vivswan/.github's CONTRIBUTING.md](https://github.com/Vivswan/.github/blob/main/CONTRIBUTING.md). This page holds what is specific to this repository.
 
 ## Toolchain
 
-`src/` is TypeScript built with [bun](https://bun.com); `lib/` holds one committed generated artifact, `settings.schema.json`, the published settings.yml schema. `bun run build:schema` regenerates it; CI's schema-check job fails on drift. The bundle the action executes, `lib/index.js`, is not committed: `bun run build:bundle` builds it where it is needed (the CI workflows that run the action build it first, and a release builds and ships it on a packaged commit that every `vX.Y.Z` tag, and the moving major with them, points at).
+- `src/` is TypeScript built with [bun](https://bun.com). The scripts in `package.json` are the commands; `bun run check` is the whole local gate.
+- `bun run test`, `bun run test:e2e`, and `bun run fuzz` start with `bun run test:artifacts`, which fetches the two gitignored test artifacts (the trimmed OpenAPI spec, the GraphQL schema) when one is absent or was fetched from a URL other than the one its script builds (the pinned ref, and the API version for the spec). A fresh checkout fetches once (a few seconds); a current file costs no network. CI restores the same files from cache and then runs the same command.
+- Committed generated output is the table in `.github/scripts/generated.ts`: `lib/settings.schema.json`, `src/upstream-gaps/index.ts`, and the generated regions of `action.yml`, `COVERAGE.md`, and the docs pages.
+- `bun run build:check` regenerates every table entry and fails on drift.
+- `lib/index.js` (the action bundle) and `lib/pkg/` (the npm library) are built where they are needed and never committed on `main`. Every runtime dependency is compiled into them.
+- [COVERAGE.md](COVERAGE.md) is the inventory of the supported API surface. A change that adds or extends a section keeps it in step.
 
-Runtime dependencies (such as @octokit/rest with the retry and throttling plugins, @actions/core, zod, and yaml) are compiled into that single bundle.
+## Backward compatibility
 
-Run `bun run check` for lint + YAML lint + typecheck + dead-code check (knip) + tests + schema freshness. The pre-commit hook runs lint and typecheck only.
+- A compat path that stays (an alias, a retired input still accepted, an arm for an older artifact) carries a comment `COMPAT(vN): <what stays working and what to delete>`, N the major that deletes it: compat kept today for a pre-3 shape is marked v3; compat introduced during 3.x for a 3.0 shape is marked v4. JSON takes no comments, so compat in a JSON file is marked in the code that reads it. A path that must work forever is not compat and gets no marker.
+- `bun run check:compat` (in `bun run check` and in CI) rejects a malformed marker and any marker whose major is at or below `package.json`'s, and prints the remaining markers grouped by major.
+- A release PR's tree already carries the version it cuts, so the same check makes a major release PR unmergeable until every marker for that major is deleted on `main` first: with 3.0.0 in preparation, every v3-marked path goes before v3 cuts.
 
-[COVERAGE.md](COVERAGE.md) is the honest inventory of the supported API surface: what works today, the repo-scoped gaps, and what is out of scope by design. A change that adds or extends a section should keep it in step.
+## Code conventions
+
+- Line caps: code wraps at biome's `lineWidth` of 100. The fleet's check-file-size caps source, test, workflow, and shell lines at 256 characters; markdown prose has no width cap. A comment block is at most 10 lines.
+- Markdown keeps one source line per paragraph or list item, so a long item is split into items, never wrapped.
+- A source file under `src/` or `.github/scripts/` opens with a one-paragraph header comment saying what the file owns; test files need none.
+- Tests live in two places: a section's unit tests sit beside it in `src/sections/<key>/`; everything else is under `test/`, mirroring `src/`.
+
+## Tests
+
+- Every temp directory a test creates is removed on every exit path, failure included: `withTempDir()` from `test/temp-dir.ts`, or a try/finally of its own. A fixture that outlives one test removes its dir when it ends (the release-pipeline fixture in afterAll, the e2e bundle on process exit).
+- An Io a test records through is `captureIo()` from `test/io/capture.ts`: every channel in its own list and in one ordered event log.
+- A repository-relative path in a test resolves from `ROOT` in `test/root.ts`; a file beside the test resolves from `import.meta.dir`.
+- A test in `test/docs` guards an invariant between artifacts (a doc's claim against the code, a workflow against the constant a script prints); a pin of one file's own text is not kept.
 
 ## End-to-end tests
 
-The end-to-end tests build the bundle to a temp path and run it as a real subprocess against a mock GitHub API, so they exercise the same single-file bundle a release ships, not the TypeScript source directly. `bun run test:e2e` runs the curated scenario corpus, and `bun run fuzz` runs seeded property fuzzing: it generates random scenarios and checks each run's outcome against an oracle that predicts the outcome class from the token mask, policy, and mode.
+The end-to-end tests build the bundle to a temp path and run it as a subprocess against a mock GitHub API, so they exercise the same single-file bundle a release ships.
 
-The fuzzer is deterministic. It prints a master seed and a per-iteration seed for each run; a whole run reproduces with `FUZZ_SEED=<masterSeed> bun run fuzz`, and a single failing iteration replays with `bun test/e2e/fuzz.ts --seed
-<iterationSeed> --iterations 1`.
+- `bun run test:e2e` runs the curated scenario corpus.
+- Every section ships the standard scenario set under `src/sections/<key>/scenarios/`, named after the section's dashed key: `<slug>-apply-converges`, `<slug>-check-drift` (a section with a planning read), `<slug>-snapshot-roundtrip` (a section with snapshot()), and for a section under the undeclared policy `<slug>-undeclared-delete` and `<slug>-undeclared-keep-note`; `test/sections/scenario-set.test.ts` derives the set from the registry.
+- `bun run fuzz` runs seeded property fuzzing: random scenarios, each checked against an oracle that predicts the outcome class from the token mask, policy, and mode.
+- The mock serves the section endpoints plus the core routes the action calls outside the sections. A request that matches no registered route fails loudly; the mock never invents a response.
+- PR CI runs the sections a pull request changed. The nightly workflow's `e2e` job runs the full corpus and files a red night under the `nightly-failure` issue; the fuzz nightly runs the full fuzz and files under `fuzz-nightly` with a replay command.
 
-The mock serves the section endpoints plus the core routes the action calls outside the sections (the repo fetch, the settings-file contents read, `repos: "*"` discovery, and the private-report issue channel), so a request that matches no registered section or core route fails loudly rather than returning a made-up response.
+The fuzzer is deterministic. It prints a master seed and a per-iteration seed:
 
-PR CI runs a diff-aware subset, scoped to the sections a pull request changed. Two nightly workflows cover the rest: one runs the curated scenario corpus and files an issue labeled `e2e-fuzz` on failure, the other runs the full fuzz and files under `fuzz-nightly`; both issues carry a replay command.
+```sh
+FUZZ_SEED=<masterSeed> bun run fuzz                          # replay a whole run
+bun test/e2e/fuzz.ts --seed <iterationSeed> --iterations 1  # replay one failing iteration
+```
 
 ## Releases
 
-The release job runs downstream of the `all-green` gate, so releases and release-PR refreshes only happen from a green main. release-please does version math, the changelog, the manifest and version pins, and the release PR; merging that PR has it cut the release as a draft with no tag. The repo-owned update-release.yml hook then builds the bundle, commits it as a child of the merge commit, creates the `vX.Y.Z` tag once on that packaged commit, moves the moving major tag to it, and uploads the assets; the managed publish stage attests every asset (on a public repository) and flips the draft live, binding the release to the packaged tag. The tag topology is unit-tested in test/scripts/release-pipeline.test.ts.
+- Releases run downstream of the `all-green` gate: ci.yml calls the fleet's release workflow, so a release or a release-PR refresh only happens from a green `main`.
+- release-please does the version math, the changelog, the version pins, and the release PR; merging that PR cuts the release.
+- Every ref a `uses:` pin can name (`vX.Y.Z`, the moving major, `latest`) points at a packaged commit: the child of one `main` commit, carrying its tree plus the built bundle and library; every green push mints one under a `build/<position>.<sha7>` tag, the ten newest kept. The tags up to v2.0.0 point at `main` commits from when `main` committed the bundle.
+- The repo-owned hooks `update-release.yml` and `update-release-pr.yml` mint the tags and keep release-please's boundary (`last-release-sha`) fresh. The git topology lives in `.github/scripts/release-pipeline.ts` and its test.

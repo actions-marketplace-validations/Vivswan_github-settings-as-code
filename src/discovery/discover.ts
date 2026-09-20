@@ -5,33 +5,44 @@
  */
 
 import type { components } from "@octokit/openapi-types";
-import { type GithubClient, isPermissionError, RERUN_ADVICE } from "../github/api.js";
+import { err, ok, ResultAsync } from "neverthrow";
+import { type GitHubClient, isPermissionError } from "../github/api.js";
 import { paginate } from "../github/paginate.js";
+import { isPrivate, markPrivate, type Private } from "../private.js";
+import { revealPrivate } from "../private-open.js";
+import type { ProblemOf } from "../problem.js";
+import { countNoun } from "../text.js";
 
 type DiscoveredRepo = Pick<
   components["schemas"]["repository"],
   "full_name" | "archived" | "fork" | "topics" | "visibility" | "private"
 >;
 
-/** One discovered repository: its slug plus the visibility the listing reported. */
 export interface DiscoveredRepoRef {
   slug: string;
   visibility: "public" | "private" | "internal";
 }
 
 /**
- * Narrow the listing's visibility for the REDACTION decision, failing closed.
- * `visibility` is a plain string in the API schema and optional on GHES; the
- * always-present `private` flag is the authority. A repo is treated as private
- * whenever `private === true` (even if a stale/forged `visibility` says
- * "public"), and when BOTH fields are missing (an unknown repo is hidden, never
- * exposed). Only `private === false` (or a trustworthy non-public visibility)
- * yields a non-private classification. `internal` survives when `visibility`
- * names it and `private` does not contradict it.
+ * A repository a filter dropped: only ever named in the skip notice, so a
+ * non-public one carries its slug sealed (opened under `private-repos: show`).
+ */
+export type FilteredRepoRef =
+  | { slug: string; visibility: "public" }
+  | { slug: Private<string>; visibility: "private" | "internal" };
+
+function sealFiltered(ref: DiscoveredRepoRef): FilteredRepoRef {
+  return ref.visibility === "public"
+    ? { slug: ref.slug, visibility: "public" }
+    : { slug: markPrivate(ref.slug), visibility: ref.visibility };
+}
+
+/**
+ * Fails closed for the REDACTION decision. `visibility` is a plain string in the API schema and optional on GHES, so
+ * the always-present `private` flag is the authority: private === true wins over any `visibility` (even a stale
+ * "public"), and with BOTH fields missing the repo is hidden, never exposed.
  */
 function normalizeVisibility(repo: DiscoveredRepo): DiscoveredRepoRef["visibility"] {
-  // private === true always wins: it is the field the API guarantees, and a
-  // repo the token can see as private must never be classed public.
   if (repo.private === true) {
     return "internal" === repo.visibility ? "internal" : "private";
   }
@@ -39,7 +50,6 @@ function normalizeVisibility(repo: DiscoveredRepo): DiscoveredRepoRef["visibilit
   if (visibility === "public" || visibility === "private" || visibility === "internal") {
     return visibility;
   }
-  // visibility absent: trust an explicit private === false, else fail closed.
   return repo.private === false ? "public" : "private";
 }
 
@@ -50,10 +60,8 @@ export const FORKS_FILTERS = ["include", "exclude", "only"] as const;
 export const AFFILIATIONS = ["owner", "collaborator", "organization_member"] as const;
 
 /**
- * The filter reason tag for a repo skipped because it is archived. Shared by
- * the discovery rule that emits it and formatSkipNotice, which special-cases
- * it for the unarchive-to-manage prose - a literal in one place and not the
- * other would silently drop that guidance.
+ * Shared by the rule that emits it and formatSkipNotice, which special-cases it for the unarchive-to-manage prose; a
+ * literal in one place and not the other would silently drop that guidance.
  */
 const ARCHIVED_REASON = "archived";
 
@@ -76,17 +84,11 @@ export const DEFAULT_DISCOVERY_FILTERS: DiscoveryFilters = {
   exclude: [],
 };
 
-/** Compile a "*"-only wildcard into an anchored, case-insensitive RegExp. */
 function compileExcludePattern(pattern: string): RegExp {
   const escaped = pattern.replace(/[.+^${}()|[\]\\?]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`, "i");
 }
 
-/**
- * True when the pattern excludes this owner/name slug. A pattern containing
- * "/" matches the full slug; otherwise it matches the name alone (same
- * split as the repos-dir <name>.yml vs <owner>/<name>.yml layout).
- */
 export function excludeMatches(pattern: string, slug: string): boolean {
   const candidate = pattern.includes("/") ? slug : (slug.split("/")[1] ?? slug);
   return compileExcludePattern(pattern).test(candidate);
@@ -94,15 +96,17 @@ export function excludeMatches(pattern: string, slug: string): boolean {
 
 export interface DiscoveryResult {
   repos: DiscoveredRepoRef[];
-  /** Repositories dropped by a filter, grouped by the first reason that hit. */
-  filtered: Array<{ reason: string; repos: DiscoveredRepoRef[] }>;
+  filtered: Array<{ reason: string; repos: FilteredRepoRef[] }>;
 }
 
-/** Discover the repositories the token's user can see, applying the filters. */
-export async function discoverRepos(
-  api: GithubClient,
+export type DiscoveryProblem = ProblemOf<
+  "discovery-request-failed" | "discovery-transport-failed" | "discovery-response-not-a-list"
+>;
+
+export function discoverRepos(
+  api: GitHubClient,
   filters: DiscoveryFilters,
-): Promise<DiscoveryResult | { error: string }> {
+): ResultAsync<DiscoveryResult, DiscoveryProblem> {
   const params = [`affiliation=${filters.affiliation.join(",")}`];
   if (filters.visibility === "public" || filters.visibility === "private") {
     // The API's visibility param has no "internal" value; that case (and the
@@ -110,40 +114,39 @@ export async function discoverRepos(
     params.push(`visibility=${filters.visibility}`);
   }
   const path = `/user/repos?${params.join("&")}`;
-  const wrap = (message: string, advice: string): { error: string } => ({
-    error: `cannot discover repositories for repos: "*": ${message}. ${advice}`,
-  });
-  let page: Awaited<ReturnType<typeof paginate>>;
-  try {
-    page = await paginate(api, path);
-  } catch (error) {
-    // Network-level failure: tryRequest throws once the retries are spent.
-    return wrap(error instanceof Error ? error.message : String(error), RERUN_ADVICE);
-  }
-  if ("error" in page) {
-    const cause = `GET ${path} failed: ${page.error.status} ${page.error.message}`;
-    // The PAT advice fits genuine denials only. A rate-limit 403 is NOT a
-    // permission problem (isPermissionError excludes it), so it must fall
-    // through to RERUN_ADVICE instead of telling the operator to swap tokens
-    // and abandon "*" discovery for nothing. 401 is an invalid/expired token,
-    // which the same PAT advice covers.
-    if (isPermissionError(page.error) || page.error.status === 401) {
-      return wrap(
-        cause,
-        `Discovery needs a user PAT; the workflow GITHUB_TOKEN and GitHub App installation tokens cannot enumerate a user's repositories. List the target repositories explicitly in the "repos" input`,
-      );
+  // Network-level failure: tryRequest throws once the retries are spent.
+  return ResultAsync.fromPromise(
+    paginate(api, path),
+    (error): DiscoveryProblem => ({
+      code: "discovery-transport-failed",
+      reason: error instanceof Error ? error.message : String(error),
+    }),
+  ).andThen((page) => {
+    if ("error" in page) {
+      // A rate-limit 403 is NOT a permission problem (isPermissionError excludes it), so it never reads as denied and
+      // never tells the operator to swap tokens; 401 (an invalid or expired token) does.
+      return err<DiscoveryResult, DiscoveryProblem>({
+        code: "discovery-request-failed",
+        path,
+        status: page.error.status,
+        message: page.error.message,
+        denied: isPermissionError(page.error) || page.error.status === 401,
+      });
     }
-    return wrap(cause, RERUN_ADVICE);
-  }
-  if ("malformed" in page) {
-    return wrap(
-      `GET ${path} returned a JSON value that is not a list, so the response cannot be paginated`,
-      RERUN_ADVICE,
-    );
-  }
-  const repos = page.items as DiscoveredRepo[];
-  // One rule per filter, in reporting-attribution order; the first reason
-  // returned is the one a skipped repo is grouped under.
+    if ("malformed" in page) {
+      return err<DiscoveryResult, DiscoveryProblem>({
+        code: "discovery-response-not-a-list",
+        path,
+      });
+    }
+    return ok(applyFilters(page.items as DiscoveredRepo[], filters));
+  });
+}
+
+function applyFilters(
+  repos: readonly DiscoveredRepo[],
+  filters: DiscoveryFilters,
+): DiscoveryResult {
   const rules: Array<(repo: DiscoveredRepo) => string | null> = [
     (repo) => {
       const isInternal = repo.visibility === "internal";
@@ -188,7 +191,7 @@ export async function discoverRepos(
     },
   ];
   const kept: DiscoveredRepoRef[] = [];
-  const filtered = new Map<string, DiscoveredRepoRef[]>();
+  const filtered = new Map<string, FilteredRepoRef[]>();
   for (const repo of repos) {
     let reason: string | null = null;
     for (const rule of rules) {
@@ -207,9 +210,9 @@ export async function discoverRepos(
     }
     const group = filtered.get(reason);
     if (group) {
-      group.push(ref);
+      group.push(sealFiltered(ref));
     } else {
-      filtered.set(reason, [ref]);
+      filtered.set(reason, [sealFiltered(ref)]);
     }
   }
   return {
@@ -219,32 +222,31 @@ export async function discoverRepos(
 }
 
 /**
- * One aggregate notice per filter reason: with "*" fleets, per-repo notices
- * would flood the annotations UI (GitHub caps annotations per step).
- * `redactPrivate` keeps private and internal repository names out of the
- * notice: only public slugs are listed, hidden ones become a count, and a
- * group with no public repos renders as a count with no names at all.
+ * One aggregate notice per filter reason: per-repo notices for a "*" fleet would flood the annotations UI (GitHub caps
+ * annotations per step). Under `redactPrivate` only public slugs are listed and hidden ones become a count; under
+ * `show` the operator opted into naming them, so the seal opens here.
  */
 export function formatSkipNotice(
-  group: { reason: string; repos: DiscoveredRepoRef[] },
+  group: { reason: string; repos: FilteredRepoRef[] },
   redactPrivate: boolean,
 ): string {
-  const named = redactPrivate
-    ? group.repos.filter((repo) => repo.visibility === "public")
-    : group.repos;
+  const named: string[] = redactPrivate
+    ? group.repos.flatMap((repo) => (repo.visibility === "public" ? [repo.slug] : []))
+    : group.repos.map((repo) => (isPrivate(repo.slug) ? revealPrivate(repo.slug) : repo.slug));
   const hidden = group.repos.length - named.length;
-  const hiddenCount = `${hidden} private or internal ${hidden === 1 ? "repository" : "repositories"}`;
-  const shown = named
-    .slice(0, 20)
-    .map((repo) => repo.slug)
-    .join(", ");
+  const hiddenCount = countNoun(
+    hidden,
+    "private or internal repository",
+    "private or internal repositories",
+  );
+  const shown = named.slice(0, 20).join(", ");
   const more = named.length > 20 ? `, and ${named.length - 20} more` : "";
   const hiddenTail = hidden > 0 ? `, and ${hiddenCount}` : "";
   const names = named.length > 0 ? `: ${shown}${more}${hiddenTail}` : "";
   const count =
     named.length === 0 && hidden > 0
       ? hiddenCount
-      : `${group.repos.length} ${group.repos.length === 1 ? "repository" : "repositories"}`;
+      : countNoun(group.repos.length, "repository", "repositories");
   if (group.reason === ARCHIVED_REASON) {
     return `repos: "*" discovery skipped ${count} because settings writes fail on archived repositories; unarchive them to manage them${names}`;
   }

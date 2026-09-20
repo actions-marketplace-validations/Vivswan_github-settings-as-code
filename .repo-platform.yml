@@ -1,5 +1,13 @@
-# This file is managed by Vivswan/repo-platform. Its presence
-# marks this repository as participating in push sync. `modules` is this
-# repo's module selection - edit it and the next sync applies the change.
-
-modules: ["agents", "bun", "release-please", "issue-templates", "pr-title", "auto-assign", "fuzzer", "nightly"]
+# Generated once by the fleet sync and repo-owned from then on: the sync reads this file and never rewrites it.
+modules:
+  - bun
+  - site
+  - release-please
+  - pr-title
+  - fuzzer
+  - nightly
+project:
+  name: GitHub Settings as Code
+  slug: github-settings-as-code
+  description: "GitHub Action applying declarative repository settings: rulesets, labels, branch protection, and more. A loud, stateless Probot Settings replacement."
+  copyright_holder: Vivswan Shah (https://github.com/Vivswan)

@@ -1,3 +1,7 @@
+---
+order: 160
+---
+
 # Forward compatibility
 
 GitHub ships new settings fields faster than any wrapper can track them, so this action is passthrough-first by design: payloads are sent to the API verbatim except for documented normalizations (ref prefixes, topics splitting, vocabulary mapping), and new fields and rule types GitHub ships work the day they exist - declare them in `settings.yml`, no action update needed. This page draws the line: where the passthrough tenet holds, and where the surface is deliberately closed.
@@ -15,4 +19,4 @@ Nine sections are closed rather than passthrough: `collaborators`, `teams`, `wor
 
 A few nested surfaces are strict for the same reason. Each key of the actions section's `cache` object is the entire body of its own endpoint, so an unrecognized cache key has nowhere to go and is rejected upfront; the rest of that section stays passthrough. Inside a declared environment, the `secrets` and `deployment_protection_rules` entries are strict the same way: their write bodies are built from the named fields alone, so an extra entry key would silently do nothing.
 
-The wrapped [`undeclared` form](undeclared-policy.md) of the list sections is strict the same way: `undeclared` and `entries` are this action's own vocabulary, never sent to GitHub, so any other wrapper key is rejected upfront as a typo.
+The wrapped form of the list sections is strict the same way: its keys are this action's own vocabulary, never sent to GitHub, so any other wrapper key is rejected upfront as a typo. The [undeclared policy page](undeclared-policy.md) is the one place that lists them.

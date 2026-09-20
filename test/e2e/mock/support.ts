@@ -1,15 +1,15 @@
 /**
- * Shared building blocks for the mock's per-endpoint handlers: the handler
- * and reply types, the reply helpers, and the handler-local helpers the
- * section handler fragments compose. This module sits at the BOTTOM of the
- * mock's layering: everything above it - the pipeline, the core-path and
- * merged handler tables, every section fragment
- * (src/sections/<key>/mock.ts) - imports it, and it imports none of them,
- * so a per-section mock fragment can depend on it without pulling the
- * whole pipeline in.
+ * Shared building blocks for the mock's per-endpoint handlers. This module sits at the BOTTOM of the
+ * mock's layering: the pipeline, the core-path and merged handler tables, and every section fragment
+ * (src/sections/<key>/mock.ts) import it and it imports none of them, so a fragment can depend on it
+ * without pulling the whole pipeline in.
  */
 
 import type { SectionKey } from "../../../src/schema.js";
+import {
+  type DefinitiveRejection,
+  endpointPath,
+} from "../../../src/sections/contract/endpoints.js";
 import type { GraphqlTolerableError } from "../../../src/sections/contract/graphql.js";
 import { type NameKey, nameKey } from "../../../src/sections/labels/index.js";
 import type {
@@ -18,6 +18,7 @@ import type {
   TaggedEndpoint,
   TaggedGraphqlOp,
 } from "../../../src/sections/registry.js";
+import type { SetupKey, SetupSectionModule } from "../../../src/sections/shared/setup-section.js";
 import { variableKey } from "../../../src/sections/shared/variables-engine.js";
 import { decodeNodeId, mintAppNodeId, mintNodeId } from "./node-id.js";
 import {
@@ -28,65 +29,56 @@ import {
 } from "./secrets.js";
 import type { MockState } from "./state.js";
 
-/** A plain JSON object body. */
 export type Json = Record<string, unknown>;
 
-/** The reply a handler (or the pipeline) produces: a status and a JSON body. */
 export interface MockResponse {
   status: number;
   body: unknown;
-  /** Extra response headers (e.g. Retry-After on the 429 fault). */
   headers?: Record<string, string>;
   /**
-   * When true, this response REJECTS a request whose body is deliberately off
-   * the spec's request schema - settings pass through to the API verbatim, so
-   * scenarios send user typos the schema forbids (an unknown rules[].type) and
-   * the handler answers GitHub's real 4xx. The OpenAPI validator skips only
-   * the request-body SCHEMA check for such requests (the rejection is the
-   * behavior under test); body-presence checks and response validation still
-   * apply.
+   * Marks a reply that REJECTS a deliberately off-spec request body: settings pass through to the API
+   * verbatim, so scenarios send user typos the schema forbids and the handler answers GitHub's real 4xx.
+   * The OpenAPI validator skips only the request-body SCHEMA check for these; body-presence checks and
+   * response validation still apply.
    */
   requestOffSpec?: boolean;
 }
 
 /**
- * Everything a handler needs to serve one request: the mutable state, the
- * matched endpoint, the concrete path, the named path params the route
- * template extracted, the parsed query, and the request body. The
- * chaos-corruption directive is applied by the pipeline AFTER the handler
- * returns, so it is not passed here.
+ * Everything a handler needs for one request. The chaos-corruption directive is applied by the pipeline
+ * AFTER the handler returns, so it is not passed here.
  */
 interface HandlerContext {
   state: MockState;
   endpoint: TaggedEndpoint;
   /**
-   * The URL-decoded value of one `{token}` in the matched route template
-   * ({owner} and {repo} included). Extraction and routing share one template
-   * walk, so a handler reads a param by the name its own ENDPOINTS
-   * declaration spells and can never disagree with it about position; asking
-   * for a token the route does not declare throws a mock BUG naming the
-   * handler, the route, and the declared tokens. The raw path is deliberately
-   * NOT exposed, so a handler cannot fall back to positional parsing.
+   * Extraction and routing share one template walk, so a handler cannot disagree with its own ENDPOINTS
+   * declaration about a param's position; the raw path is deliberately NOT exposed.
+   *   declared token                 -> its URL-decoded value ({owner} and {repo} included)
+   *   token missing from the route   -> throws a mock BUG naming the handler, the route, and the declared tokens
    */
   param(name: string): string;
   query: Record<string, string>;
   body: unknown;
+  /**
+   * The request headers, lower-cased names, frozen (requestHeaders in dispatch.ts is the one minter). For the
+   * endpoints whose reply GitHub shapes by media type (the teams probe's 200 body vs bare 204), so a client that
+   * drops its Accept header meets GitHub's real answer here instead of passing.
+   */
+  headers: Readonly<Record<string, string>>;
+  /**
+   * For a field GitHub reveals only above the endpoint's own grade (a ruleset's bypass_actors,
+   * admin-only), so the mock omits it like GitHub does.
+   */
+  grants(kind: "read" | "write"): boolean;
 }
 
 export type Handler = (ctx: HandlerContext) => MockResponse;
 
-/**
- * One section's REST mock fragment: exactly one handler per declared
- * endpoint role. The Record over the section's exact SectionEndpointKey<K>
- * union makes both halves of handler completeness a compile-time fact for
- * the fragment - a declared endpoint without a handler is a missing
- * property, a handler naming no declared endpoint an excess one.
- */
 export type SectionRestHandlers<K extends SectionKey> = Readonly<
   Record<SectionEndpointKey<K>, Handler>
 >;
 
-/** The GraphQL sibling of SectionRestHandlers, over SectionGraphqlKey<K>. */
 export type SectionGraphqlHandlers<K extends SectionKey> = Readonly<
   Record<SectionGraphqlKey<K>, GraphqlHandler>
 >;
@@ -94,15 +86,9 @@ export type SectionGraphqlHandlers<K extends SectionKey> = Readonly<
 // --- Pagination -----------------------------------------------------------
 
 /**
- * Slice a full list the way src/github/paginate.ts asks for it: the client
- * sends per_page (100, or the endpoint's declared smaller pageSize) and
- * page=N, stopping when a chunk is shorter than requested. `cap`, when
- * given, is the endpoint's own documented maximum: GitHub clamps an
- * oversized per_page rather than honoring it, so a capped endpoint serves
- * at most `cap` items per page no matter what the client asks - mirroring
- * that here is what keeps the mock's paging indistinguishable from
- * GitHub's. A page past the end yields an empty slice, which ends the
- * client's loop.
+ * Slices the way src/github/paginate.ts asks: per_page (100, or the endpoint's declared smaller pageSize)
+ * and page=N, stopping on a short chunk. `cap` is the endpoint's documented maximum: GitHub clamps an
+ * oversized per_page rather than honoring it, so a capped endpoint never serves more per page.
  */
 export function slicePage<T>(
   items: readonly T[],
@@ -127,7 +113,6 @@ export function asObject(body: unknown): Json {
   return body && typeof body === "object" && !Array.isArray(body) ? (body as Json) : {};
 }
 
-/** A 200 JSON reply. */
 export function ok(body: unknown): MockResponse {
   return { status: 200, body };
 }
@@ -137,11 +122,12 @@ export function noContent(): MockResponse {
   return { status: 204, body: null };
 }
 
-/**
- * True when an environment exists AND its stored deployment_branch_policy
- * enables custom_branch_policies - the precondition every branch-policy
- * pattern endpoint shares (they answer 404 otherwise, like GitHub).
- */
+/** A section's declared definitive rejection, served from the declaration so the wire body cannot drift from the classifier. */
+export function rejected(rejection: DefinitiveRejection): MockResponse {
+  return { status: rejection.status, body: { message: rejection.message } };
+}
+
+/** The precondition every branch-policy pattern endpoint shares; they answer 404 otherwise, like GitHub. */
 export function branchPoliciesEnabled(state: MockState, env: string): boolean {
   const environment = state.environments[env];
   if (!environment) {
@@ -155,12 +141,9 @@ export function branchPoliciesEnabled(state: MockState, env: string): boolean {
 }
 
 /**
- * The bare organization probe (GET /orgs/{org}) that teams and
- * custom_properties both declare: 200 with the org body, 404 on a personal
- * account. ONE handler registered under both keys, so the two cannot drift.
- * matchEndpoint resolves the shared route to the FIRST declaring section
- * (teams), so the custom_properties registration exists for the
- * completeness assertion.
+ * ONE handler registered under both teams.org and custom_properties.org, so the two cannot drift.
+ * matchEndpoint resolves the shared route to the FIRST declaring section (teams); the custom_properties
+ * registration exists for the completeness assertion.
  */
 export const orgProbeHandler: Handler = ({ state }) => {
   if (state.org === null) {
@@ -170,11 +153,8 @@ export const orgProbeHandler: Handler = ({ state }) => {
 };
 
 /**
- * The deterministic timestamp the Nth secret PUT against a state carries:
- * every write moves updated_at, exactly like GitHub, without the mock ever
- * reading a real clock. One counter per state, shared by EVERY secret
- * family - the stamps only need to move monotonically per write, and one
- * source keeps a mixed-family scenario's ordering deterministic.
+ * Every secret PUT moves updated_at like GitHub, without a real clock. One counter per state serves
+ * EVERY family, so a mixed-family scenario's ordering stays deterministic.
  */
 function secretWriteStamp(writeCount: number): string {
   return new Date(Date.UTC(2020, 0, 15, 0, 0, writeCount)).toISOString().replace(".000Z", "Z");
@@ -186,13 +166,9 @@ export function secretsList(list: Json[], query: Record<string, string>): MockRe
 }
 
 /**
- * The sealed PUT every secret family shares. This is the crypto proof: it
- * UNSEALS the uploaded ciphertext with the fixed test keypair - verifying
- * the client's key decode, sealed-box construction, and base64 round-trip in
- * one step - and stores the name plus a deterministic digest of the unsealed
- * value, never the plaintext. Every PUT bumps updated_at via the per-state
- * write counter, so the idempotence snapshot's volatile-field exclusion is
- * exercised for real. 201 on create, 204 on update, matching GitHub.
+ * The crypto proof every secret family shares: the ciphertext is UNSEALED with the fixed test keypair,
+ * verifying the client's key decode, sealed-box construction, and base64 round-trip in one step; the
+ * state keeps a digest of the value, never the plaintext. 201 on create, 204 on update, like GitHub.
  */
 export function sealedSecretPut(
   state: MockState,
@@ -210,9 +186,7 @@ export function sealedSecretPut(
   }
   const plaintext = unsealSecretValue(String(payload.encrypted_value ?? ""));
   if (plaintext === null) {
-    // The ciphertext does not open against the advertised public key: a
-    // client-side sealing bug. GitHub would store the garbage; the mock
-    // rejects it loudly instead, so a broken sealing path can never pass.
+    // GitHub would store the garbage; the mock rejects it, so a broken client sealing path can never pass.
     return {
       status: 422,
       body: { message: "encrypted_value is not a sealed box for the advertised public key" },
@@ -224,13 +198,12 @@ export function sealedSecretPut(
   const existing = list.find((s) => s.name === name);
   if (existing) {
     (existing as Record<string, unknown>).updated_at = stamp;
-    return noContent(); // 204: updated
+    return noContent();
   }
   list.push({ name, created_at: stamp, updated_at: stamp });
   return { status: 201, body: {} };
 }
 
-/** The DELETE every secret family shares: drop the item and its digest. */
 export function secretRemove(
   list: Json[],
   digests: Record<string, string>,
@@ -247,21 +220,13 @@ export function secretRemove(
 
 // --- The secret/variable family factories -----------------------------------
 //
-// The repository secret and variable sections come in FAMILIES that differ
-// only in which MockState list they read (the section modules are the same
-// way: one repoSecretsSection()/repoVariablesSection() call each). Their mock
-// fragments are minted here from the section key. Compile-time completeness
-// survives the factoring in two halves: the annotated per-role record below
-// rejects a missing or typo'd role at the factory, and the fragment's
-// SectionRestHandlers<K> annotation rejects a declared endpoint the factory
-// does not serve; assertHandlerCompleteness() remains the construction-time
-// backstop.
+// The secret and variable sections come in FAMILIES differing only in which MockState list they read, so
+// their fragments are minted here. Compile-time completeness survives the factoring in two halves.
+//   annotated per-role record          -> rejects a missing or typo'd role
+//   fragment's SectionRestHandlers<K>  -> rejects a declared endpoint the factory does not serve
+//   assertHandlerCompleteness()        -> the runtime backstop
 
-/**
- * Build one "<key>.<role>" handler record from per-role handlers. The
- * Object.fromEntries round-trip erases the key type, so the cast restores
- * exactly what the construction just did.
- */
+/** Object.fromEntries erases the key type; the cast restores exactly what the construction just did. */
 function keyedHandlers<K extends SectionKey, R extends string>(
   key: K,
   roles: Readonly<Record<R, Handler>>,
@@ -271,7 +236,6 @@ function keyedHandlers<K extends SectionKey, R extends string>(
   ) as Record<`${K}.${R}`, Handler>;
 }
 
-/** The sealed-secret families: a list plus its digest map, named in lockstep. */
 type SecretsFamilyKey =
   | "actions_secrets"
   | "dependabot_secrets"
@@ -281,21 +245,12 @@ type SecretDigestsKey<K extends SecretsFamilyKey> = K extends `${infer F}_secret
   ? `${F}_secret_digests`
   : never;
 
-/** The endpoint roles every repository secret family declares. */
 type SecretsRole = "list" | "publicKey" | "put" | "remove";
 
-/**
- * The four handlers every repository secret family serves, over the state
- * family the section key names. The sealed-secret semantics live on the
- * shared helpers above (sealedSecretPut/secretsList/secretRemove).
- */
 export function repoSecretsRestHandlers<K extends SecretsFamilyKey>(
   key: K,
 ): Record<`${K}.${SecretsRole}`, Handler> {
-  // The digests family is the list family's "_secret_digests" sibling; the
-  // cast restates in the type what the string surgery just did.
   const digestsKey = key.replace(/_secrets$/, "_secret_digests") as SecretDigestsKey<K>;
-  // Annotated, not inferred, so a missing or typo'd role fails to compile.
   const roles: Readonly<Record<SecretsRole, Handler>> = {
     list: ({ state, query }) => secretsList(state[key], query),
     publicKey: () => ok({ key_id: MOCK_SECRETS_KEY_ID, key: MOCK_SECRETS_PUBLIC_KEY }),
@@ -309,15 +264,11 @@ export function repoSecretsRestHandlers<K extends SecretsFamilyKey>(
 /** The repository-variables families (same GET shape, uppercase-stored names). */
 type VariablesFamilyKey = "actions_variables" | "agents_variables";
 
-/** The endpoint roles every repository variables family declares. */
 type VariablesRole = "list" | "create" | "update" | "remove";
 
 /**
- * The four handlers every repository variables family serves, over the state
- * family the section key names. The page cap comes from the endpoint
- * DECLARATION, the same single source the client's page loop and the
- * spec-derived pageSize sweep read - so the mock can never clamp at a stale
- * number the section stopped using.
+ * The page cap comes from the endpoint DECLARATION, the single source the client's page loop and the
+ * spec-derived pageSize sweep also read, so the mock can never clamp at a stale number.
  */
 export function repoVariablesRestHandlers<K extends VariablesFamilyKey>(section: {
   key: K;
@@ -325,7 +276,6 @@ export function repoVariablesRestHandlers<K extends VariablesFamilyKey>(section:
 }): Record<`${K}.${VariablesRole}`, Handler> {
   const key = section.key;
   const list = (state: MockState): Json[] => state[key];
-  // Annotated, not inferred, so a missing or typo'd role fails to compile.
   const roles: Readonly<Record<VariablesRole, Handler>> = {
     list: ({ state, query }) =>
       ok({
@@ -334,12 +284,8 @@ export function repoVariablesRestHandlers<K extends VariablesFamilyKey>(section:
       }),
     create: ({ state, body }) => {
       const payload = asObject(body);
-      // GitHub stores variable names uppercased regardless of how they are
-      // entered (the variables naming rules; the spec examples show uppercase
-      // names), so the stored GET shape carries the uppercase name. Payload
-      // spread FIRST so passthrough fields the section sends (and later
-      // subsetDiffs) are stored and read back; the canonical fields are then
-      // normalized over them.
+      // GitHub stores variable names uppercased however they are entered. Payload spread FIRST so the
+      // passthrough fields the section sends (and later subsetDiffs) read back; canonical fields normalize over them.
       const variable: Json = {
         ...payload,
         name: variableName(payload),
@@ -387,6 +333,46 @@ export function repoVariablesRestHandlers<K extends VariablesFamilyKey>(section:
   return keyedHandlers(key, roles);
 }
 
+// --- The setup family factory -----------------------------------------------
+
+const SETUP_STATE = {
+  code_scanning_default_setup: "code_scanning",
+  code_quality_setup: "code_quality",
+} as const satisfies Record<SetupKey, keyof MockState>;
+
+type SetupRole = keyof SetupSectionModule<SetupKey>["endpoints"] & string;
+
+/** GitHub starts an async configuration run when the PATCH changes `languages`, hence the 202 with a run_id. */
+export function setupRestHandlers<K extends SetupKey>(
+  key: K,
+): Record<`${K}.${SetupRole}`, Handler> {
+  const setup = (state: MockState): Json => state[SETUP_STATE[key]];
+  const roles: Readonly<Record<SetupRole, Handler>> = {
+    get: ({ state }) => ok(setup(state)),
+    update: ({ state, body, endpoint }) => {
+      const live = setup(state);
+      if (live.configuration_run_in_progress === true) {
+        return { status: 409, body: { message: "A configuration run is already in progress" } };
+      }
+      const payload = asObject(body);
+      const changesLanguages =
+        "languages" in payload &&
+        JSON.stringify(payload.languages) !== JSON.stringify(live.languages);
+      Object.assign(live, payload);
+      if (!changesLanguages) {
+        return ok({});
+      }
+      const runId = state.nextId++;
+      const path = endpointPath(endpoint.route).replace("{owner}/{repo}", state.slug);
+      return {
+        status: 202,
+        body: { run_id: runId, run_url: `https://api.github.com${path}/runs/${runId}` },
+      };
+    },
+  };
+  return keyedHandlers(key, roles);
+}
+
 /** Deterministic expires_at per declared expiry (see interaction_limits.put). */
 export const INTERACTION_EXPIRES: Record<string, string> = {
   one_day: "2027-01-02T00:00:00Z",
@@ -403,22 +389,35 @@ export const INTERACTION_ORG_LIMIT = {
   expires_at: "2027-07-01T00:00:00Z",
 } as const;
 
-/** The 409 GitHub answers when an org/user-level limit overrides the repo's. */
 export const INTERACTION_ORG_CONFLICT = {
   status: 409,
   body: { message: "Conflict: an organization or user interaction limit is in effect" },
 } as const;
 
-/** The 405 both creation-cap endpoints answer where the cap is unavailable. */
 export const CAP_UNAVAILABLE_405 = {
   status: 405,
   body: { message: "Method Not Allowed: the pull request creation cap is not available" },
 } as const;
 
-/** The logins a bypass-list PUT/DELETE body names ({users: [logins]}). */
+/**
+ * The body's `users`, one entry per distinct login (case-insensitive, first spelling kept): GitHub stores a login
+ * once however many times one body repeats it, so a repeated login neither lands twice nor counts twice toward
+ * the 100-user cap. Both callers (the bypass PUT and DELETE) want set semantics, so the dedupe lives here.
+ */
 export function bypassLogins(body: unknown): string[] {
   const users = asObject(body).users;
-  return Array.isArray(users) ? users.map(String) : [];
+  if (!Array.isArray(users)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  return users.map(String).filter((login) => {
+    const key = login.toLowerCase();
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Case-insensitive login match, as GitHub treats logins. */
@@ -426,7 +425,6 @@ export function sameLogin(user: Json, login: string): boolean {
   return String(user.login).toLowerCase() === login.toLowerCase();
 }
 
-/** The 409 both immutable-releases writes answer under owner enforcement. */
 export const IMMUTABLE_OWNER_CONFLICT = {
   status: 409,
   body: { message: "Conflict: the repository owner enforces immutable releases" },
@@ -434,47 +432,25 @@ export const IMMUTABLE_OWNER_CONFLICT = {
 
 // --- Handler-local helpers ------------------------------------------------
 
-/** The Pages API url a served Pages body carries, named for the OWNING repo. */
 export function pagesUrl(slug: string): string {
   return `https://api.github.com/repos/${slug}/pages`;
 }
 
-/**
- * A GET on a 204/404 boolean toggle (vulnerability-alerts): 204 when enabled,
- * 404 when not. The spec documents this 404 with NO content, so the body is
- * empty.
- */
+/** 204 when enabled, 404 when not; the spec documents this 404 with NO content, so the body is empty. */
 export function booleanToggleGet(enabled: boolean): MockResponse {
   return enabled ? noContent() : { status: 404, body: null };
 }
 
-export function labelName(label: Json): NameKey {
-  // The section's own mint, so the mock's matching can never fold a name
-  // differently than the handler does.
+function labelName(label: Json): NameKey {
+  // The section's own mint, so the mock never folds a name differently than the handler does.
   return nameKey(String(label.name));
 }
 
 /** A variable's case-insensitive matching key (GitHub uppercases the match). */
 export function variableName(variable: Json): string {
-  // The engine's own mint, so the mock's matching can never fold a name
-  // differently than the handler does (the labelName precedent).
+  // The engine's own mint, so the mock never folds a name differently than the handler does.
   return variableKey(String(variable.name ?? ""));
 }
-
-/**
- * Label fields the server owns (or the update handler maps explicitly); the
- * passthrough loop must never let a payload overwrite them.
- */
-export const LABEL_CANONICAL_KEYS = new Set([
-  "new_name",
-  "name",
-  "color",
-  "description",
-  "id",
-  "node_id",
-  "url",
-  "default",
-]);
 
 export function findLabel(state: MockState, name: string): Json | undefined {
   return state.labels.find((l) => labelName(l) === nameKey(name));
@@ -486,8 +462,8 @@ export function findLabel(state: MockState, name: string): Json | undefined {
  */
 const VARIABLE_CANONICAL_KEYS = new Set(["name", "value", "created_at", "updated_at"]);
 /**
- * Hook fields the update handler maps explicitly; anything else in a general
- * PATCH body is a passthrough field stored verbatim.
+ * Hook fields the update handler owns (config, events, and active mapped explicitly; name and id
+ * ignored); anything else in a PATCH body is a passthrough field stored verbatim.
  */
 export const HOOK_CANONICAL_KEYS = new Set(["config", "events", "active", "name", "id"]);
 
@@ -500,23 +476,20 @@ export const SECRET_SCANNING_UPDATABLE_KEYS = [
   "must_not_match",
 ] as const;
 
-/** The 412 both versioned custom-pattern writes answer on a stale version. */
 export const SECRET_SCANNING_STALE_VERSION = {
   status: 412,
   body: { message: "Precondition Failed: the custom pattern was modified" },
 } as const;
 
 /**
- * A fresh custom_pattern_version, minted on EVERY mutation from the
- * per-state counter - deterministic (the idempotence snapshot compares
- * state byte for byte), never a clock.
+ * Minted on each create and update from the per-state counter; deterministic rather than a clock, because
+ * the idempotence snapshot compares state byte for byte.
  */
 export function mintSecretScanningVersion(state: MockState): string {
   state._secret_scanning_version_counter += 1;
   return `v${state._secret_scanning_version_counter}`;
 }
 
-/** A URL-friendly slug derived from a pattern name, like GitHub's. */
 function secretScanningSlug(name: string): string {
   return (
     name
@@ -527,10 +500,8 @@ function secretScanningSlug(name: string): string {
 }
 
 /**
- * The stored GET shape for one bulk-create entry: server-owned fields
- * (id, slug, the "published" state, push protection off, a fresh version,
- * fixed timestamps) over the payload's declared fields. Timestamps are
- * FIXED so repeat applies stay byte-stable for the idempotence proof.
+ * Server-owned fields over the payload's declared ones; timestamps are FIXED so repeat applies stay
+ * byte-stable for the idempotence proof.
  */
 export function secretScanningPatternFromCreate(state: MockState, payload: Json): Json {
   const name = String(payload.name ?? "");
@@ -560,10 +531,8 @@ export function secretScanningPatternFromCreate(state: MockState, payload: Json)
 const HOOK_SECRET_ECHO = "********";
 
 /**
- * The stored form of a webhook config: GitHub keeps insecure_ssl as the
- * STRING "0"/"1" and echoes it that way even when the write sent a number,
- * so the mock normalizes on store - which is exactly what makes the
- * section's compare-side normalization observable.
+ * GitHub keeps insecure_ssl as the STRING "0"/"1" and echoes it that way even when the write sent a
+ * number; normalizing on store is what makes the section's compare-side normalization observable.
  */
 export function storedHookConfig(config: Json): Json {
   if (typeof config.insecure_ssl === "number") {
@@ -572,32 +541,25 @@ export function storedHookConfig(config: Json): Json {
   return config;
 }
 
-/** A webhook config copy with any stored secret replaced by GitHub's echo. */
 export function maskedConfig(config: Json): Json {
   return config.secret === undefined ? config : { ...config, secret: HOOK_SECRET_ECHO };
 }
 
-/** A response-side hook copy whose config.secret is masked (state keeps the real one). */
 export function maskHookSecret(hook: Json): Json {
   const config = asObject(hook.config);
   return config.secret === undefined ? hook : { ...hook, config: maskedConfig(config) };
 }
 
-/** The next 1-based `number` for a list keyed by a numeric `number` field. */
 export function nextNumber(items: Json[]): number {
   const max = items.reduce((acc, item) => Math.max(acc, Number(item.number) || 0), 0);
   return max + 1;
 }
 
 /**
- * The deploy key material GitHub stores: the algorithm and base64 blob, with
- * any trailing comment stripped. Mirrors GitHub's normalization so a
- * converging e2e apply proves the section compares normalized material - and
- * is deliberately an INDEPENDENT implementation, not an import of the
- * section's normalizeKeyMaterial, so a bug there surfaces as a disagreement
- * here instead of hiding (the oracle's globMatches pattern). Sub-two-field
- * material is stored as-is; GitHub would reject it, but the mock never
- * invents validation the exercised scenarios do not need.
+ * Mirrors GitHub's normalization (algorithm and blob, comment stripped) as an INDEPENDENT implementation,
+ * not an import of the section's normalizeKeyMaterial, so a bug there surfaces as a disagreement here.
+ * Sub-two-field material is stored trimmed but otherwise as-is:
+ * GitHub would reject it, but the mock invents no validation the exercised scenarios do not need.
  */
 export function storedKeyMaterial(key: string): string {
   const match = key.trim().match(/^(\S+)\s+(\S+)/);
@@ -605,12 +567,9 @@ export function storedKeyMaterial(key: string): string {
 }
 
 /**
- * The rule types GitHub's rulesets API accepts, as its docs list them.
- * Mock-only realism: the action passes rules through verbatim by design and
- * never consults this list; it exists so a typo'd rules[].type answers
- * GitHub's real 422 shape (errors[] plus documentation_url) instead of being
- * stored silently. Pinned to the trimmed OpenAPI spec's rules[].type enums by
- * a lockstep test, so it cannot drift from the contract the validator checks.
+ * Mock-only realism: the action passes rules through verbatim and never consults this list; it exists so
+ * a typo'd rules[].type answers GitHub's real 422 shape instead of being stored silently. A lockstep test
+ * (openapi/validate.test.ts) pins it to the trimmed spec's rules[].type enums.
  */
 export const RULESET_RULE_TYPES = new Set([
   "creation",
@@ -668,21 +627,15 @@ export function invalidRuleTypeResponse(body: unknown, docAnchor: string): MockR
   return null;
 }
 
-/** One GraphQL errors[] entry a handler (or the denial gate) may emit. */
 export interface GraphqlErrorReply {
   readonly type: GraphqlTolerableError;
   readonly message: string;
 }
 
-/**
- * A GraphQL handler's reply: data XOR errors, the structural exclusion making
- * a two-marker literal fail to compile (the IssueReportOutcome idiom).
- */
 export type GraphqlHandlerResult =
   | { data: Json; errors?: never }
   | { errors: readonly GraphqlErrorReply[]; data?: never };
 
-/** Everything a GraphQL handler needs: the target state, its op, the variables. */
 export interface GraphqlHandlerContext {
   state: MockState;
   op: TaggedGraphqlOp;
@@ -692,12 +645,9 @@ export interface GraphqlHandlerContext {
 export type GraphqlHandler = (ctx: GraphqlHandlerContext) => GraphqlHandlerResult;
 
 /**
- * The GraphQL-only feature fields as the Repository object serves them. The
- * state fields carry the GraphQL enum vocabulary (UPPERCASE), and a seeded
- * value outside it throws instead of folding to a default: the state key
- * looks like the settings key, so a scenario seeding the lowercase
- * "collaborators_only" would otherwise silently test against ALL. Absent
- * fields take the fixture defaults (button off, policy ALL).
+ * A seeded value outside the GraphQL enum vocabulary (UPPERCASE) throws instead of folding to a default:
+ * the state key looks like the settings key, so a scenario seeding the lowercase "collaborators_only"
+ * would otherwise silently test against ALL. Absent fields take the fixture defaults (button off, ALL).
  */
 export function repoFeatureFields(state: MockState): Json {
   const sponsorships = state.repo.has_sponsorships_enabled;
@@ -719,13 +669,10 @@ export function repoFeatureFields(state: MockState): Json {
 }
 
 /**
- * Resolve a pin mutation's target environment from its $environmentId. The
- * pipeline already proved the id decodes and names this repository; what is
- * checked here is the FAMILY and the environment's existence. The section
- * only mutates pins of environments it just PUT, so a non-environment id or
- * a missing environment is a section bug - answered with NOT_FOUND, which
- * neither mutation declares as an outcome, so the response guard turns it
- * into a loud violation instead of a silently tolerated error.
+ * The pipeline already proved the id decodes and names this repository; only the FAMILY and the
+ * environment's existence are checked here. The section pins only environments it declared, with ids
+ * from its own probe or PUT response, so a miss is a section bug.
+ *   NOT_FOUND, declared by neither mutation  -> the response guard raises a loud violation, not a tolerated error
  */
 export function pinTargetName(
   state: MockState,
@@ -746,18 +693,16 @@ export function pinTargetName(
 }
 
 /**
- * The repo's canonical minted node id, re-minted from the state's fixed slug
- * (exactly what stampNodeIds stored at build): the ONE spelling of the repo
- * identity every GraphQL handler serves.
+ * Re-minted from the fixed slug, exactly what stampNodeIds stored: the ONE spelling of the repo identity
+ * every GraphQL handler serves.
  */
 export function repoNodeId(state: MockState): string {
   return mintNodeId("repo", state.slug, "");
 }
 
 /**
- * The full integration (GitHub App) body the app-by-slug lookup serves,
- * completed to the spec's required shape around a PROTECTION_RULE_APPS
- * roster entry. Deterministic (fixed timestamps) for the idempotence proof.
+ * Completed to the spec's required shape around a PROTECTION_RULE_APPS entry; fixed timestamps for the
+ * idempotence proof.
  */
 export function integrationBody(app: Json): Json {
   const slug = String(app.slug);

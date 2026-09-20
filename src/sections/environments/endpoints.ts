@@ -1,29 +1,28 @@
 /**
- * The section's REST endpoint declarations: the single dictionary that
- * drives the request paths, the mock routes, and USED_PATHS - the leaf
- * every sibling module making REST calls reads its routes from.
+ * The REST endpoint dictionary, the leaf every sibling module reads its routes and operation
+ * types from; it drives the request paths, the mock routes, and USED_PATHS.
  */
 
 import type { EndpointDecl } from "../contract/endpoints.js";
+import type { PlanContext, PlannedOp } from "../contract/plan.js";
 
-/**
- * The 404 on the pattern endpoints is ambiguous: besides a missing grant it
- * can mean the environment does not exist, or that its
- * deployment_branch_policy does not enable custom_branch_policies.
- */
 const BRANCH_POLICIES_DENIAL_HINT =
   "a 404 here can also mean the environment does not exist, or that its deployment_branch_policy does not set custom_branch_policies: true";
 
-/**
- * The 404 on the protection-rule endpoints is ambiguous the same way:
- * besides a missing grant it can mean the environment does not exist.
- */
 const PROTECTION_RULES_DENIAL_HINT = "a 404 here can also mean the environment does not exist";
 
 export const ENDPOINTS = {
+  // The snapshot's entry point; plan() addresses environments by name through the probe.
+  list: {
+    route: "GET /repos/{owner}/{repo}/environments",
+    statuses: { 200: "the environment list" },
+  },
   probe: {
     route: "GET /repos/{owner}/{repo}/environments/{environment_name}",
     statuses: { 200: "the environment", 404: "no such environment yet" },
+    // A fine-grained denial reads as "no such environment" and surfaces on the PUT's 403, so a
+    // token that can read nothing still gets an actionable error from the first write.
+    primaryRead: { notFound: "absent" },
   },
   update: {
     route: "PUT /repos/{owner}/{repo}/environments/{environment_name}",
@@ -35,8 +34,7 @@ export const ENDPOINTS = {
   listVariables: {
     route: "GET /repos/{owner}/{repo}/environments/{environment_name}/variables",
     statuses: { 200: "the environment variable list" },
-    // Same documented cap as the repository variables list: GitHub clamps
-    // a larger per_page, and a clamped page would read as the last one.
+    // GitHub clamps a larger per_page on this list, and a clamped page would read as the last one.
     pageSize: 30,
   },
   createVariable: {
@@ -55,9 +53,12 @@ export const ENDPOINTS = {
     route: "GET /repos/{owner}/{repo}/environments/{environment_name}/secrets",
     statuses: { 200: "the environment secrets list (names and timestamps; never values)" },
   },
+  // Read inside the secret PUT's payload thunk (nested.ts): in apply the environment PUT may only just
+  // have created the environment the key belongs to, so check mode never issues it.
   secretsPublicKey: {
     route: "GET /repos/{owner}/{repo}/environments/{environment_name}/secrets/public-key",
     statuses: { 200: "the environment sealing public key" },
+    phase: "execution",
   },
   putSecret: {
     route: "PUT /repos/{owner}/{repo}/environments/{environment_name}/secrets/{secret_name}",
@@ -71,16 +72,14 @@ export const ENDPOINTS = {
   listPolicies: {
     route: "GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies",
     statuses: { 200: "the deployment branch-policy pattern list" },
-    // GitHub gates this read under Actions, not Environments (the OIDC
-    // customization pair in actions.ts is the precedent for the override).
+    // GitHub gates this read under Actions, not Environments.
     permission: { repo: ["actions"] },
     denialHint: BRANCH_POLICIES_DENIAL_HINT,
   },
   createPolicy: {
     route: "POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies",
-    // GitHub documents 200 for the create (never 201), and 303 when a policy
-    // with the same name pattern already exists - desired state is there
-    // either way, so the handler treats 303 as converged.
+    // GitHub documents 200 for the create, never 201; a 303 means the desired state is already
+    // there, so it counts as converged.
     statuses: {
       200: "deployment branch policy created",
       303: "a policy with this name pattern already exists",
@@ -98,17 +97,17 @@ export const ENDPOINTS = {
     permission: { repo: ["administration"] },
     denialHint: BRANCH_POLICIES_DENIAL_HINT,
   },
-  // The protection-rule endpoints spell their path segment with UNDERSCORES
-  // (deployment_protection_rules), unlike the hyphenated branch-policy
-  // family. GitHub gates them outside the Environments permission too:
-  // the enabled-rules list under Actions, everything else under
-  // Administration (fine-grained permissions reference).
+  // GitHub spells this family's path segment with underscores (deployment_protection_rules), unlike
+  // the hyphenated branch-policy family; the permission overrides follow the fine-grained reference.
   listProtectionRules: {
     route: "GET /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules",
     statuses: { 200: "the enabled custom deployment protection rules" },
     permission: { repo: ["actions"] },
     denialHint: PROTECTION_RULES_DENIAL_HINT,
   },
+  // Read at plan for an environment that exists, so an unlisted or duplicated App fails before any
+  // write; for an environment the run creates the list 404s until its PUT lands, so the enabling
+  // POST's payload thunk reads it then (protection-rules.ts).
   listProtectionRuleApps: {
     route:
       "GET /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules/apps",
@@ -130,3 +129,7 @@ export const ENDPOINTS = {
     denialHint: PROTECTION_RULES_DENIAL_HINT,
   },
 } as const satisfies Record<string, EndpointDecl>;
+
+export type EnvironmentsRestContext = PlanContext<typeof ENDPOINTS>;
+
+export type EnvironmentRestOp = PlannedOp<typeof ENDPOINTS>;

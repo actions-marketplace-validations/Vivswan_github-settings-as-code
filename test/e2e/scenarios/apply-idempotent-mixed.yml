@@ -1,11 +1,6 @@
-# Apply is a fixpoint across write disciplines. One apply converges a mixed bag
-# of sections; the second apply (expect.apply_idempotent) must then be
-# write-QUIET for every compare-before-write section here (labels, milestones,
-# autolinks, collaborators, workflows), may re-PUT the unconditional ones
-# (rulesets, environments), and must leave the mock state byte-identical either
-# way; a final check run reads back clean with zero writes. This pins the
-# payload/read-back round trip for the quiet sections and state stability for
-# the loud ones.
+# One apply converges a mixed bag of sections (labels, milestones, autolinks, collaborators,
+# workflows, rulesets, environments); every one compares before writing, so the second apply
+# must be write-quiet on every endpoint and leave the mock state byte-identical.
 name: apply-idempotent-mixed
 settings:
   labels:
@@ -45,4 +40,4 @@ live_state:
 expect:
   exit_code: 0
   result: applied
-  apply_idempotent: true
+  fixpoint: apply_idempotent

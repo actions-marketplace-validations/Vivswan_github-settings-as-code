@@ -1,28 +1,19 @@
-/**
- * Unit tests for the shared secrets engine: the seal/unseal round-trip
- * against the mock's fixed keypair, reconcileSecrets' use of the apply
- * context's resolver (each entry's own value, and never on an empty
- * inventory), and duplicate-name rejection.
- */
-
 import { describe, expect, test } from "bun:test";
+import type { EndpointDecl } from "../../src/sections/contract/endpoints.js";
+import type { SectionContext, SectionMeta } from "../../src/sections/contract/module.js";
+import type { ExecTools, SectionPlan } from "../../src/sections/contract/plan.js";
+import { decodeBase64, sealForGithub } from "../../src/sections/shared/sealed-box.js";
 import {
-  beginRun,
-  type SectionContext,
-  type SectionMeta,
-} from "../../src/sections/contract/module.js";
-import {
-  reconcileSecrets,
+  parseSealingKey,
+  planSecrets,
   rejectDuplicateSecretNames,
   type SealedSecretPayload,
-  type SecretsScope,
-  sealSecretValue,
+  type SecretsPlanScope,
   secretKey,
 } from "../../src/sections/shared/secrets-engine.js";
 import {
   MOCK_SECRETS_PUBLIC_KEY,
   mockSodiumReady,
-  secretDigest,
   unsealSecretValue,
 } from "../e2e/mock/secrets.js";
 import { MockApi } from "../mock-api.js";
@@ -34,64 +25,114 @@ const section: SectionMeta = {
   undeclaredDefault: "keep",
 };
 
-function applyCtx(resolved?: Record<string, string>): SectionContext {
-  return {
-    api: new MockApi({}),
-    repo: { owner: "o", name: "r", slug: "o/r" },
-    check: false,
-    resolveSecret: (reference: string): string => {
-      const plaintext = resolved?.[reference];
-      if (plaintext === undefined) {
-        throw new Error(`test resolver has no value for ${reference}`);
-      }
-      return plaintext;
-    },
+const KEY_DATA = { key_id: "key-1", key: MOCK_SECRETS_PUBLIC_KEY };
+
+const PUBLIC_KEY_ENDPOINT: EndpointDecl = {
+  route: "GET /repos/{owner}/{repo}/actions/secrets/public-key",
+  statuses: { 200: "the sealing key" },
+};
+
+function resolver(resolved?: Record<string, string>): ExecTools["resolveSecret"] {
+  return (reference) => {
+    const plaintext = resolved?.[reference];
+    if (plaintext === undefined) {
+      throw new Error(`test resolver has no value for ${reference}`);
+    }
+    return plaintext;
   };
 }
 
-/**
- * A fabricated scope whose operations never touch an API: the list answers
- * `live`, the public key is the mock keypair's, and every sealed PUT is
- * recorded for the assertions.
- */
-function fabricatedScope(
-  live: string[],
-  puts: Array<{ name: string; payload: SealedSecretPayload }>,
-): SecretsScope {
+/** An erased planned op, as the fabricated plan scope's builders return it. */
+type Op = SectionPlan["ops"][number];
+
+/** A plan scope off the API: the list answers `live`, reads are counted, builders echo facets. */
+function fabricatedPlanScope(live: string[], reads: string[]): SecretsPlanScope<Op, Op> {
   return {
     label: "actions_secrets",
     noun: "Actions secret",
-    ops: {
-      list: async () => live.map((name) => ({ name })),
-      publicKey: async () => ({ key_id: "key-1", key: MOCK_SECRETS_PUBLIC_KEY }),
-      put: async (_ctx, _section, name, payload) => {
-        puts.push({ name, payload });
-        return null;
-      },
-      remove: async () => null,
+    list: async () => {
+      reads.push("list");
+      return live.map((name) => ({ name }));
     },
+    publicKeyEndpoint: PUBLIC_KEY_ENDPOINT,
+    publicKey: async (_exec, describe) => {
+      reads.push(describe);
+      return KEY_DATA;
+    },
+    put: (write) => ({
+      role: "put",
+      params: { secret_name: write.name },
+      payload: write.payload,
+      drift: write.drift,
+      change: write.change,
+    }),
+    remove: (deletion) => ({
+      role: "remove",
+      params: { secret_name: deletion.name },
+      drift: deletion.drift,
+      change: deletion.change,
+    }),
   };
 }
 
-describe("sealSecretValue", () => {
-  test("round-trips through the mock keypair, hostile characters included", async () => {
+describe("sealing", () => {
+  test("sealForGithub round-trips through the mock keypair, hostile characters included", async () => {
     await mockSodiumReady();
     const hostile = 'p@ss"word\\with\nnewline\tand unicode-éñ中';
-    const sealed = await sealSecretValue(hostile, MOCK_SECRETS_PUBLIC_KEY);
-    // The ciphertext is base64 and never contains the plaintext.
+    const sealed = sealForGithub(decodeBase64(MOCK_SECRETS_PUBLIC_KEY), hostile);
     expect(sealed).toMatch(/^[A-Za-z0-9+/]+=*$/);
     expect(sealed).not.toContain("p@ss");
     expect(unsealSecretValue(sealed)).toBe(hostile);
   });
 
-  test("two seals of the same plaintext differ, but their digests agree", async () => {
-    // Sealed boxes use a fresh ephemeral key per seal; the mock's digest is
-    // what makes idempotence judgeable anyway.
-    const a = await sealSecretValue("same-value", MOCK_SECRETS_PUBLIC_KEY);
-    const b = await sealSecretValue("same-value", MOCK_SECRETS_PUBLIC_KEY);
-    expect(a).not.toBe(b);
+  const WHERE =
+    "actions_secrets: GET /repos/{owner}/{repo}/actions/secrets/public-key (the actions_secrets sealing key) returned ";
+  const ADVICE =
+    ', so no value can be sealed. Check the "api-version" input against the GitHub REST docs for this endpoint';
+  test.each([
+    [
+      "a missing key_id",
+      { key: MOCK_SECRETS_PUBLIC_KEY },
+      `${WHERE}no usable {key_id, key} pair (key_id is missing)${ADVICE}`,
+    ],
+    [
+      "a key that is not base64",
+      { key_id: "k", key: "not base64!" },
+      `${WHERE}a key that is not valid base64${ADVICE}`,
+    ],
+    [
+      "a key of the wrong length",
+      { key_id: "k", key: Buffer.from("short").toString("base64") },
+      `${WHERE}a key that decodes to 5 bytes where an X25519 public key has 32${ADVICE}`,
+    ],
+    [
+      "a right-sized key that is not a usable point",
+      { key_id: "k", key: Buffer.alloc(32).toString("base64") },
+      `${WHERE}a key that is not a usable X25519 public key${ADVICE}`,
+    ],
+  ])("parseSealingKey rejects %s, naming the scope and the defect", (_what, body, message) => {
+    const attempt = () =>
+      parseSealingKey(section, { label: "actions_secrets" }, PUBLIC_KEY_ENDPOINT, body);
+    expect(attempt).toThrow(new Error(message));
+  });
+
+  test("a parsed sealing key seals synchronously into the {encrypted_value, key_id} body, fresh per seal", async () => {
     await mockSodiumReady();
-    expect(secretDigest(unsealSecretValue(a) ?? "")).toBe(secretDigest(unsealSecretValue(b) ?? ""));
+    // Sealed boxes use a fresh ephemeral key per seal, so the ciphertexts must differ while both carry the plaintext.
+    const key = parseSealingKey(
+      section,
+      { label: "actions_secrets" },
+      PUBLIC_KEY_ENDPOINT,
+      KEY_DATA,
+    );
+    expect(key.keyId).toBe("key-1");
+    const a = key.seal("same-value");
+    const b = key.seal("same-value");
+    expect(Object.keys(a).sort()).toEqual(["encrypted_value", "key_id"]);
+    expect(a.key_id).toBe("key-1");
+    expect(a.encrypted_value).not.toBe(b.encrypted_value);
+    expect(unsealSecretValue(a.encrypted_value)).toBe("same-value");
+    expect(unsealSecretValue(b.encrypted_value)).toBe("same-value");
   });
 });
 
@@ -106,16 +147,123 @@ describe("secretKey and duplicates", () => {
         { name: "Deploy_Token", value: "$A" },
         { name: "DEPLOY_TOKEN", value: "$B" },
       ]),
-    ).toThrow(/same actions_secrets entry.*"Deploy_Token" and "DEPLOY_TOKEN"/s);
+    ).toThrow(
+      new Error(
+        'actions_secrets: the settings file declares entries that name the same actions_secrets entry: "Deploy_Token" and "DEPLOY_TOKEN". Keep exactly one entry per resource',
+      ),
+    );
   });
 });
 
-describe("reconcileSecrets and the apply-arm resolver", () => {
-  // Reference VALIDATION (literals, provenance, unset/empty) lives in the
-  // engine (src/engine/secrets.ts + secret-refs.ts) and runs before any
-  // section; these tests cover only the resolver usage. The context ARMS
-  // themselves are compiler-enforced: a check context cannot carry a
-  // resolver, and an apply context cannot lack one.
+describe("planSecrets and the execution-time resolver", () => {
+  test("each PUT's thunk seals its OWN entry's resolved value, uppercasing the name; planning reads the list alone and the key once at execution", async () => {
+    await mockSodiumReady();
+    const reads: string[] = [];
+    const plan = await planSecrets(section, fabricatedPlanScope([], reads), {
+      entries: [
+        { name: "first", value: "$ONE" },
+        { name: "SECOND", value: "$TWO" },
+      ],
+      policy: "keep",
+      defaultPolicy: "keep",
+    });
+    // The sealing key is an execution-time read: check mode never issues it.
+    expect(reads).toEqual(["list"]);
+    expect(plan.ops.map((op) => op.params)).toEqual([
+      { secret_name: "FIRST" },
+      { secret_name: "SECOND" },
+    ]);
+    const lookups: string[] = [];
+    const exec: ExecTools = {
+      resolveSecret: (reference) => {
+        lookups.push(reference);
+        return resolver({ $ONE: "plain-1", $TWO: "plain-2" })(reference);
+      },
+    };
+    const sealed = await Promise.all(
+      plan.ops.map((op) =>
+        typeof op.payload === "function"
+          ? (op.payload(exec) as Promise<SealedSecretPayload>)
+          : Promise.resolve(null),
+      ),
+    );
+    // Both thunks share ONE key read.
+    expect(reads).toEqual(["list", "reading the actions_secrets sealing key"]);
+    expect(lookups).toEqual(["$ONE", "$TWO"]);
+    expect(sealed.map((p) => p?.key_id)).toEqual(["key-1", "key-1"]);
+    expect(sealed.map((p) => unsealSecretValue(p?.encrypted_value ?? ""))).toEqual([
+      "plain-1",
+      "plain-2",
+    ]);
+  });
+
+  test("a builder can only answer with its own role's operation", () => {
+    type Put = { role: "put"; params: { secret_name: string }; drift: string[]; change: string };
+    type Remove = {
+      role: "remove";
+      params: { secret_name: string };
+      drift: string[];
+      change: string;
+    };
+    const swapped = (deletion: { name: string; describe: string; change: string }): Put => ({
+      role: "put",
+      params: { secret_name: deletion.name },
+      drift: [],
+      change: deletion.change,
+    });
+    const scope: Pick<SecretsPlanScope<Put, Remove>, "remove"> = {
+      // @ts-expect-error the remove builder must return the remove-role operation
+      remove: swapped,
+    };
+    expect(typeof scope.remove).toBe("function");
+  });
+
+  test("a builder cannot demand a facet the engine never supplies", () => {
+    // Compile-time only: the builders are function-valued, so a narrower parameter is a contravariance error rather than a method-bivariance pass.
+    type Put = { role: "put"; params: { secret_name: string }; drift: string[]; change: string };
+    const demanding = (write: { name: string; change: string; keyId: string }): Put => ({
+      role: "put",
+      params: { secret_name: write.name },
+      drift: [],
+      change: `${write.change} ${write.keyId}`,
+    });
+    const scope: Pick<SecretsPlanScope<Put, Put>, "put"> = {
+      // @ts-expect-error the engine supplies no keyId facet
+      put: demanding,
+    };
+    expect(typeof scope.put).toBe("function");
+  });
+
+  test("an empty declaration plans nothing and never reads the sealing key", async () => {
+    const reads: string[] = [];
+    const plan = await planSecrets(section, fabricatedPlanScope([], reads), {
+      entries: [],
+      policy: "keep",
+      defaultPolicy: "keep",
+    });
+    expect(plan).toEqual({ ops: [], notes: [], drift: [] });
+    expect(reads).toEqual(["list"]);
+  });
+
+  test("a value the engine never resolved fails the thunk loudly", async () => {
+    const plan = await planSecrets(section, fabricatedPlanScope([], []), {
+      entries: [{ name: "A", value: "$NEVER_RESOLVED" }],
+      policy: "keep",
+      defaultPolicy: "keep",
+    });
+    const payload = plan.ops[0]?.payload;
+    expect(typeof payload).toBe("function");
+    if (typeof payload === "function") {
+      expect(() => payload({ resolveSecret: resolver({}) })).toThrow(
+        new Error("test resolver has no value for $NEVER_RESOLVED"),
+      );
+    }
+  });
+});
+
+describe("the section context arms", () => {
+  // Reference VALIDATION lives in the engine (src/engine/secrets.ts + secret-refs.ts) and runs before any section; the context ARMS are
+  // compiler-enforced.
   test("a check-mode context carrying a resolver does not compile", () => {
     // @ts-expect-error the check arm pins resolveSecret to never
     const checkCtx: SectionContext = {
@@ -125,55 +273,5 @@ describe("reconcileSecrets and the apply-arm resolver", () => {
       resolveSecret: (reference: string): string => reference,
     };
     expect(checkCtx.check).toBe(true);
-  });
-
-  test("an empty declaration in apply mode never touches the resolver", async () => {
-    // A document with no references gets the engine's stub resolver, and
-    // `actions_secrets: []` (or an entries-less `undeclared: delete` purge)
-    // must still apply - nothing to seal means nothing to resolve.
-    const puts: Array<{ name: string; payload: SealedSecretPayload }> = [];
-    const run = beginRun(applyCtx());
-    await reconcileSecrets(run, section, fabricatedScope([], puts), {
-      entries: [],
-      policy: "keep",
-      defaultPolicy: "keep",
-    });
-    expect(run.result.changes).toEqual([]);
-    expect(puts).toEqual([]);
-  });
-
-  test("apply seals each entry's OWN resolved value, uppercasing the name", async () => {
-    await mockSodiumReady();
-    const puts: Array<{ name: string; payload: SealedSecretPayload }> = [];
-    await reconcileSecrets(
-      beginRun(applyCtx({ $ONE: "plain-1", $TWO: "plain-2" })),
-      section,
-      fabricatedScope([], puts),
-      {
-        entries: [
-          { name: "first", value: "$ONE" },
-          { name: "SECOND", value: "$TWO" },
-        ],
-        policy: "keep",
-        defaultPolicy: "keep",
-      },
-    );
-    expect(puts.map((put) => put.name)).toEqual(["FIRST", "SECOND"]);
-    expect(puts.map((put) => unsealSecretValue(put.payload.encrypted_value))).toEqual([
-      "plain-1",
-      "plain-2",
-    ]);
-  });
-
-  test("a value the engine never resolved fails the entry loudly", async () => {
-    const puts: Array<{ name: string; payload: SealedSecretPayload }> = [];
-    await expect(
-      reconcileSecrets(beginRun(applyCtx({})), section, fabricatedScope([], puts), {
-        entries: [{ name: "A", value: "$NEVER_RESOLVED" }],
-        policy: "keep",
-        defaultPolicy: "keep",
-      }),
-    ).rejects.toThrow(/no value for \$NEVER_RESOLVED/);
-    expect(puts).toEqual([]);
   });
 });

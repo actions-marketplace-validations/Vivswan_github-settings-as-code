@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { executePlan } from "../../../src/engine/execute.js";
+import type { GitHubClient } from "../../../src/github/api.js";
+import {
+  type PlannedOp,
+  planContext,
+  snapshotContext,
+} from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
-import { ctx } from "../../../test/sections/context.js";
+import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
+import { REPO } from "../../../test/sections/section-run.js";
 import { normalizeRefName, normalizeRuleset, rulesetsSection } from "./index.js";
 
 describe("normalizeRefName", () => {
@@ -31,58 +39,355 @@ describe("normalizeRuleset", () => {
   });
 });
 
+/** A live ruleset as the list summary and the by-id read return it. */
+type LiveRuleset = Record<string, unknown> & { id: number; name: string; source_type?: string };
+
+/** A stateful fake of the rulesets API; `ignoredKeys` are accepted on a write and dropped, as GitHub does with a key it does not know. */
+function liveRepo(
+  rulesets: LiveRuleset[],
+  ignoredKeys: readonly string[] = [],
+): GitHubClient & { writes: string[] } {
+  let nextId = 1000;
+  const stored = (body: unknown): Record<string, unknown> =>
+    Object.fromEntries(Object.entries(body ?? {}).filter(([key]) => !ignoredKeys.includes(key)));
+  return {
+    writes: [],
+    async tryRequest(method, path, payload) {
+      const byId = path.match(/\/rulesets\/(\d+)$/);
+      const target = rulesets.find((r) => String(r.id) === byId?.[1]);
+      if (method === "GET") {
+        if (byId === null) {
+          return { data: rulesets.map(({ id, name, source_type }) => ({ id, name, source_type })) };
+        }
+        return target === undefined
+          ? { error: { status: 404, message: "Not Found", body: "" } }
+          : { data: target };
+      }
+      this.writes.push(`${method} ${path}`);
+      const body = stored(payload);
+      if (method === "POST") {
+        const created = { id: nextId++, source_type: "Repository", ...body } as LiveRuleset;
+        rulesets.push(created);
+        return { data: created };
+      }
+      if (target === undefined) {
+        return { error: { status: 404, message: "Not Found", body: "" } };
+      }
+      if (method === "PUT") {
+        Object.assign(target, body);
+        return { data: target };
+      }
+      rulesets.splice(rulesets.indexOf(target), 1);
+      return { data: null };
+    },
+    async tryGraphql() {
+      throw new Error("the rulesets section issues no GraphQL");
+    },
+  };
+}
+
 describe("rulesets", () => {
-  test("creates missing with normalized refs, never deletes undeclared", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": {
-        data: [{ id: 7, name: "legacy", source_type: "Repository" }],
-      },
-    }).allowMutations("POST /repos/o/r/rulesets");
-    const result = await rulesetsSection.run(ctx(api), [
+  const listRoute = "GET /repos/o/r/rulesets?per_page=100&page=1";
+  const plan = (api: MockApi, desired: Parameters<typeof rulesetsSection.plan>[1]) =>
+    rulesetsSection.plan(planContext(rulesetsSection, api, REPO), desired);
+  /** A mock that would accept every write the section declares. */
+  const writable = (routes: ConstructorParameters<typeof MockApi>[0]) =>
+    new MockApi(routes).allowMutations(
+      "POST /repos/o/r/rulesets",
+      "PUT /repos/o/r/rulesets/*",
+      "DELETE /repos/o/r/rulesets/*",
+    );
+
+  test("a missing ruleset plans a create with normalized refs and defaults; undeclared ones are notes", async () => {
+    const api = writable({
+      [listRoute]: { data: [{ id: 7, name: "legacy", source_type: "Repository" }] },
+    });
+    const result = await plan(api, [
       {
         name: "build-tags",
         target: "tag",
-        enforcement: "active",
         conditions: { ref_name: { include: ["templates/*"], exclude: [] } },
         rules: [{ type: "deletion" }],
       },
     ]);
-    expect(result.changes).toEqual(['created ruleset "build-tags"']);
-    expect(result.notes).toEqual([
-      'ruleset "legacy" exists on the repo but is not declared in the settings file; kept under "undeclared: keep" - add it to the settings file to manage it, or set "undeclared: delete" to have apply DELETE it',
-    ]);
-    const post = api.mutations()[0];
-    expect(post?.method).toBe("POST");
-    const payload = post?.payload as { conditions: { ref_name: { include: string[] } } };
-    expect(payload.conditions.ref_name.include).toEqual(["refs/tags/templates/*"]);
+    expect(result).toEqual({
+      ops: [
+        {
+          role: "create",
+          payload: {
+            name: "build-tags",
+            target: "tag",
+            enforcement: "active",
+            conditions: { ref_name: { include: ["refs/tags/templates/*"], exclude: [] } },
+            rules: [{ type: "deletion" }],
+          },
+          describe: 'creating ruleset "build-tags"',
+          drift: [
+            "rulesets[build-tags]: missing - declared in the settings file but not on the repo; apply will create it",
+          ],
+          change: 'created ruleset "build-tags"',
+        },
+      ],
+      notes: [
+        'ruleset "legacy" exists on the repo but is not declared in the settings file; kept under "_undeclared: keep" - add it to the settings file to manage it, or set "_undeclared: delete" to have apply DELETE it',
+      ],
+      drift: [],
+    });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([listRoute]);
   });
 
-  test("updates by name with full payload", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": {
-        data: [{ id: 9, name: "main", source_type: "Repository" }],
+  test("a divergent existing ruleset plans a full-payload update carrying the subset drift", async () => {
+    const api = writable({
+      [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+      "GET /repos/o/r/rulesets/9": {
+        data: {
+          id: 9,
+          name: "main",
+          target: "branch",
+          enforcement: "evaluate",
+          rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
+          bypass_actors: [{ actor_id: 1, actor_type: "Team" }],
+        },
       },
-    }).allowMutations("PUT /repos/o/r/rulesets/*");
-    const result = await rulesetsSection.run(ctx(api), [
+    });
+    const result = await plan(api, [
       { name: "main", target: "branch", rules: [{ type: "deletion" }] },
     ]);
-    expect(result.changes).toEqual(['updated ruleset "main" (id 9)']);
-    expect(api.mutations()[0]?.path).toBe("/repos/o/r/rulesets/9");
+    expect(result).toEqual({
+      ops: [
+        {
+          role: "update",
+          params: { ruleset_id: "9" },
+          payload: {
+            name: "main",
+            target: "branch",
+            enforcement: "active",
+            rules: [{ type: "deletion" }],
+          },
+          describe: 'updating ruleset "main"',
+          drift: [
+            "rulesets[main].rules[non_fast_forward]: present live but not declared",
+            'rulesets[main].enforcement: declared "active" != live "evaluate"; apply will set the declared value',
+          ],
+          change: 'updated ruleset "main"',
+        },
+      ],
+      notes: [],
+      drift: [],
+    });
+    expect(api.mutations()).toEqual([]);
   });
 
-  test("ruleset create defaults enforcement", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": { data: [] },
-    }).allowMutations("POST /repos/o/r/rulesets");
-    await rulesetsSection.run(ctx(api), [{ name: "x", target: "branch" }]);
-    const payload = api.mutations()[0]?.payload as { enforcement?: string };
-    expect(payload.enforcement).toBe("active");
+  test("a declared key the live ruleset lacks is drift plus a phantom-key note", async () => {
+    // One read cannot tell a typo from a write-only key, so the update still runs and the note warns it recurs until the key is fixed or removed.
+    const api = writable({
+      [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+      "GET /repos/o/r/rulesets/9": {
+        data: { id: 9, name: "main", target: "branch", enforcement: "active" },
+      },
+    });
+    // A variable, not a literal, so the extra key is a passthrough field to the type checker rather than an excess property.
+    const misspelled = { name: "main", target: "branch" as const, enforcemant: "evaluate" };
+    const result = await plan(api, [misspelled]);
+    expect(result).toEqual({
+      ops: [
+        {
+          role: "update",
+          params: { ruleset_id: "9" },
+          payload: { ...misspelled, enforcement: "active" },
+          describe: 'updating ruleset "main"',
+          drift: [
+            'rulesets[main].enforcemant: declared "evaluate" but the API response has no such field (new or write-only field?)',
+          ],
+          change: 'updated ruleset "main"',
+        },
+      ],
+      notes: [
+        'rulesets[main]: declared key "enforcemant" does not exist on the live ruleset, so if GitHub ignores it this update will re-run on every apply without converging. Fix the key name, or remove it from the settings file',
+      ],
+      drift: [],
+    });
+  });
+
+  test("a key GitHub drops re-plans the identical update and note on every pass: documented non-convergence", async () => {
+    // One read cannot tell a typo from a field GitHub omits until set, so the write is never withheld.
+    const api = liveRepo(
+      [{ id: 9, name: "main", source_type: "Repository", target: "branch", enforcement: "active" }],
+      ["enforcemant"],
+    );
+    const misspelled = { name: "main", target: "branch" as const, enforcemant: "evaluate" };
+    const pass = async () =>
+      rulesetsSection.plan(planContext(rulesetsSection, api, REPO), [misspelled]);
+    const first = await pass();
+    const execution = await executePlan(first, rulesetsSection, api, REPO, {
+      resolveSecret() {
+        throw new Error("no secrets");
+      },
+    });
+    expect(execution).toEqual({
+      status: "applied",
+      changes: ['updated ruleset "main"'],
+      notes: [],
+      landed: 1,
+    });
+    const second = await pass();
+    expect(first).toEqual({
+      ops: [
+        {
+          role: "update",
+          params: { ruleset_id: "9" },
+          payload: { ...misspelled, enforcement: "active" },
+          describe: 'updating ruleset "main"',
+          drift: [
+            'rulesets[main].enforcemant: declared "evaluate" but the API response has no such field (new or write-only field?)',
+          ],
+          change: 'updated ruleset "main"',
+        },
+      ],
+      notes: [
+        'rulesets[main]: declared key "enforcemant" does not exist on the live ruleset, so if GitHub ignores it this update will re-run on every apply without converging. Fix the key name, or remove it from the settings file',
+      ],
+      drift: [],
+    });
+    expect(second).toEqual(first);
+    expect(api.writes).toEqual(["PUT /repos/o/r/rulesets/9"]);
+  });
+
+  describe("bypass_actors visibility", () => {
+    // GitHub answers a non-admin GET without the bypass_actors key (never `[]`), so the declared list cannot be judged.
+    const BASE = { id: 9, name: "main", target: "branch", enforcement: "active" };
+    const HIDDEN_NOTE =
+      "rulesets[main]: bypass_actors is not visible to this token (GitHub returns it only to a token with write access to the ruleset), so drift on it cannot be judged here; grant Administration write to check it";
+    const team = { actor_id: 1, actor_type: "Team", bypass_mode: "always" };
+    const cases: Array<{
+      name: string;
+      declared: Record<string, unknown>[];
+      live: Record<string, unknown>;
+      expected: Awaited<ReturnType<typeof plan>>;
+    }> = [
+      {
+        name: "key absent live, declared []: converged with the visibility note",
+        declared: [],
+        live: BASE,
+        expected: { ops: [], notes: [HIDDEN_NOTE], drift: [] },
+      },
+      {
+        name: "key absent live, declared non-empty: converged with the visibility note",
+        declared: [team],
+        live: BASE,
+        expected: { ops: [], notes: [HIDDEN_NOTE], drift: [] },
+      },
+      {
+        name: "key present and different: real drift, no note",
+        declared: [team],
+        live: { ...BASE, bypass_actors: [] },
+        expected: {
+          ops: [
+            {
+              role: "update",
+              params: { ruleset_id: "9" },
+              payload: {
+                name: "main",
+                target: "branch",
+                enforcement: "active",
+                bypass_actors: [team],
+              },
+              describe: 'updating ruleset "main"',
+              drift: [
+                'rulesets[main].bypass_actors[0]: no matching live entry for {"actor_id":1,"actor_type":"Team","bypass_mode":"always"}',
+              ],
+              change: 'updated ruleset "main"',
+            },
+          ],
+          notes: [],
+          drift: [],
+        },
+      },
+      {
+        name: "key present and equal: converged, no note",
+        declared: [team],
+        live: { ...BASE, bypass_actors: [team] },
+        expected: { ops: [], notes: [], drift: [] },
+      },
+    ];
+    for (const { name, declared, live, expected } of cases) {
+      test(name, async () => {
+        const api = writable({
+          [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+          "GET /repos/o/r/rulesets/9": { data: live },
+        });
+        const result = await plan(api, [
+          { name: "main", target: "branch", enforcement: "active", bypass_actors: declared },
+        ]);
+        expect(result).toEqual(expected);
+        expect(api.mutations()).toEqual([]);
+      });
+    }
+
+    test("a hidden bypass_actors beside real drift: the note, the drift, and the full declared payload", async () => {
+      const api = writable({
+        [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+        "GET /repos/o/r/rulesets/9": { data: { ...BASE, enforcement: "evaluate" } },
+      });
+      const result = await plan(api, [
+        { name: "main", target: "branch", enforcement: "active", bypass_actors: [team] },
+      ]);
+      expect(result).toEqual({
+        ops: [
+          {
+            role: "update",
+            params: { ruleset_id: "9" },
+            payload: {
+              name: "main",
+              target: "branch",
+              enforcement: "active",
+              bypass_actors: [team],
+            },
+            describe: 'updating ruleset "main"',
+            drift: [
+              'rulesets[main].enforcement: declared "active" != live "evaluate"; apply will set the declared value',
+            ],
+            change: 'updated ruleset "main"',
+          },
+        ],
+        notes: [HIDDEN_NOTE],
+        drift: [],
+      });
+    });
+  });
+
+  test("a converged ruleset plans nothing: rules match by type regardless of order", async () => {
+    const api = writable({
+      [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+      "GET /repos/o/r/rulesets/9": {
+        data: {
+          id: 9,
+          name: "main",
+          target: "branch",
+          enforcement: "active",
+          conditions: { ref_name: { include: ["refs/heads/main"], exclude: [] } },
+          rules: [{ type: "non_fast_forward" }, { type: "deletion" }],
+        },
+      },
+    });
+    const result = await plan(api, [
+      {
+        name: "main",
+        conditions: { ref_name: { include: ["main"] } },
+        rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
+      },
+    ]);
+    expect(result).toEqual({ ops: [], notes: [], drift: [] });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      listRoute,
+      "GET /repos/o/r/rulesets/9",
+    ]);
   });
 
   test("duplicate ruleset names are rejected before any API call", async () => {
     const api = new MockApi({});
     await expect(
-      rulesetsSection.run(ctx(api), [
+      plan(api, [
         { name: "main", target: "branch" },
         { name: "main", target: "tag" },
       ]),
@@ -90,33 +395,99 @@ describe("rulesets", () => {
     expect(api.calls).toHaveLength(0);
   });
 
-  test("wrapped undeclared:delete DELETES the undeclared ruleset", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": {
+  test("a repeated rule type is a settings-file error before any read, and a live body repeating one fails loudly naming the ruleset", async () => {
+    // Rules pair by type, so a repeat has no pairing; the settings-file case names the fix, the live case the defect.
+    const api = writable({
+      [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+      "GET /repos/o/r/rulesets/9": {
+        data: {
+          id: 9,
+          name: "main",
+          target: "branch",
+          enforcement: "active",
+          rules: [{ type: "deletion" }, { type: "deletion" }],
+        },
+      },
+    });
+    await expect(
+      plan(api, [{ name: "main", rules: [{ type: "deletion" }, { type: "deletion" }] }]),
+    ).rejects.toThrow(
+      'rulesets: the settings file declares conflicting rulesets: the ruleset "main" lists the rule type "deletion" more than once, and GitHub keeps one rule per type - declare each type once. Fix the settings file, then re-run',
+    );
+    await expect(
+      plan(api, [
+        {
+          name: "main",
+          rules: [
+            { type: "deletion" },
+            { type: "deletion" },
+            { type: "creation" },
+            { type: "creation" },
+          ],
+        },
+      ]),
+    ).rejects.toThrow('lists the rule types "deletion", "creation" more than once');
+    expect(api.calls).toHaveLength(0);
+    await expect(plan(api, [{ name: "main", rules: [{ type: "deletion" }] }])).rejects.toThrow(
+      'rulesets: GitHub returned the ruleset "main" (id 9) with the rule type "deletion" more than once, so its rules cannot be paired by type; delete the repeated rule on GitHub, then re-run',
+    );
+    expect(api.mutations()).toEqual([]);
+  });
+
+  test("wrapped _undeclared:delete plans the DELETE after the declared upserts", async () => {
+    const api = writable({
+      [listRoute]: {
         data: [
           { id: 7, name: "legacy", source_type: "Repository" },
           { id: 9, name: "main", source_type: "Repository" },
         ],
       },
-    }).allowMutations("PUT /repos/o/r/rulesets/*", "DELETE /repos/o/r/rulesets/*");
-    const result = await rulesetsSection.run(ctx(api), {
-      undeclared: "delete",
+      "GET /repos/o/r/rulesets/9": {
+        data: { id: 9, name: "main", target: "branch", enforcement: "disabled", rules: [] },
+      },
+    });
+    const result = await plan(api, {
+      _undeclared: "delete",
       entries: [{ name: "main", target: "branch", rules: [{ type: "deletion" }] }],
     });
-    expect(result.changes).toEqual([
-      'updated ruleset "main" (id 9)',
-      'DELETED undeclared ruleset "legacy"',
-    ]);
-    expect(result.notes).toEqual([]);
-    expect(api.mutations().at(-1)?.path).toBe("/repos/o/r/rulesets/7");
+    expect(result).toEqual({
+      ops: [
+        {
+          role: "update",
+          params: { ruleset_id: "9" },
+          payload: {
+            name: "main",
+            target: "branch",
+            enforcement: "active",
+            rules: [{ type: "deletion" }],
+          },
+          describe: 'updating ruleset "main"',
+          drift: [
+            "rulesets[main].rules[deletion]: missing live",
+            'rulesets[main].enforcement: declared "active" != live "disabled"; apply will set the declared value',
+          ],
+          change: 'updated ruleset "main"',
+        },
+        {
+          role: "remove",
+          params: { ruleset_id: "7" },
+          describe: 'deleting undeclared ruleset "legacy"',
+          drift: [
+            'rulesets[legacy]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
+          ],
+          change: 'DELETED undeclared ruleset "legacy"',
+        },
+      ],
+      notes: [],
+      drift: [],
+    });
+    expect(api.mutations()).toEqual([]);
   });
 
-  test("undeclared:delete never deletes a ruleset without an explicit Repository source", async () => {
-    // source_type is optional in the API type; a missing field is not proof
-    // of repository ownership, and deletion cannot be undone. Organization
-    // and enterprise rulesets never enter the managed list at all.
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": {
+  test("_undeclared:delete deletes a repository-owned ruleset, a source_type-less one included, and never an inherited one", async () => {
+    // source_type is optional in the API type; a body without it is read as repository-owned, the only kind the repository endpoints can write.
+    const api = writable({
+      [listRoute]: {
         data: [
           { id: 7, name: "ambiguous" },
           { id: 8, name: "org-owned", source_type: "Organization" },
@@ -124,45 +495,209 @@ describe("rulesets", () => {
           { id: 10, name: "repo-owned", source_type: "Repository" },
         ],
       },
-    }).allowMutations("DELETE /repos/o/r/rulesets/*");
-    const result = await rulesetsSection.run(ctx(api), {
-      undeclared: "delete",
-      entries: [],
     });
-    // Only the explicitly repository-owned ruleset is deleted; the
-    // source_type-less one is kept with a note naming the rule.
-    expect(result.changes).toEqual(['DELETED undeclared ruleset "repo-owned"']);
-    expect(result.notes).toEqual([
-      'ruleset "ambiguous" is undeclared, but the list response does not mark it source_type "Repository"; NOT deleting - only rulesets the API explicitly marks repository-owned are deleted; add it to the settings file to manage it, or delete it in GitHub if it should not exist',
-    ]);
-    expect(api.mutations().map((m) => m.path)).toEqual(["/repos/o/r/rulesets/10"]);
-  });
-
-  test("wrapped undeclared:delete in check mode reports drift, writes nothing", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": {
-        data: [{ id: 7, name: "legacy", source_type: "Repository" }],
-      },
+    const undeclared = (name: string, id: number) => ({
+      role: "remove" as const,
+      params: { ruleset_id: String(id) },
+      describe: `deleting undeclared ruleset "${name}"`,
+      drift: [
+        `rulesets[${name}]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it`,
+      ] as const,
+      change: `DELETED undeclared ruleset "${name}"`,
     });
-    const result = await rulesetsSection.run(ctx(api, true), {
-      undeclared: "delete",
-      entries: [],
+    expect(await plan(api, { _undeclared: "delete", entries: [] })).toEqual({
+      ops: [undeclared("ambiguous", 7), undeclared("repo-owned", 10)],
+      notes: [],
+      drift: [],
     });
-    expect(result.drift).toEqual([
-      'rulesets[legacy]: undeclared - not in the settings file and "undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
-    ]);
-    expect(api.mutations()).toEqual([]);
   });
 
   test("the wrapper without a policy keeps the keep default (notes only)", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r/rulesets?per_page=100&page=1": {
-        data: [{ id: 7, name: "legacy", source_type: "Repository" }],
-      },
+    const api = writable({
+      [listRoute]: { data: [{ id: 7, name: "legacy", source_type: "Repository" }] },
     });
-    const result = await rulesetsSection.run(ctx(api), { entries: [] });
-    expect(result.changes).toEqual([]);
-    expect(result.notes).toHaveLength(1);
-    expect(api.mutations()).toEqual([]);
+    expect(await plan(api, { entries: [] })).toEqual({
+      ops: [],
+      notes: [
+        'ruleset "legacy" exists on the repo but is not declared in the settings file; kept under "_undeclared: keep" - add it to the settings file to manage it, or set "_undeclared: delete" to have apply DELETE it',
+      ],
+      drift: [],
+    });
+  });
+
+  test("executing the plan converges: create, update, and delete land once, then the re-plan is empty", async () => {
+    const api = liveRepo([
+      { id: 7, name: "legacy", source_type: "Repository", enforcement: "active" },
+      { id: 9, name: "main", source_type: "Repository", target: "branch", enforcement: "evaluate" },
+      { id: 900, name: "org-baseline", source_type: "Organization", enforcement: "active" },
+    ]);
+    const { first, second, changes } = await provePlanIdempotent(rulesetsSection, api, {
+      _undeclared: "delete",
+      entries: [
+        { name: "main", target: "branch", enforcement: "active", rules: [{ type: "deletion" }] },
+        { name: "tags", target: "tag", conditions: { ref_name: { include: ["v*"] } } },
+      ],
+    });
+    expect(changes).toEqual([
+      'updated ruleset "main"',
+      'created ruleset "tags"',
+      'DELETED undeclared ruleset "legacy"',
+    ]);
+    expect(api.writes).toEqual([
+      "PUT /repos/o/r/rulesets/9",
+      "POST /repos/o/r/rulesets",
+      "DELETE /repos/o/r/rulesets/7",
+    ]);
+    expect(first.drift).toEqual([]);
+    expect(second).toEqual({ ops: [], notes: [], drift: [] });
+  });
+
+  test("the read port exposes the list and get roles, the list narrowed to its denied posture", () => {
+    const ctx = planContext(rulesetsSection, new MockApi({}), REPO);
+    expect(Object.keys(ctx.read)).toEqual(["list", "get"]);
+    // @ts-expect-error a write role is not a read: the port has no `create`
+    ctx.read.create;
+    // @ts-expect-error nor an `update`
+    ctx.read.update;
+    // @ts-expect-error nor a `remove`
+    ctx.read.remove;
+    // @ts-expect-error nor the raw client
+    ctx.api;
+    // @ts-expect-error a "denied" primary read offers no 404-tolerant helper
+    ctx.read.list.probeAbsent;
+    // @ts-expect-error nor the tolerant tryCall
+    ctx.read.list.tryCall;
+  });
+
+  test("a planned operation can only name a declared write role, and must justify itself", () => {
+    // Compile-time only. Each rejected shape is built first and assigned on one line, so the @ts-expect-error anchors to the assignment whichever
+    // property the compiler blames.
+    type Op = PlannedOp<typeof rulesetsSection.endpoints>;
+    const _create: Op = { role: "create", payload: { name: "x" }, drift: ["missing"], change: "" };
+    const read = { role: "get", params: { ruleset_id: "1" }, drift: ["x"], change: "" } as const;
+    // @ts-expect-error the get role is a read, not a plannable write
+    const _read: Op = read;
+    const paramless = { role: "update", payload: {}, drift: ["x"], change: "" } as const;
+    // @ts-expect-error the route's ruleset_id path param is required
+    const _paramless: Op = paramless;
+    const silent = { role: "create", payload: {}, drift: [], change: "" } as const;
+    // @ts-expect-error a write on a non-alwaysRewrite endpoint must carry drift
+    const _silent: Op = silent;
+  });
+});
+
+describe("rulesets snapshot", () => {
+  const snapshot = (api: GitHubClient) =>
+    rulesetsSection.snapshot(snapshotContext(rulesetsSection, api, REPO, "fail"));
+
+  /** A live ruleset as the by-id GET returns it, server fields included. */
+  const served = (
+    id: number,
+    name: string,
+    body: Record<string, unknown>,
+  ): Record<string, unknown> & { id: number; name: string } => ({
+    id,
+    name,
+    node_id: `RRS_${id}`,
+    source_type: "Repository",
+    source: "o/r",
+    _links: { self: { href: `https://api.github.com/repos/o/r/rulesets/${id}` } },
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-02T00:00:00Z",
+    current_user_can_bypass: "always",
+    ...body,
+  });
+
+  test("reads repository rulesets back as keep entries, dropping server fields; a hidden bypass list and an inherited ruleset are notes, not entries", async () => {
+    const api = liveRepo([
+      served(1, "main", {
+        target: "branch",
+        enforcement: "active",
+        conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+        rules: [
+          { type: "deletion" },
+          { type: "pull_request", parameters: { required_approving_review_count: 1 } },
+        ],
+        bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }],
+      }),
+      // No bypass_actors KEY: what a token without write access is served.
+      served(2, "tags", {
+        target: "tag",
+        enforcement: "evaluate",
+        conditions: { ref_name: { include: ["refs/tags/v*"], exclude: [] } },
+        rules: [{ type: "update" }],
+      }),
+      {
+        ...served(3, "org-wide", { target: "branch", enforcement: "active" }),
+        source_type: "Organization",
+      },
+    ]);
+    expect(await snapshot(api)).toEqual({
+      value: {
+        _undeclared: "keep",
+        entries: [
+          {
+            name: "main",
+            target: "branch",
+            enforcement: "active",
+            conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+            rules: [
+              { type: "deletion" },
+              { type: "pull_request", parameters: { required_approving_review_count: 1 } },
+            ],
+            bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }],
+          },
+        ],
+      },
+      notes: [
+        'rulesets[org-wide]: left out of the snapshot - inherited from the organization (source_type "Organization"); manage it where it is defined',
+        "rulesets[tags]: left out of the snapshot - bypass_actors is not visible to this token (GitHub returns it only to a token with write access to the ruleset), " +
+          "and an entry without it would clear it on the next update; grant Administration write to read it back",
+      ],
+    });
+    expect(api.writes).toEqual([]);
+  });
+
+  test("two repository rulesets under one name fail the snapshot naming both, since plan() upserts by name", async () => {
+    const api = liveRepo([
+      served(1, "main", { target: "branch", enforcement: "active" }),
+      served(2, "main", { target: "tag", enforcement: "active" }),
+    ]);
+    await expect(snapshot(api)).rejects.toThrow(
+      'rulesets: GitHub holds rulesets that resolve to one identity: "main (ruleset id 1)" and "main (ruleset id 2)". This section manages one ruleset per identity, so it cannot tell them apart; delete all but one of each on GitHub, then run again',
+    );
+  });
+
+  test("an owned ruleset left out for its hidden bypass list leaves an empty keep wrapper, which plans as a no-op", async () => {
+    const api = liveRepo([served(2, "tags", { target: "tag", enforcement: "evaluate" })]);
+    const read = await snapshot(api);
+    expect(read).toEqual({
+      value: { _undeclared: "keep", entries: [] },
+      notes: [
+        "rulesets[tags]: left out of the snapshot - bypass_actors is not visible to this token (GitHub returns it only to a token with write access to the ruleset), " +
+          "and an entry without it would clear it on the next update; grant Administration write to read it back",
+      ],
+    });
+    const planned = await rulesetsSection.plan(
+      planContext(rulesetsSection, api, REPO),
+      read.value as NonNullable<typeof read.value>,
+    );
+    expect({ ops: planned.ops, drift: planned.drift }).toEqual({ ops: [], drift: [] });
+    expect(api.writes).toEqual([]);
+  });
+
+  test("only inherited rulesets is nothing to declare, with the inherited note", async () => {
+    const api = liveRepo([
+      {
+        ...served(3, "org-wide", { target: "branch", enforcement: "active" }),
+        source_type: "Organization",
+      },
+    ]);
+    expect(await snapshot(api)).toEqual({
+      value: undefined,
+      notes: [
+        'rulesets[org-wide]: left out of the snapshot - inherited from the organization (source_type "Organization"); manage it where it is defined',
+      ],
+    });
   });
 });

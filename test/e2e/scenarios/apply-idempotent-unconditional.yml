@@ -1,21 +1,11 @@
-# The unconditional half of the COMPARE_BEFORE_WRITE table needs a corpus
-# witness per false-listed section: run.ts fails (unwitnessedUnconditionalSections)
-# when a false-listed section has no apply_idempotent scenario writing to it,
-# because a wrong `false` merely weakens the zero-write proof and nothing else
-# would contradict it. apply-idempotent-mixed carries the compare-before-write
-# sections plus rulesets and environments; the secrets *-apply-converges
-# scenarios carry the four secret sections and webhooks. This scenario covers
-# the rest: each section here writes unconditionally, so the second apply must
-# write to every one of them again while leaving the mock state byte-identical,
-# and the final check run reads back clean.
+# Corpus witness for the alwaysRewrite endpoints no other apply_idempotent scenario writes: run.ts
+# fails (unwitnessedExemptEndpoints) when a flagged endpoint is never written by a first apply. The
+# LFS PUT, the check suite PATCH, and the interaction-limit PUT recur byte-stably; the rest stay quiet.
 name: apply-idempotent-unconditional
 settings:
   repository:
     description: unconditional PATCH witness
-  branches:
-    - name: main
-      protection:
-        enforce_admins: true
+    enable_git_lfs: true
   actions:
     default_workflow_permissions: read
   pages:
@@ -41,8 +31,8 @@ settings:
     expiry: one_week
 owner_kind: org
 live_state:
-  # A live Pages site, so both applies take the unconditional update PUT (a
-  # create would be a POST whose body needs source and build_type instead).
+  # A live Pages site, so the first apply takes the update PUT (a create
+  # would be a POST whose body needs source and build_type instead).
   pages:
     url: https://api.github.com/repos/e2e-owner/e2e-repo/pages
     build_type: workflow
@@ -54,4 +44,4 @@ live_state:
 expect:
   exit_code: 0
   result: applied
-  apply_idempotent: true
+  fixpoint: apply_idempotent

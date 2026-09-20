@@ -1,18 +1,9 @@
 /**
- * The mock's GraphQL pipeline, tested at three levels:
- *   - through the wire (startMockServer + fetch) for the parts that need no
- *     declared operation: the POST-only rule, the body-shape rule, and the
- *     unknown-operationName violation (the fixture names below are declared
- *     by no section, so they stay unknown at the wire);
- *   - through handleGraphqlRequest with FIXTURE operation/handler tables (the
- *     same injectable-dictionary idiom as assertHandlerCompleteness) for
- *     dispatch, the check-mode barrier, the permission gate and denial
- *     barrier, slug resolution from variables and node ids, the
- *     declared-outcomes response guard, and the fault/corruption hooks;
- *   - through the PRODUCTION tables for the pinned-environments position
- *     semantics the mock must model exactly (verified live behavior: tail
- *     appends via a monotonic counter, holes on unpin, renormalization only
- *     on reorder).
+ * The mock's GraphQL pipeline at three levels. The fixture operations below are declared by no
+ * section, so at the wire they stay unknown and only the rules needing no declared op are tested.
+ *   wire (startMockServer + fetch)          -> POST-only, body shape, unknown operationName
+ *   handleGraphqlRequest with fixture tables -> dispatch, barriers, gate, slug resolution, faults
+ *   the production tables                    -> pinned-environments positions (verified live)
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -58,6 +49,12 @@ const G_READ_TOLERANT: TaggedGraphqlOp = {
   role: "gProbe",
   outcomes: { ok: "the toggles", NOT_FOUND: "the feature is off" },
 };
+const G_READ_EXECUTION: TaggedGraphqlOp = {
+  ...G_READ,
+  name: "RepoNodeId",
+  role: "gNodeId",
+  phase: "execution",
+};
 const G_WRITE: TaggedGraphqlOp = {
   name: "UpdateToggles",
   kind: "write",
@@ -71,6 +68,7 @@ const G_WRITE: TaggedGraphqlOp = {
 const OPS: Readonly<Record<string, TaggedGraphqlOp>> = {
   "repository.gToggles": G_READ,
   "repository.gProbe": G_READ_TOLERANT,
+  "repository.gNodeId": G_READ_EXECUTION,
   "repository.gUpdate": G_WRITE,
 };
 
@@ -79,13 +77,15 @@ const HANDLERS: Record<string, GraphqlHandler> = {
     data: { repository: { id: String(state.repo.node_id) } },
   }),
   "repository.gProbe": () => ({ errors: [{ type: "NOT_FOUND", message: "feature off" }] }),
+  "repository.gNodeId": ({ state }) => ({
+    data: { repository: { id: String(state.repo.node_id) } },
+  }),
   "repository.gUpdate": ({ state, variables }) => {
     state.repo.has_wiki = variables.hasWiki === true;
     return { data: { updateRepository: { clientMutationId: null } } };
   },
 };
 
-/** The wire body for a fixture operation. */
 function gqlBody(op: TaggedGraphqlOp, variables: Json): Json {
   return { query: op.query, operationName: op.name, variables };
 }
@@ -104,7 +104,6 @@ function baseLog(body: unknown): LoggedRequest {
   return { method: "POST", pathname: "/graphql", query: "", status: 0, body };
 }
 
-/** Dispatch one fixture operation through the pipeline branch. */
 function dispatch(op: TaggedGraphqlOp, variables: Json, opts: PipelineOptions, method = "POST") {
   const body = gqlBody(op, variables);
   return handleGraphqlRequest({ method, body }, opts, baseLog(body), OPS, HANDLERS);
@@ -153,11 +152,18 @@ describe("GraphQL wire contract (through the server)", () => {
 
 describe("GraphQL dispatch and logging", () => {
   test("a read dispatches to its handler and logs its operation and kind", () => {
-    const result = dispatch(G_READ, { owner: OWNER, repo: REPO }, options(scenario()));
+    const s = scenario();
+    const state = buildState(s.live_state, s.owner_kind);
+    const result = dispatch(
+      G_READ,
+      { owner: OWNER, repo: REPO },
+      options(s, { working: { mode: "single", state } }),
+    );
     expect(result.violation).toBeUndefined();
     expect(result.response.status).toBe(200);
-    const data = (result.response.body as { data: Json }).data;
-    expect(data.repository).toBeDefined();
+    expect(result.response.body).toEqual({
+      data: { repository: { id: String(state.repo.node_id) } },
+    });
     expect(result.log.graphql).toEqual({ operationName: "RepoToggles", kind: "read" });
     expect(isWriteRequest(result.log)).toBe(false);
   });
@@ -194,8 +200,8 @@ describe("GraphQL dispatch and logging", () => {
   });
 
   test("sectionForRequest attributes a /graphql request through its body", () => {
-    // Attribution reads the live registry, where no section declares ops yet,
-    // so an unknown name resolves null - the REST fallback stays intact.
+    // The live registry declares no "RepoToggles", so attribution resolves null and the REST
+    // fallback stays intact.
     expect(sectionForRequest("POST", "/graphql", gqlBody(G_READ, {}))).toBeNull();
     expect(sectionForRequest("GET", `/repos/${OWNER}/${REPO}`)).toBe("repository");
   });
@@ -223,6 +229,19 @@ describe("GraphQL check-mode barrier", () => {
     );
     expect(result.violation).toBeUndefined();
     expect(result.response.status).toBe(200);
+  });
+
+  test("an execution-phase read is a violation in check mode and passes in apply", () => {
+    const inCheck = dispatch(
+      G_READ_EXECUTION,
+      { owner: OWNER, repo: REPO },
+      options(scenario({ inputs: { mode: "check" } })),
+    );
+    expect(inCheck.violation).toBe("GraphQL execution-phase read in check mode (RepoNodeId)");
+    expect(inCheck.response.status).toBe(400);
+    const inApply = dispatch(G_READ_EXECUTION, { owner: OWNER, repo: REPO }, options(scenario()));
+    expect(inApply.violation).toBeUndefined();
+    expect(inApply.response.status).toBe(200);
   });
 });
 
@@ -288,22 +307,53 @@ describe("GraphQL denial barrier (shared with REST)", () => {
 
   test("a TOLERATED denied read (declared NOT_FOUND outcome) does not arm", () => {
     const s = scenario({ token_permissions: { administration: "none" } });
-    const opts = options(s);
+    const state = buildState(s.live_state, s.owner_kind);
+    const opts = options(s, { working: { mode: "single", state } });
     const read = dispatch(G_READ_TOLERANT, { owner: OWNER, repo: REPO }, opts);
     expect(read.violation).toBeUndefined();
-    const write = dispatch(G_WRITE, { repositoryId: mintNodeId("repo", ADMIN_SLUG, "") }, opts);
+    expect(read.response.body).toEqual({
+      data: null,
+      errors: graphqlDenialErrors("fine_grained", "read"),
+    });
+    const wikiBefore = state.repo.has_wiki;
+    const write = dispatch(
+      G_WRITE,
+      { repositoryId: mintNodeId("repo", ADMIN_SLUG, ""), hasWiki: !wikiBefore },
+      opts,
+    );
     expect(write.violation).toBeUndefined();
+    expect(write.response.body).toEqual({
+      data: null,
+      errors: graphqlDenialErrors("fine_grained", "write"),
+    });
+    expect(state.repo.has_wiki).toBe(wikiBefore);
   });
 
   test("an ADVISORY denied read does not arm", () => {
     const advisory: TaggedGraphqlOp = { ...G_READ, advisory: true };
     const ops = { ...OPS, "repository.gToggles": advisory };
     const s = scenario({ token_permissions: { administration: "none" } });
-    const opts = options(s);
+    const state = buildState(s.live_state, s.owner_kind);
+    const opts = options(s, { working: { mode: "single", state } });
     const body = gqlBody(advisory, { owner: OWNER, repo: REPO });
-    handleGraphqlRequest({ method: "POST", body }, opts, baseLog(body), ops, HANDLERS);
-    const write = dispatch(G_WRITE, { repositoryId: mintNodeId("repo", ADMIN_SLUG, "") }, opts);
+    const read = handleGraphqlRequest({ method: "POST", body }, opts, baseLog(body), ops, HANDLERS);
+    expect(read.violation).toBeUndefined();
+    expect(read.response.body).toEqual({
+      data: null,
+      errors: graphqlDenialErrors("fine_grained", "read"),
+    });
+    const wikiBefore = state.repo.has_wiki;
+    const write = dispatch(
+      G_WRITE,
+      { repositoryId: mintNodeId("repo", ADMIN_SLUG, ""), hasWiki: !wikiBefore },
+      opts,
+    );
     expect(write.violation).toBeUndefined();
+    expect(write.response.body).toEqual({
+      data: null,
+      errors: graphqlDenialErrors("fine_grained", "write"),
+    });
+    expect(state.repo.has_wiki).toBe(wikiBefore);
   });
 });
 
@@ -344,15 +394,6 @@ describe("GraphQL multi-repo slug resolution", () => {
     expect(result.violation).toBeUndefined();
     expect(multi?.repos.get("acme/alpha")?.repo.has_wiki).toBe(false);
     expect(multi?.repos.get("acme/beta")?.repo.has_wiki).toBe(true);
-  });
-
-  test("a mutation without a decodable node id is a violation", () => {
-    const result = dispatch(
-      G_WRITE,
-      { repositoryId: "R_kgDOnotOurs", hasWiki: true },
-      multiOptions(scenario()),
-    );
-    expect(result.violation).toContain("carries no decodable mock node id");
   });
 
   test("a mutation whose ids span two repositories is a violation", () => {
@@ -409,7 +450,6 @@ describe("GraphQL response guard and chaos", () => {
     expect(faulted.response.status).toBe(403);
     expect(faulted.offSpecBody).toBe(true);
     expect(opts.faultCounts.get("repository.gToggles")).toBe(1);
-    // The fault budget spent, the next request serves normally.
     const next = dispatch(G_READ, { owner: OWNER, repo: REPO }, opts);
     expect(next.response.status).toBe(200);
   });
@@ -427,7 +467,7 @@ describe("GraphQL response guard and chaos", () => {
 describe("assertGraphqlHandlerCompleteness", () => {
   test("both drift directions fail loudly", () => {
     expect(() => assertGraphqlHandlerCompleteness(OPS, {})).toThrow(
-      /GraphQL operations with no mock handler: \[repository\.gProbe \(add it in src\/sections\/repository\/mock\.ts/,
+      /GraphQL operations with no mock handler: \[repository\.gNodeId \(add it in src\/sections\/repository\/mock\.ts/,
     );
     expect(() => assertGraphqlHandlerCompleteness({}, HANDLERS)).toThrow(
       /GraphQL handlers naming no declared operation/,
@@ -440,10 +480,6 @@ describe("assertGraphqlHandlerCompleteness", () => {
 });
 
 describe("pinned-environments position semantics (production tables)", () => {
-  // The DEFAULT ops/handlers serve these dispatches, so what is pinned here
-  // is the real mock's model of the verified live behavior: a new pin
-  // appends at a monotonic counter, an unpin leaves a hole, and only the
-  // reorder mutation renormalizes the numbering.
   const pinOp = allGraphqlOps()["environments.pin"] as TaggedGraphqlOp;
   const reorderOp = allGraphqlOps()["environments.reorder"] as TaggedGraphqlOp;
 

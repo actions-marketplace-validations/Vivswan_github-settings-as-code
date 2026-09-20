@@ -1,19 +1,45 @@
 /**
- * The fuzz oracle: predicts the CLASS of outcome for a generated scenario from
- * the permission mask, policy, and mode alone, never the drift content.
- * Predicting exact drift would reimplement the engine, and a bug shared by the
- * engine and the oracle would hide. So the oracle asserts only what follows
- * mechanically from the permission and policy model, plus the universal
- * properties every run must satisfy.
+ * The fuzz oracle predicts the CLASS of outcome for a generated scenario from the permission mask,
+ * policy, and mode, plus a seeded live-state witness, never the diff itself: predicting exact drift
+ * would reimplement the engine, and a bug the two shared would hide.
  */
 
-import type { SectionKey } from "../../src/schema.js";
-import { sectionOperations } from "../../src/sections/contract/module.js";
+import type { OptOutNotice } from "../../src/engine/layers.js";
+import { validateSettingsDoc } from "../../src/engine/orchestrate.js";
+import { SectionSelection } from "../../src/engine/section-selection.js";
+import { silentIo } from "../../src/io.js";
+import { describeProblem } from "../../src/problem.js";
+import {
+  SECTION_KEYS,
+  type SectionKey,
+  UNDECLARED_POLICY_SECTIONS,
+  type UndeclaredPolicySection,
+} from "../../src/schema.js";
+import {
+  type DenialPosture,
+  denialPosture,
+  planningReads,
+  type ReadGating,
+  readGating,
+} from "../../src/sections/contract/module.js";
 import type { SectionPermission } from "../../src/sections/contract/permissions.js";
 import { SECTIONS } from "../../src/sections/registry.js";
-import { DENIAL_SEMANTICS } from "./denial-semantics.js";
-import { displayKeyOf, type MultiScenarioMeta, type ScenarioMeta } from "./generators.js";
-import { type DenialStyle, GRADE_RANK, type MaskGrade, type MaskKey } from "./schema.js";
+import {
+  type Json,
+  LAYERING_DIRECTIVES,
+  LAYERING_KEY,
+  type LayeringDirective,
+  UNDECLARED_KEY,
+} from "./gen-support.js";
+import {
+  displayKeyOf,
+  isNullValued,
+  type MergeLayer,
+  type MergeScenarioMeta,
+  type MultiScenarioMeta,
+  type ScenarioMeta,
+} from "./generators.js";
+import { GRADE_RANK, type MaskGrade, type MaskKey } from "./schema.js";
 
 /** A section outcome the step summary can report. */
 type Outcome = "applied" | "clean" | "drift" | "skipped" | "failed" | "excluded";
@@ -22,75 +48,42 @@ const PERMISSION_BY_KEY: Record<SectionKey, SectionPermission> = Object.fromEntr
   SECTIONS.map((section) => [section.key, section.permission]),
 ) as Record<SectionKey, SectionPermission>;
 
-/**
- * Sections whose every read is write-gated (the EndpointDecl accessGrade
- * override; Codespaces secrets today): a read-only grant cannot even list,
- * so grade "read" collapses to "none". Derived from the same declarations
- * the mock's permission gate reads, through sectionOperations - the
- * flattened REST + GraphQL view, where a REST GET carries its accessGrade
- * as `grade` and a GraphQL read is always read-gated (its kind IS the gate) -
- * so mock and oracle cannot disagree. A section with MIXED read grades would
- * make the section-level collapse wrong; the registry unit test forbids
- * that shape.
- */
-const READS_REQUIRE_WRITE: ReadonlySet<SectionKey> = new Set(
-  SECTIONS.filter((section) => {
-    const readGates = sectionOperations(section)
-      .filter((op) => op.wire === "read")
-      .map((op) => op.grade);
-    return readGates.length > 0 && readGates.every((gate) => gate === "write");
-  }).map((section) => section.key),
-);
+/** Each section's read gating, from the same declarations the mock's permission gate reads, so the two cannot disagree. */
+const READ_GATING: Record<SectionKey, ReadGating> = Object.fromEntries(
+  SECTIONS.map((section) => [section.key, readGating(section)]),
+) as Record<SectionKey, ReadGating>;
+
+/** Each section's 404 posture off its primaryRead declaration; the mock's denial barrier reads the same. */
+const DENIAL_POSTURE: Record<SectionKey, DenialPosture> = Object.fromEntries(
+  SECTIONS.map((section) => [section.key, denialPosture(section)]),
+) as Record<SectionKey, DenialPosture>;
 
 /**
- * Sections whose resources exist only under an ORGANIZATION owner: on a
- * personal account their handler's org probe 404s and the section no-ops
- * with a note, so check reports clean and apply reports applied - never
- * both in one mode. Derived from the sections' own ownerSensitivity
- * declarations (the same source the registry pins to the org-probe
- * endpoint), so a new org-only section joins the fold without a hand edit
- * here.
+ * On a personal account these sections' org probe 404s and the handler no-ops with a note, so check
+ * reports clean and apply reports applied, whatever the mask says.
  */
 const ORG_ONLY_SECTIONS: ReadonlySet<SectionKey> = new Set(
   SECTIONS.filter((section) => section.ownerSensitivity === "org").map((section) => section.key),
 );
 
 /**
- * Sections that declare NO read at all - REST or GraphQL
- * (check_suite_preferences today): check mode issues zero requests for them -
- * the cannot-verify note is not an outcome - so they are ALWAYS clean in
- * check mode no matter what the mask says, and apply-mode preflight has
- * nothing to probe, so the barrier can never arm on them (the denial
- * surfaces mid-apply on the first write instead). Derived through
- * sectionOperations, the same flattened view the mock routes and the
- * write-gate collapse read, so a section gaining a read of EITHER kind
- * drops out automatically. Exported for the fuzz unfaultable battery, whose
- * empty-read-derivation guard stays armed for every section outside this
- * set.
+ * Sections with no plan-time read, REST or GraphQL (check_suite_preferences today); fuzz.ts's
+ * unfaultable battery keeps its empty-read guard armed for every section outside this set.
+ *   check mode  -> no request at all, so always clean whatever the mask says
+ *   apply mode  -> preflight has nothing to probe, so the barrier never arms; the denial surfaces on the first write
  */
 export const NO_READ_SECTIONS: ReadonlySet<SectionKey> = new Set(
-  SECTIONS.filter((section) => sectionOperations(section).every((op) => op.wire === "write")).map(
-    (section) => section.key,
-  ),
+  SECTIONS.filter((section) => planningReads(section).length === 0).map((section) => section.key),
 );
 
-/** Map a section's repo resources to the mask keys they use (org is separate). */
 function repoMaskKeys(permission: SectionPermission): MaskKey[] {
   return [...permission.repo];
 }
 
-/**
- * The effective grant grade for a section under a mask. The repo permission is
- * "ANY one resource grants access", so the repo grade is the MAX over the
- * section's repo mask keys. When a section also needs an organization
- * permission (teams needs org_members read), that is an ADDITIONAL requirement,
- * so the effective grade is capped by the org grade (an AND). An unspecified
- * resource defaults to "write" (the mask default).
- */
+/** The grade a mask GRANTS a section's repository reads and writes, before its read gating folds it (effectiveGrades). */
 export function sectionGrade(
   key: SectionKey,
   mask: Partial<Record<MaskKey, MaskGrade>>,
-  orgMask: Partial<Record<MaskKey, MaskGrade>> = mask,
 ): MaskGrade {
   const permission = PERMISSION_BY_KEY[key];
   let repoGrade: MaskGrade = "none";
@@ -100,167 +93,203 @@ export function sectionGrade(
       repoGrade = grade;
     }
   }
-  if (repoGrade === "read" && READS_REQUIRE_WRITE.has(key)) {
-    // Every read this section can issue is write-gated, so a read-only
-    // grant behaves exactly like no grant: the primary read is denied.
-    repoGrade = "none";
-  }
-  if (permission.org !== "members") {
-    return repoGrade;
-  }
-  // teams also needs org_members, but only as a READ-GATE: the org_members
-  // permission gates the organization PROBE (a read), while the team writes go
-  // through the repo administration permission. So org_members "none" denies the
-  // section outright (grade none); "read" or "write" leaves the repo grade
-  // intact (org_members write is NOT required to write teams). Capping the grade
-  // by org_members would wrongly downgrade an administration-write + members-read
-  // token to read-grade.
-  //
-  // The org_members gate reads from `orgMask`, which differs from `mask` ONLY in
-  // multi-repo mode: the mock grades teams' org-scoped endpoints
-  // (PUT /orgs/{org}/teams/.../repos/{owner}/{repo}, which start with /orgs/ not
-  // /repos/) against the GLOBAL token mask, never the per-slug overlay. So a
-  // per-slug org_members:none does NOT gate teams; the global one does. In
-  // single-repo mode orgMask defaults to mask and this is a no-op.
-  const orgGrade = orgMask.org_members ?? "write";
-  return orgGrade === "none" ? "none" : repoGrade;
-}
-
-/** The predicted set of outcomes a section may land in, given the run's shape. */
-export interface SectionPrediction {
-  key: SectionKey;
-  grade: MaskGrade;
-  /** The outcomes the section is allowed to report; the runner must see one. */
-  allowed: Set<Outcome>;
-  /** True when the section can write under this prediction (drives universals). */
-  mayWrite: boolean;
+  return repoGrade;
 }
 
 /**
- * Predict one section's allowed outcome set from its grade, the mode, policy,
- * denial style, and its denial semantics. Mirrors the plan's rule table.
- *
- * When the generator seeded a live-state WITNESS for the section (labels or
- * milestones), the prediction tightens from {clean, drift} to the exact
- * outcome the witness dictates. The permission/mode/policy fold always comes
- * FIRST: a denied or preflight-aborted section stays skipped/failed no matter
- * what the live state looks like; the witness only refines outcomes that are
- * still reachable successes.
+ * Whether the org gate denies a section's org-scoped requests: org_members gates teams' per-team access probes and
+ * its grants, never the repository's team list (GitHub grades that at repository Administration alone, and the
+ * section declares it so). A denied probe answers 404 under fine_grained, which the section reads as "no access",
+ * so the reads go through and only the writes are denied: the ABSENT posture at grade none, whatever the
+ * section's own posture says. The mock takes org_members for teams' /orgs/ endpoints from the GLOBAL mask, not
+ * the per-slug overlay (the rest of the mask stays per slug), so the gate reads orgMask (equal to mask outside
+ * multi-repo mode).
  */
+export function orgGateDenied(
+  key: SectionKey,
+  orgMask: Partial<Record<MaskKey, MaskGrade>>,
+): boolean {
+  return PERMISSION_BY_KEY[key].org === "members" && (orgMask.org_members ?? "write") === "none";
+}
+
+/**
+ * The grades a section may RUN at: a read grant folded through its read gating. Write-gated is
+ * denied at its first read; mixed keeps both grades, since reaching the gated read depends on
+ * content the oracle never models.
+ */
+export function effectiveGrades(grant: MaskGrade, gating: ReadGating): readonly MaskGrade[] {
+  if (grant !== "read" || gating === "plain") {
+    return [grant];
+  }
+  return gating === "write-gated" ? ["none"] : ["read", "none"];
+}
+
+export interface SectionPrediction {
+  key: SectionKey;
+  /**
+   * The grades the section may run at. EMPTY for an excluded section: orchestrate.ts classifies it
+   * before preflight and the section loop, so every fold over these grades (preflightDeniable,
+   * writeGranted) is vacuous for it and no consumer recognizes "excluded" by hand.
+   */
+  grades: readonly MaskGrade[];
+  /**
+   * What a fine-grained 404 on the first read denied at these grades means: the section's own
+   * posture, or "absent" when only the org gate is shut (the repository read passes and the
+   * org-gated probe's 404 reads as a missing grant). The preflight fold reads it.
+   */
+  posture: DenialPosture;
+  /** The outcomes the section is allowed to report; the runner must see one. */
+  allowed: Set<Outcome>;
+  /** False folds the section into writeDeniedSections, whose writes the fuzz asserts never mutate state. */
+  mayWrite: boolean;
+}
+
+const DENIAL_POSTURES: readonly DenialPosture[] = ["denied", "absent"];
+
 export function predictSection(key: SectionKey, meta: ScenarioMeta): SectionPrediction {
-  const grade = sectionGrade(key, meta.mask, meta.orgMask ?? meta.mask);
-  const check = meta.mode === "check";
-  const required = meta.requiredSections.includes(key);
-  const semantics = DENIAL_SEMANTICS[key];
-  const witness = meta.liveKinds?.[key];
-  // A declared section outside the `sections` allowlist never runs: the engine
-  // reports it "excluded" before any read (orchestrate.ts), so exclusion folds
-  // before EVERYTHING - grades, denial semantics, and witnesses alike. An
-  // EMPTY allowlist means unrestricted, mirroring orchestrate.ts's size > 0
-  // gate, so only a non-empty list excludes.
+  return predictSectionAt(key, meta, READ_GATING[key]);
+}
+
+/**
+ * A mixed section denied under a READ grant stops at a gated read whose 404 posture may differ from
+ * its primary read's, so that arm covers both postures.
+ */
+export function predictSectionAt(
+  key: SectionKey,
+  meta: ScenarioMeta,
+  gating: ReadGating,
+): SectionPrediction {
+  // An EMPTY allowlist is unrestricted, mirroring orchestrate.ts's size > 0 gate.
   if (
     meta.onlySections !== undefined &&
     meta.onlySections.length > 0 &&
     !meta.onlySections.includes(key)
   ) {
-    return { key, grade, allowed: new Set(["excluded"]), mayWrite: false };
+    return {
+      key,
+      grades: [],
+      posture: DENIAL_POSTURE[key],
+      allowed: new Set(["excluded"]),
+      mayWrite: false,
+    };
   }
-  // An org-only section on a personal account no-ops regardless of mask:
-  // its org probe 404s, the section returns with only a note, so check
-  // reports clean and apply reports applied - never both in one mode.
+  // The org probe is declared permission "none", so no mask key gates it and its 404 is met before
+  // any gated read; by sectionGrade's convention an ungated resource grades write.
   if (ORG_ONLY_SECTIONS.has(key) && meta.ownerKind === "user") {
-    return { key, grade, allowed: new Set([check ? "clean" : "applied"]), mayWrite: false };
+    return {
+      key,
+      grades: ["write"],
+      posture: DENIAL_POSTURE[key],
+      allowed: new Set([meta.mode === "check" ? "clean" : "applied"]),
+      mayWrite: false,
+    };
   }
-  // A section with no read endpoint makes NO request in check mode, so it is
-  // exactly clean regardless of the mask - there is nothing a denial could
-  // deny - and no witness kind is modeled for it.
+  const grant = sectionGrade(key, meta.mask);
+  const grades = effectiveGrades(grant, gating);
+  const deniedAtGatedRead = gating === "mixed" && grant === "read";
+  // The repository grant holds but the org gate is shut: the repository reads pass and the org-gated probes are
+  // denied, so the section runs at grade none under the absent posture (orgGateDenied). With no repository grant
+  // the gated repository read is denied first, under the section's own posture.
+  const orgDenied = orgGateDenied(key, meta.orgMask ?? meta.mask) && grant !== "none";
+  const posture: DenialPosture = orgDenied ? "absent" : DENIAL_POSTURE[key];
+  const arms = orgDenied
+    ? [predictAtGrade(key, meta, "none", posture)]
+    : grades.flatMap((grade) =>
+        grade === "none" && deniedAtGatedRead
+          ? DENIAL_POSTURES.map((candidate) => predictAtGrade(key, meta, grade, candidate))
+          : [predictAtGrade(key, meta, grade, posture)],
+      );
+  return {
+    key,
+    grades: orgDenied ? ["none"] : grades,
+    posture,
+    allowed: new Set(arms.flatMap((arm) => [...arm.allowed])),
+    mayWrite: arms.some((arm) => arm.mayWrite),
+  };
+}
+
+/**
+ * One section's allowed outcomes at ONE grade. A seeded live-state WITNESS tightens {clean, drift}
+ * to one outcome, but only after the permission and policy fold: a section that never ran stays denied.
+ */
+function predictAtGrade(
+  key: SectionKey,
+  meta: ScenarioMeta,
+  grade: MaskGrade,
+  posture: DenialPosture,
+): Pick<SectionPrediction, "allowed" | "mayWrite"> {
+  const check = meta.mode === "check";
+  const required = meta.requiredSections.includes(key);
+  const witness = meta.liveKinds?.[key];
   if (check && NO_READ_SECTIONS.has(key)) {
-    return { key, grade, allowed: new Set(["clean"]), mayWrite: false };
+    return { allowed: new Set(["clean"]), mayWrite: false };
   }
 
   if (grade === "write") {
     if (witness === "matching") {
-      // The live state mirrors every field the handler diffs, so no write is
-      // ever attempted: check is exactly clean and apply a no-op applied.
-      return { key, grade, allowed: new Set([check ? "clean" : "applied"]), mayWrite: false };
+      // A matching witness mirrors every field the handler diffs, so no write is ever attempted.
+      return { allowed: new Set([check ? "clean" : "applied"]), mayWrite: false };
     }
     if (witness !== undefined) {
-      // A seeded drift witness: check MUST report drift (a clean here is a
-      // false-negative drift detector); apply writes and reports applied.
-      return { key, grade, allowed: new Set([check ? "drift" : "applied"]), mayWrite: !check };
+      // A drift witness: a check-mode clean here is a false-negative drift detector.
+      return { allowed: new Set([check ? "drift" : "applied"]), mayWrite: !check };
     }
     return {
-      key,
-      grade,
       allowed: check ? new Set(["clean", "drift"]) : new Set(["applied"]),
       mayWrite: !check,
     };
   }
 
-  // A denied read: whether it reads as a permission error or a missing resource
-  // depends on the denial style and the section's semantics. A section with no
-  // reads at all can never be read-denied, whatever the style: its denial
-  // surfaces on the apply-mode write, like the fine_grained "absent" model.
+  // A section with no reads can never be read-denied under any style: its denial surfaces on the
+  // apply-mode write, like the fine_grained "absent" posture.
   const readsAsDenied =
     grade === "none" &&
     !NO_READ_SECTIONS.has(key) &&
-    (meta.denialStyle === 403 || semantics === "denied");
+    (meta.denialStyle === 403 || posture === "denied");
 
   if (grade === "none" && readsAsDenied) {
-    // Preflight (or the first read) classifies this as a permission denial.
     if (check) {
-      // Check mode: a denied required section fails; otherwise skipped/failed
-      // by policy.
       const allowed: Set<Outcome> =
         required || meta.policy === "fail" ? new Set(["failed"]) : new Set(["skipped"]);
-      return { key, grade, allowed, mayWrite: false };
+      return { allowed, mayWrite: false };
     }
-    // Apply mode: fail policy or required means the whole run fails at preflight
-    // with zero writes; warn means the section is skipped.
     const allowed: Set<Outcome> =
       required || meta.policy === "fail" ? new Set(["failed"]) : new Set(["skipped"]);
-    return { key, grade, allowed, mayWrite: false };
+    return { allowed, mayWrite: false };
   }
 
-  // grade none, fine_grained, absent semantics: reads look like missing
-  // resources, so check reports clean/drift and apply attempts the first write
-  // (which is 403-denied). grade read: reads pass, first write 403-denied.
+  // From here the reads go through and only an apply-mode write can be denied.
+  //   grade none, absent posture -> the denied reads look like missing resources
+  //   grade read                 -> the reads are granted
   if (check) {
     if (witness === "matching") {
-      return { key, grade, allowed: new Set(["clean"]), mayWrite: false };
+      return { allowed: new Set(["clean"]), mayWrite: false };
     }
     if (witness !== undefined) {
-      return { key, grade, allowed: new Set(["drift"]), mayWrite: false };
+      return { allowed: new Set(["drift"]), mayWrite: false };
     }
-    return { key, grade, allowed: new Set(["clean", "drift"]), mayWrite: false };
+    return { allowed: new Set(["clean", "drift"]), mayWrite: false };
   }
   if (witness === "matching") {
-    // No write is needed, so the missing write grant is never exercised: the
-    // section lands applied even though a write would have been denied.
-    return { key, grade, allowed: new Set(["applied"]), mayWrite: false };
+    // No write is needed, so the missing write grant is never exercised.
+    return { allowed: new Set(["applied"]), mayWrite: false };
   }
   if (witness !== undefined) {
-    // The witness forces exactly one write, and every write is denied at this
-    // grade: the section can never be a no-op "applied". Mirrors the mid-apply
-    // PermissionDenied fold in orchestrate.ts.
+    // The witness forces one write and every write is denied at this grade, so the section can never
+    // be a no-op "applied"; mirrors the mid-apply PermissionDenied fold in orchestrate.ts.
     const allowed: Set<Outcome> =
       required || meta.policy === "fail" ? new Set(["failed"]) : new Set(["skipped"]);
-    return { key, grade, allowed, mayWrite: false };
+    return { allowed, mayWrite: false };
   }
-  // Apply: a needed write is denied mid-run. A required section (or fail
-  // policy) cannot be skipped, so it fails; warn skips a non-required section.
-  // A COMPARING section may still land "applied" when no write was actually
-  // needed (the live state already matched) - but a no-read section has
-  // nothing to compare against, so its write is unconditional AND
-  // unavoidable: the denial is guaranteed and "applied" is unreachable.
+  // A comparing section may land applied when the live state already matched; a no-read section's
+  // write is unconditional, so its denial is certain and "applied" unreachable.
   const canSilentlyApply = !NO_READ_SECTIONS.has(key);
   const allowed: Set<Outcome> =
     required || meta.policy === "fail"
       ? new Set(canSilentlyApply ? ["applied", "failed"] : ["failed"])
       : new Set(canSilentlyApply ? ["applied", "skipped"] : ["skipped"]);
-  // In absent/read cases the section may attempt one write before the denial;
-  // that write hits an "absent"-semantics family (mock rule 4 tolerates it).
-  return { key, grade, allowed, mayWrite: semantics === "absent" };
+  // An absent-posture section may attempt one write before the denial it then meets.
+  return { allowed, mayWrite: posture === "absent" };
 }
 
 /** The worst-of section rank the engine uses to fold outcomes into a run result. */
@@ -273,76 +302,103 @@ const RESULT_RANK: Record<string, number> = {
   failed: 3,
 };
 
-/** The whole-run prediction: per-section classes plus run-level constraints. */
 export interface RunPrediction {
   sections: SectionPrediction[];
   /** Exit codes the run may produce (a set, since some sections span classes). */
   allowedExitCodes: Set<number>;
-  /** No write may occur in check mode, ever (mock rule 3). */
   noWritesInCheck: boolean;
-  /** Sections whose denied writes must never mutate state (mock rule 4). */
+  /** Sections whose denied writes must never mutate state. */
   writeDeniedSections: SectionKey[];
-  /**
-   * True when every ACTIVE section is write-granted (convergence expected).
-   * Excluded sections never run, so they do not count against this.
-   */
+  /** The fixpoint proofs in fuzz.ts run only under this. */
   fullyGranted: boolean;
   /**
-   * True when the run aborts at the preflight barrier before rendering any
-   * section. The barrier only runs under apply + fail policy (orchestrate.ts),
-   * and fires when a section's preflight READ is permission-denied; on abort
-   * the step summary is EMPTY, so a per-section presence check must be skipped.
+   * Whether the run aborts at the preflight barrier (apply + fail policy, a denied preflight READ)
+   * before rendering any section; "possible" when only a mixed section under a read grant could arm it.
    */
-  preflightAborts: boolean;
+  preflightAborts: PreflightAbort;
+}
+
+export type PreflightAbort = "no" | "yes" | "possible";
+
+/**
+ * Whether a run DID abort at the barrier: the "preflight failed" annotation
+ * decides, and a row-less summary table plus the "failed" result must agree with it.
+ */
+export type AbortVerdict =
+  | { kind: "aborted" }
+  | { kind: "ran" }
+  | { kind: "contradiction"; problem: string };
+
+/** Every table body row the summary rendered, well-formed or not, so a malformed row cannot pass as "no rows". */
+function renderedSummaryRows(summary: string): string[] {
+  return summary
+    .split("\n")
+    .filter((line) => /^\|/.test(line) && !/^\|\s*(Section|Repository)\s*\|/.test(line))
+    .filter((line) => !/^\|(-+\|)+$/.test(line));
+}
+
+export function judgePreflightAbort(
+  predicted: PreflightAbort,
+  observed: { summary: string; result: string | undefined; stdout: string },
+): AbortVerdict {
+  const contradiction = (problem: string): AbortVerdict => ({ kind: "contradiction", problem });
+  if (!/^::error::preflight failed/m.test(observed.stdout)) {
+    return predicted === "yes"
+      ? contradiction(
+          'a certain preflight abort was predicted, but the run never annotated "preflight failed"',
+        )
+      : { kind: "ran" };
+  }
+  const rendered = renderedSummaryRows(observed.summary);
+  if (rendered.length > 0 || observed.result !== "failed") {
+    return contradiction(
+      `the run annotated "preflight failed" yet rendered ${rendered.length} summary row(s) and result "${observed.result}"`,
+    );
+  }
+  return predicted === "no"
+    ? contradiction("no preflight abort was predicted, but the run aborted at the barrier")
+    : { kind: "aborted" };
+}
+
+function foldPreflightAbort(verdicts: readonly PreflightAbort[]): PreflightAbort {
+  if (verdicts.includes("yes")) {
+    return "yes";
+  }
+  return verdicts.includes("possible") ? "possible" : "no";
+}
+
+function writeGranted(section: SectionPrediction): boolean {
+  return section.grades.every((grade) => grade === "write");
 }
 
 /**
- * Whether a section can be denied at the preflight barrier: its grade is none
- * and the denial reads as a permission error (a 403 style, or a
- * "denied"-semantics section whose read goes through the classifier). Preflight
- * performs READS only - orchestrate.ts runs every handler in check mode behind
- * a probe wrapper that stops writes client-side - so a read grade always PASSES
- * preflight; its first write is denied later, during apply, and the section
- * still renders its summary row. Absent a permission denial (a fine_grained
- * 404 on an absent-tolerant section) the preflight probe reads as "resource
- * absent" and does not arm the barrier either.
+ * Whether preflight (reads only) denies the section. Two effective grades make it "possible": the
+ * probe reaches the gated read only for some declared content.
  */
-function preflightDeniable(section: SectionPrediction, meta: ScenarioMeta): boolean {
-  // Preflight only probes ACTIVE sections (orchestrate.ts filters by the
-  // allowlist first), so an excluded section can never arm the barrier.
-  if (section.allowed.has("excluded")) {
-    return false;
-  }
+export function preflightDeniable(section: SectionPrediction, meta: ScenarioMeta): PreflightAbort {
   if (NO_READ_SECTIONS.has(section.key)) {
-    // No read endpoints: preflight probes nothing, so the barrier cannot arm.
-    return false;
+    return "no";
   }
-  if (section.grade !== "none") {
-    return false;
+  if (!section.grades.includes("none")) {
+    return "no";
   }
-  const semantics = DENIAL_SEMANTICS[section.key];
-  return meta.denialStyle === 403 || semantics === "denied";
+  if (section.grades.length > 1) {
+    return "possible";
+  }
+  return meta.denialStyle === 403 || section.posture === "denied" ? "yes" : "no";
 }
 
-/**
- * Predict the whole run: fold the per-section predictions into the run-level
- * exit-code set and the universal properties. Exit code follows the worst-of
- * ranking (failed or check-mode drift exits 1; everything else 0), computed as
- * a set because some sections' allowed classes span ranks.
- */
 export function predictOutcomes(meta: ScenarioMeta): RunPrediction {
   const sections = meta.sections.map((key) => predictSection(key, meta));
   const check = meta.mode === "check";
-  const preflightAborts =
-    !check && meta.policy === "fail" && sections.some((s) => preflightDeniable(s, meta));
+  const preflightAborts: PreflightAbort =
+    !check && meta.policy === "fail"
+      ? foldPreflightAbort(sections.map((s) => preflightDeniable(s, meta)))
+      : "no";
 
-  // Compute the exit-code set: for each combination of per-section outcomes the
-  // classes allow, the worst rank decides the exit. We only need the extremes:
-  // the best-case (lowest worst rank) and worst-case (highest) outcomes.
   const exitCodes = new Set<number>();
   for (const pick of [bestOutcomes(sections), worstOutcomes(sections)]) {
     const worst = Math.max(0, ...pick.map((o) => RESULT_RANK[o] ?? 0));
-    // Exit 1 on failed (rank 3), or in check mode on drift (rank 2).
     exitCodes.add(worst >= 3 || (check && worst >= 2) ? 1 : 0);
   }
 
@@ -350,77 +406,46 @@ export function predictOutcomes(meta: ScenarioMeta): RunPrediction {
     sections,
     allowedExitCodes: exitCodes,
     noWritesInCheck: check,
-    writeDeniedSections: sections
-      .filter((s) => s.grade !== "write" && !s.mayWrite)
-      .map((s) => s.key),
-    // Excluded sections never run, so they cannot break convergence or
-    // idempotence: fullyGranted quantifies over the sections that WILL run.
-    fullyGranted: sections.every((s) => s.allowed.has("excluded") || s.grade === "write"),
+    writeDeniedSections: sections.filter((s) => !writeGranted(s) && !s.mayWrite).map((s) => s.key),
+    fullyGranted: sections.every(writeGranted),
     preflightAborts,
   };
 }
 
-/** The worst-of rank of an outcome (defaults to 0 for unknown outcomes). */
 function rank(outcome: Outcome): number {
   return RESULT_RANK[outcome] ?? 0;
 }
 
-/** The best (lowest-rank) outcome each section allows. */
 function bestOutcomes(sections: SectionPrediction[]): Outcome[] {
   return sections.map((s) => [...s.allowed].sort((a, b) => rank(a) - rank(b))[0] as Outcome);
 }
 
-/** The worst (highest-rank) outcome each section allows. */
 function worstOutcomes(sections: SectionPrediction[]): Outcome[] {
   return sections.map((s) => [...s.allowed].sort((a, b) => rank(b) - rank(a))[0] as Outcome);
 }
 
-/** The prediction for one multi-repo target: its per-repo run, or "skipped". */
 interface RepoPrediction {
   slug: string;
   /**
-   * The repos-result KEY the action emits for this target: the
-   * "private repository #N" placeholder when redacted, else the slug. The fuzz
-   * comparison keys on this, since a redacted target never appears under its
-   * real slug.
+   * The repos-result KEY the action emits: the "private repository #N" placeholder when redacted,
+   * else the slug. The fuzz comparison keys on this, since a redacted target never appears under its slug.
    */
   displayKey: string;
-  /** True when this target is hidden from the public view (drives the leak check). */
   redacted: boolean;
-  /**
-   * null when this target produces no per-section run: either it has no settings
-   * file, or its settings file is unreadable because `contents` is denied. In
-   * both cases `allowedResults` carries the repo-level outcome the action reports.
-   */
+  /** null when the target never runs a section: no settings file and no defaults document, or a gated settings read. */
   run: RunPrediction | null;
-  /**
-   * The repo-level result strings this target may report. For a normal target it
-   * is the union of its sections' outcomes (plus the multi "partial" alias); for
-   * a skipped/unreadable target it is the settings-gate outcome (skipped, or
-   * failed under the 403 style / fail policy).
-   */
   allowedResults: Set<string>;
 }
 
-/** The whole multi-repo prediction: per-target runs plus the rolled-up exit. */
 export interface MultiPrediction {
   repos: RepoPrediction[];
   /** Exit codes the multi run may produce (worst-of over the targets). */
   allowedExitCodes: Set<number>;
-  /**
-   * Every string that must appear in NO public surface when redaction is active:
-   * each redacted target's real slug plus its planted canaries. The leak
-   * invariant asserts their absence from stdout/summary/outputs.
-   */
+  /** Every string that must appear on NO public surface: each redacted target's real slug plus its planted canaries. */
   forbidden: string[];
 }
 
-/**
- * Fold a per-section outcome into the engine's three roll-up flags, mirroring
- * orchestrate.ts: "failed" sets failed, check-mode "drift" sets drifted, and a
- * "skipped" (warn) or the multi "partial" alias sets partial. Other outcomes
- * (applied/clean/excluded) leave the flags untouched.
- */
+/** The engine's roll-up flags (orchestrate.ts), mirrored; the multi "partial" alias also sets partial. */
 function foldFlags(
   outcome: string,
   flags: { failed: boolean; drifted: boolean; partial: boolean },
@@ -449,10 +474,8 @@ function repoResultFrom(
 }
 
 /**
- * Fold OBSERVED section outcomes into the repo result the engine reports,
- * composing the same foldFlags + repoResultFrom mirror predictMulti proves on
- * every multi iteration. The fuzz self-consistency invariant asserts that the
- * `result` output equals this fold over the summary's outcome table.
+ * OBSERVED section outcomes folded the way the engine folds them; the fuzz self-consistency
+ * invariant compares the `result` output against this fold of the summary's outcome table.
  */
 export function foldSectionOutcomes(outcomes: string[], check: boolean): string {
   const flags = { failed: false, drifted: false, partial: false };
@@ -463,12 +486,8 @@ export function foldSectionOutcomes(outcomes: string[], check: boolean): string 
 }
 
 /**
- * The repo-result worst-first order the MULTI rollup folds with, mirroring
- * orchestrate.ts's REPO_RESULTS exactly (multi.ts computes the overall result
- * as worstOf over per-target results). A harness-local mirror, deliberately
- * NOT an import: importing the engine's own order would let a src rank-order
- * regression agree with itself - the same contradiction-path pattern as
- * DENIAL_SEMANTICS and COMPARE_BEFORE_WRITE.
+ * The repo words of outcome.ts's RUN_RESULTS order, mirrored by hand rather than imported: the engine's own order
+ * would agree with its own regression.
  */
 const MULTI_RESULT_ORDER = ["failed", "drift", "partial", "skipped", "applied", "clean"] as const;
 
@@ -482,22 +501,12 @@ export function foldRepoResults(results: string[], check: boolean): string {
   return check ? "clean" : "applied";
 }
 
-/**
- * The repo-level result strings a per-repo run may report, computed MECHANICALLY
- * by folding the per-section allowed outcomes through the engine's exact
- * roll-up (orchestrate.ts), not a loose union. Each section independently
- * contributes its best-case (does not set a flag) and worst-case (sets its flag)
- * outcome, so the reachable set of (failed, drifted, partial) flag combinations
- * is the product over sections; the result set is repoResultFrom over that
- * product. A preflight-aborting target is always "failed".
- */
+/** Folded through the engine's own roll-up rather than a loose union of the section outcomes. */
 function runResultClass(run: RunPrediction): Set<string> {
   const check = run.noWritesInCheck;
-  if (run.preflightAborts) {
+  if (run.preflightAborts === "yes") {
     return new Set(["failed"]);
   }
-  // Reachable flag combinations: start from all-false and, per section, branch
-  // into "contributes its flag" vs "does not", using the section's allowed set.
   let combos: Array<{ failed: boolean; drifted: boolean; partial: boolean }> = [
     { failed: false, drifted: false, partial: false },
   ];
@@ -519,32 +528,6 @@ function runResultClass(run: RunPrediction): Set<string> {
   return results;
 }
 
-/**
- * The repo-level result when a target's settings file cannot be read because
- * `contents` is denied. The action reads .github/settings.yml through the
- * contents endpoint before any section runs (src/github/repo-file.ts). A denied
- * contents read 404s; the action then probes the repo (an administration-gated
- * GET /repos/{slug}) to disambiguate:
- *   - 403 style: the contents read fails outright, so the target FAILS.
- *   - fine_grained + administration readable: the repo probe succeeds with
- *     pull:true, so the 404 reads as a missing file and the target is SKIPPED.
- *   - fine_grained + administration denied: the repo probe ALSO 404s, so the
- *     read is "visible but unreadable" and the target FAILS.
- */
-function settingsGateResult(denialStyle: DenialStyle, adminGrade: MaskGrade): Set<string> {
-  if (denialStyle === 403) {
-    return new Set(["failed"]);
-  }
-  return adminGrade === "none" ? new Set(["failed"]) : new Set(["skipped"]);
-}
-
-/**
- * Predict a multi-repo run: predict each target independently, then apply the
- * mechanical rollup. A target is settings-gated (no per-section run) when it has
- * no settings file (skipped) or its `contents` grade is none, so the settings
- * file itself is unreadable. The run exits 1 when any target fails, or in check
- * mode when any target drifts; skipped targets do not raise the exit alone.
- */
 export function predictMulti(meta: MultiScenarioMeta): MultiPrediction {
   const repos: RepoPrediction[] = meta.repos.map((repo) => {
     const common = {
@@ -553,37 +536,31 @@ export function predictMulti(meta: MultiScenarioMeta): MultiPrediction {
       redacted: repo.redaction.kind === "redacted",
     };
     if (repo.target.kind === "missing") {
-      // No settings file: the contents read 404s and the target is skipped.
-      return { ...common, run: null, allowedResults: new Set(["skipped"]) };
+      // A missing target sets no mask, so the defaults document runs at the default write grade.
+      if (meta.defaults === undefined) {
+        return { ...common, run: null, allowedResults: new Set(["skipped"]) };
+      }
+      const run = predictOutcomes(meta.defaults);
+      return { ...common, run, allowedResults: runResultClass(run) };
     }
     if (repo.target.kind === "raw-invalid") {
-      // Raw settings text FAILS before any section runs: an unparseable body
-      // dies at the parse gate ("cannot parse <slug>"), a non-mapping one at
-      // the top-level validator. Never skipped.
+      // Raw settings text fails before any section runs, never skipped: unparseable at the parse
+      // gate, non-mapping at the top-level validator.
       return { ...common, run: null, allowedResults: new Set(["failed"]) };
     }
     const repoMeta = repo.target.meta;
-    // The settings file read itself needs contents; a denied contents read
-    // gates the whole target before any section runs.
-    const contentsGrade = repoMeta.mask.contents ?? "write";
-    if (contentsGrade === "none") {
-      const adminGrade = repoMeta.mask.administration ?? "write";
-      return {
-        ...common,
-        run: null,
-        allowedResults: settingsGateResult(repoMeta.denialStyle, adminGrade),
-      };
+    // A Contents-denied token fails the target under every denial style: the action proves a file
+    // missing through a Contents-gated ref read (src/github/repo-file.ts), so it never reads as fileless.
+    if ((repoMeta.mask.contents ?? "write") === "none") {
+      return { ...common, run: null, allowedResults: new Set(["failed"]) };
     }
     const run = predictOutcomes(repoMeta);
     return { ...common, run, allowedResults: runResultClass(run) };
   });
 
-  // A FATAL core.contentsGet fault (injected by the fuzz iteration) kills the
-  // FIRST target's settings fetch, so the victim fails outright - overriding
-  // whatever gate its kind would otherwise hit (missing-file skip,
-  // contents-denied gate, raw parse gate alike). The key is matched
-  // explicitly so a future second core-fault key cannot silently reuse the
-  // contents-specific victim rule.
+  // A FATAL core.contentsGet fault kills the FIRST target's settings fetch, whatever gate its kind
+  // would otherwise hit. The key is matched explicitly so a second core-fault key cannot silently
+  // reuse this contents-specific victim rule.
   if (meta.coreFault?.key === "core.contentsGet" && meta.coreFault.fatal && repos.length > 0) {
     const victim = repos[0] as RepoPrediction;
     repos[0] = { ...victim, run: null, allowedResults: new Set(["failed"]) };
@@ -594,7 +571,6 @@ export function predictMulti(meta: MultiScenarioMeta): MultiPrediction {
     if (r.run) {
       return r.run.allowedExitCodes;
     }
-    // A settings-gated target: failed raises exit 1, skipped stays 0.
     return r.allowedResults.has("failed") ? new Set([1]) : new Set([0]);
   });
   const anyCanFail = perTargetExit.some((set) => set.has(1));
@@ -605,8 +581,6 @@ export function predictMulti(meta: MultiScenarioMeta): MultiPrediction {
   if (anyCanFail) {
     exitCodes.add(1);
   }
-  // The leak invariant's forbidden set: every redacted target's real slug plus
-  // its planted canaries. Under `show` nothing is redacted, so the set is empty.
   const forbidden: string[] = [];
   for (const repo of meta.repos) {
     if (repo.redaction.kind === "redacted") {
@@ -635,13 +609,9 @@ export interface DiscoveryFilters {
 }
 
 /**
- * An INDEPENDENT glob matcher for the exclude filter, deliberately NOT calling
- * src's excludeMatches (which compiles to a RegExp): this is a char-by-char
- * two-pointer matcher with backtracking, so a bug in either implementation
- * surfaces as a disagreement instead of hiding. `*` matches any run (including
- * empty); all other characters match literally, case-insensitively. A pattern
- * with "/" matches the full slug, otherwise the name portion - mirroring the
- * repos-dir <name>.yml vs <owner>/<name>.yml split.
+ * An INDEPENDENT glob matcher, deliberately not src's excludeMatches (a RegExp compile), so a bug in
+ * either surfaces as a disagreement. A pattern with "/" matches the full slug, otherwise the name
+ * portion, mirroring the repos-dir <name>.yml vs <owner>/<name>.yml split.
  */
 function globMatches(pattern: string, slug: string): boolean {
   const target = (pattern.includes("/") ? slug : (slug.split("/")[1] ?? slug)).toLowerCase();
@@ -675,11 +645,9 @@ function globMatches(pattern: string, slug: string): boolean {
 }
 
 /**
- * Predict the set of slugs a `repos: "*"` discovery keeps, by mirroring the
- * action's documented filter rules INDEPENDENTLY (not by calling discoverRepos,
- * so a shared bug cannot hide). Order matches the engine's attribution order:
- * visibility, archived, forks, topics, exclude. The exclude match uses the
- * independent globMatches above rather than src's excludeMatches.
+ * The slugs a `repos: "*"` discovery keeps, mirroring the action's documented filter rules
+ * INDEPENDENTLY of discoverRepos so a shared bug cannot hide; the filters run in the engine's
+ * attribution order.
  */
 export function predictDiscovery(pool: DiscoveryRepo[], filters: DiscoveryFilters): string[] {
   const visibility = filters.visibility ?? "all";
@@ -697,10 +665,7 @@ export function predictDiscovery(pool: DiscoveryRepo[], filters: DiscoveryFilter
   const kept: string[] = [];
   for (const repo of pool) {
     const vis = repo.visibility ?? "public";
-    // Visibility is the net of the server-side query narrowing plus the
-    // action's client-side settle: public keeps only public; private keeps
-    // only private (the API returns private+internal, the action drops
-    // internal); internal keeps only internal; all/absent keeps everything.
+    // private keeps only private: the API returns private+internal and the action drops internal.
     if (visibility === "public" && vis !== "public") {
       continue;
     }
@@ -731,4 +696,352 @@ export function predictDiscovery(pool: DiscoveryRepo[], filters: DiscoveryFilter
     kept.push(repo.slug);
   }
   return kept;
+}
+
+// --- mode: merge -------------------------------------------------------------
+
+/**
+ * The engine's own notice record, so the fuzz shares its wording (describeOptOut) with the action;
+ * the oracle computes the layer and the path itself.
+ */
+export type MergeNotice = OptOutNotice;
+
+/**
+ * The merge oracle's verdict. Two layers each valid alone can fold into a document the post-merge
+ * validator rejects: a lower `allowed_actions: selected` with its allowlist under a higher `allowed_actions: all`.
+ */
+export type MergePrediction =
+  | { kind: "merged"; merged: Json; notices: MergeNotice[] }
+  | { kind: "refused"; layer: string }
+  | { kind: "invalid"; error: string };
+
+/** A list the merge combines by identity: two entries are one resource when their key sets intersect. */
+interface KeyedList {
+  /** Every identity the entry claims, folded; null when it carries none (refused at the boundary). */
+  keysOf: (entry: Json) => readonly string[] | null;
+  /** The entry field the keys are read from, for naming a keyless entry the fold cannot place. */
+  keyField: string;
+  combine: "replace" | "merge";
+  nested?: Readonly<Record<string, KeyedList>>;
+}
+
+function labelKeys(entry: Json): readonly string[] | null {
+  const names = entry.new_name === undefined ? [entry.name] : [entry.new_name, entry.name];
+  if (!names.every((name): name is string => typeof name === "string")) {
+    return null;
+  }
+  return [...new Set(names.map((name) => name.toLowerCase()))];
+}
+
+function singleKey(field: string): KeyedList["keysOf"] {
+  return (entry) => (typeof entry[field] === "string" ? [entry[field]] : null);
+}
+
+/**
+ * The keyed sections in the oracle's OWN words, not read off the section modules, so a module whose
+ * layering declaration drifts is a disagreement the fuzz surfaces; oracle.test.ts pins the two as data.
+ */
+export const KEYED_MERGE_SECTIONS: Readonly<Partial<Record<UndeclaredPolicySection, KeyedList>>> = {
+  labels: { keysOf: labelKeys, keyField: "name", combine: "replace" },
+  rulesets: {
+    keysOf: singleKey("name"),
+    keyField: "name",
+    combine: "merge",
+    nested: { rules: { keysOf: singleKey("type"), keyField: "type", combine: "replace" } },
+  },
+};
+
+const UNDECLARED_DEFAULTS: Record<UndeclaredPolicySection, "keep" | "delete"> = Object.fromEntries(
+  UNDECLARED_POLICY_SECTIONS.map((key) => {
+    const section = SECTIONS.find((candidate) => candidate.key === key);
+    if (section === undefined || section.undeclaredDefault === "untouched") {
+      throw new Error(`${key} is knobbed but declares no keep/delete default`);
+    }
+    return [key, section.undeclaredDefault];
+  }),
+) as Record<UndeclaredPolicySection, "keep" | "delete">;
+
+function isMapping(value: unknown): value is Json {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isKnobbed(key: string): key is UndeclaredPolicySection {
+  return (UNDECLARED_POLICY_SECTIONS as readonly string[]).includes(key);
+}
+
+function isDirective(value: unknown): value is LayeringDirective {
+  return LAYERING_DIRECTIVES.some((directive) => directive === value);
+}
+
+function asWrapper(value: unknown): Json {
+  return Array.isArray(value) ? { entries: value } : (value as Json);
+}
+
+/** The layer a notice attributes a deletion to; the removed path arrives as the settle() parameter. */
+interface Site {
+  layer: string;
+  notices: MergeNotice[];
+}
+
+/** What the layers so far said about one key: nothing yet, a null that stayed as written, or a value. */
+type Slot = unknown;
+
+function at(path: string, key: string): string {
+  return path === "" ? key : `${path}.${key}`;
+}
+
+/**
+ * The dialect's one sentence about a higher value, transcribed. `keyedFields` names the fields of two
+ * mappings whose lists combine by key (a ruleset's rules) instead of replacing.
+ */
+function settle(
+  slot: Slot,
+  higher: unknown,
+  path: string,
+  site: Site,
+  keyedFields?: Readonly<Record<string, KeyedList>>,
+): Slot {
+  if (higher === null) {
+    if (slot !== undefined && slot !== null) {
+      site.notices.push({ layer: site.layer, path });
+      return undefined;
+    }
+    return null;
+  }
+  if (isMapping(slot) && isMapping(higher)) {
+    return mergeTrees(slot, higher, path, site, keyedFields);
+  }
+  return structuredClone(higher);
+}
+
+function mergeTrees(
+  lower: Json,
+  higher: Json,
+  path: string,
+  site: Site,
+  keyedFields?: Readonly<Record<string, KeyedList>>,
+): Json {
+  const out: Json = {};
+  for (const key of new Set([...Object.keys(lower), ...Object.keys(higher)])) {
+    if (!(key in higher) || higher[key] === undefined) {
+      out[key] = lower[key];
+      continue;
+    }
+    const keyed = keyedFields?.[key];
+    const settled =
+      keyed !== undefined && Array.isArray(lower[key]) && Array.isArray(higher[key])
+        ? unionKeyed(lower[key] as Json[], higher[key] as Json[], keyed, at(path, key), site)
+        : settle(lower[key], higher[key], at(path, key), site, undefined);
+    if (settled !== undefined) {
+      out[key] = settled;
+    }
+  }
+  return out;
+}
+
+/** An entry's keys; the boundary refused every keyless entry before the fold runs. */
+function keysOrThrow(entry: Json, keyed: KeyedList): readonly string[] {
+  const keys = keyed.keysOf(entry);
+  if (keys === null) {
+    throw new Error(`a keyless ${keyed.keyField} entry reached the fold: ${JSON.stringify(entry)}`);
+  }
+  return keys;
+}
+
+function sameResource(a: readonly string[], b: readonly string[]): boolean {
+  return a.some((key) => b.includes(key));
+}
+
+/**
+ * Matching reads the lower list as it stood before this layer, so two higher entries claiming one
+ * lower entry both take its slot, in their order. A notice inside a merged entry names it by its
+ * INDEX in the higher layer's list (where the null was written), never by a key value.
+ */
+function unionKeyed(
+  lower: Json[],
+  higher: Json[],
+  keyed: KeyedList,
+  path: string,
+  site: Site,
+): Json[] {
+  const lowerKeys = lower.map((entry) => keysOrThrow(entry, keyed));
+  const higherKeys = higher.map((entry) => keysOrThrow(entry, keyed));
+  const slotOf = higherKeys.map((keys) =>
+    lowerKeys.findIndex((below) => sameResource(below, keys)),
+  );
+  const combine = (below: Json, entry: Json, h: number): Json =>
+    keyed.combine === "replace"
+      ? structuredClone(entry)
+      : mergeTrees(below, entry, `${path}[${h}]`, site, keyed.nested);
+  const out = lower.flatMap((below, index) => {
+    const keys = lowerKeys[index] as readonly string[];
+    if (!higherKeys.some((claims) => sameResource(claims, keys))) {
+      return [below];
+    }
+    return higher.flatMap((entry, h) => (slotOf[h] === index ? [combine(below, entry, h)] : []));
+  });
+  out.push(...higher.flatMap((entry, h) => (slotOf[h] === -1 ? [structuredClone(entry)] : [])));
+  return out;
+}
+
+interface Contribution {
+  layer: string;
+  value: unknown;
+  fileDirective: LayeringDirective | undefined;
+}
+
+function reduceKnobbed(
+  key: UndeclaredPolicySection,
+  column: readonly Contribution[],
+  run: LayeringDirective,
+  notices: MergeNotice[],
+): Slot {
+  const keyed = KEYED_MERGE_SECTIONS[key];
+  let slot: Slot;
+  for (const { layer, value, fileDirective } of column) {
+    const site: Site = { layer, notices };
+    if (value === null) {
+      slot = settle(slot, null, key, site);
+      continue;
+    }
+    const { entries, [LAYERING_KEY]: directive, ...knobs } = asWrapper(value);
+    const effective = (isDirective(directive) ? directive : undefined) ?? fileDirective ?? run;
+    const below = isMapping(slot) ? slot : {};
+    const { entries: belowEntries, ...belowKnobs } = below;
+    const unite = effective === "merge" && keyed !== undefined && Array.isArray(belowEntries);
+    slot = {
+      ...mergeTrees(belowKnobs, knobs, key, site),
+      entries: unite
+        ? unionKeyed(belowEntries as Json[], entries as Json[], keyed, key, site)
+        : structuredClone(entries),
+    };
+  }
+  if (isMapping(slot) && Array.isArray(slot.entries) && slot[UNDECLARED_KEY] === undefined) {
+    slot[UNDECLARED_KEY] = UNDECLARED_DEFAULTS[key];
+  }
+  return slot;
+}
+
+/**
+ * The oracle's own fold, written from the dialect's description rather than the engine; it assumes
+ * refusedMergeLayer admitted every layer. `_layering` is consumed, never written: a layer's top-level
+ * directive governs its knobbed sections, a wrapper's governs its own section.
+ */
+export function foldMergeLayers(
+  layers: readonly MergeLayer[],
+  layering: LayeringDirective,
+): { merged: Json; notices: MergeNotice[] } {
+  const notices: MergeNotice[] = [];
+  const merged: Json = {};
+  for (const key of SECTION_KEYS) {
+    const column: Contribution[] = layers.flatMap((layer) =>
+      layer.doc[key] === undefined
+        ? []
+        : [
+            {
+              layer: layer.name,
+              value: layer.doc[key],
+              fileDirective: isDirective(layer.doc[LAYERING_KEY])
+                ? layer.doc[LAYERING_KEY]
+                : undefined,
+            },
+          ],
+    );
+    if (column.length === 0) {
+      continue;
+    }
+    let slot: Slot;
+    if (isKnobbed(key)) {
+      slot = reduceKnobbed(key, column, layering, notices);
+    } else {
+      for (const { layer, value } of column) {
+        slot = settle(slot, value, key, { layer, notices });
+      }
+    }
+    // A top-level null that met nothing below opted out of nothing: it drops, unless null is the section's value.
+    if (slot === null && !isNullValued(key)) {
+      continue;
+    }
+    if (slot !== undefined) {
+      merged[key] = slot;
+    }
+  }
+  return { merged, notices };
+}
+
+/**
+ * Whether a keyed list declares two entries claiming one key (a label renaming
+ * into a sibling's name included) or a keyless entry, at any nesting.
+ */
+function keyedListRefused(entries: readonly unknown[], keyed: KeyedList): boolean {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!isMapping(entry)) {
+      return true;
+    }
+    const keys = keyed.keysOf(entry);
+    if (keys === null || keys.some((key) => seen.has(key))) {
+      return true;
+    }
+    for (const key of keys) {
+      seen.add(key);
+    }
+    for (const [field, nested] of Object.entries(keyed.nested ?? {})) {
+      const value = entry[field];
+      if (Array.isArray(value) && keyedListRefused(value, nested)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function refusedMergeLayer(layers: readonly MergeLayer[]): string | undefined {
+  for (const layer of layers) {
+    const fileDirective = layer.doc[LAYERING_KEY];
+    if (fileDirective !== undefined && !isDirective(fileDirective)) {
+      return layer.name;
+    }
+    for (const key of UNDECLARED_POLICY_SECTIONS) {
+      const value = layer.doc[key];
+      if (value === undefined || value === null) {
+        continue;
+      }
+      const wrapper = asWrapper(value);
+      if (!isMapping(wrapper) || !Array.isArray(wrapper.entries)) {
+        return layer.name;
+      }
+      if (!wrapper.entries.every(isMapping)) {
+        return layer.name;
+      }
+      const directive = wrapper[LAYERING_KEY];
+      if (directive !== undefined && !isDirective(directive)) {
+        return layer.name;
+      }
+      const keyed = KEYED_MERGE_SECTIONS[key];
+      if (keyed === undefined && (directive ?? fileDirective) === "merge") {
+        return layer.name;
+      }
+      if (keyed !== undefined && keyedListRefused(wrapper.entries, keyed)) {
+        return layer.name;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** A mode: merge run never contacts the mock: it is refused, invalid, or written from the fold alone. */
+export function predictMerge(meta: MergeScenarioMeta): MergePrediction {
+  const refused = refusedMergeLayer(meta.layers);
+  if (refused !== undefined) {
+    return { kind: "refused", layer: refused };
+  }
+  const folded = foldMergeLayers(meta.layers, meta.layering);
+  // Whether the fold is a valid document is the validator's question, the same one the run asks:
+  // cross-field rules the published schema cannot spell, so the generator cannot avoid them by construction.
+  const validated = validateSettingsDoc(folded.merged, "merged", SectionSelection.ALL, silentIo());
+  if (validated.isErr()) {
+    return { kind: "invalid", error: describeProblem(validated.error) };
+  }
+  return { kind: "merged", ...folded };
 }

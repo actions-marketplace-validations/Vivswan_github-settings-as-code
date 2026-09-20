@@ -1,60 +1,91 @@
-/**
- * The private-report issue-delivery assertions over the mock's request log:
- * which body was delivered for a slug, and the full expect.issue_report
- * check (marker label, label-lookup mechanism, body substrings, final
- * state). Shared by the curated corpus (runScenario) and the fuzz
- * report-body check, so both prove the same delivery contract.
- */
+/** Shared by the curated corpus (runScenario) and the fuzz report-body check, so both prove the same delivery contract. */
 
 import { MARKER_LABEL } from "../../src/report/issue-report.js";
 import type { LoggedRequest } from "./mock/contract.js";
 import type { Expect } from "./schema.js";
 
-/** The `body` field of a recorded request payload, when it is a string. */
 function stringBody(request: LoggedRequest | undefined): string | undefined {
   const body = (request?.body as { body?: unknown } | undefined)?.body;
   return typeof body === "string" ? body : undefined;
 }
 
-/**
- * The report body delivered for a slug: the create POST body when the issue was
- * created this run, else the last PATCH body (an existing issue updated in
- * place). Undefined when no issue write reached the mock for that slug (e.g. the
- * permission-denied path). Shared by the curated issue_report assertion and the
- * fuzz report-body check.
- */
-export function deliveredIssueBody(requests: LoggedRequest[], slug: string): string | undefined {
+/** A rejected write delivered nothing, so only an accepted one counts as a report; the leak sweep below reads every attempt. */
+function accepted(request: LoggedRequest): boolean {
+  return request.status >= 200 && request.status < 300;
+}
+
+/** Every body GitHub accepted for the slug's report issue, in write order: the create and each body-bearing PATCH. */
+function deliveredIssueBodies(requests: LoggedRequest[], slug: string): string[] {
   const base = `/repos/${slug}/issues`;
-  const create = requests.find((r) => r.method === "POST" && r.pathname === base);
-  const fromCreate = stringBody(create);
-  if (fromCreate !== undefined) {
-    return fromCreate;
+  return requests
+    .filter(
+      (r) =>
+        accepted(r) &&
+        ((r.method === "POST" && r.pathname === base) ||
+          (r.method === "PATCH" && r.pathname.startsWith(`${base}/`))),
+    )
+    .flatMap((r) => {
+      const body = stringBody(r);
+      return body === undefined ? [] : [body];
+    });
+}
+
+/** The issue's final body: the latest accepted write that carried one, so a trailing state-only PATCH hides nothing. */
+export function deliveredIssueBody(requests: LoggedRequest[], slug: string): string | undefined {
+  return deliveredIssueBodies(requests, slug).at(-1);
+}
+
+const ISSUE_WRITE = /^\/repos\/([^/]+\/[^/]+)\/issues(?:\/\d+)?$/;
+
+/**
+ * Every report body the run TRANSMITTED, whichever target it went to and whether or not GitHub accepted it: the create
+ * and each reuse or close PATCH. A rejected write still carried its body over the wire, so a leak in it is a leak.
+ */
+export function transmittedReportBodies(
+  requests: LoggedRequest[],
+): Array<{ slug: string; body: string }> {
+  const out: Array<{ slug: string; body: string }> = [];
+  for (const request of requests) {
+    const slug = request.pathname.match(ISSUE_WRITE)?.[1];
+    if (slug === undefined || (request.method !== "POST" && request.method !== "PATCH")) {
+      continue;
+    }
+    const body = stringBody(request);
+    if (body !== undefined) {
+      out.push({ slug, body });
+    }
   }
-  const lastPatch = requests
-    .filter((r) => r.method === "PATCH" && r.pathname.startsWith(`${base}/`))
-    .at(-1);
-  return stringBody(lastPatch);
+  return out;
 }
 
 /**
- * Assert the private-report issue delivery for one slug against the recorded
- * requests: the report body carried the expected substrings (the full
- * unredacted detail), the issue's title/state matched, and the right number of
- * report issues were created. The report body is the POST /issues create body,
- * or - when the issue already existed and was updated - the PATCH body; state
- * is taken from the last create/patch that set it. `created_count` counts
- * POST /issues for the slug (0 proves no issue was created, e.g. the
- * permission-denied path).
+ * The private report is the one surface the redacted transcript reaches, and it is written unmasked so the private slug
+ * stays legible there (capturingIo in src/flows/redact.ts). A resolved secret plaintext must still never land in it, so
+ * the runner sweeps every delivered body for the run's secrets; the same needles fail the public surfaces via checkLeaks.
  */
+export function checkReportLeaks(requests: LoggedRequest[], secrets: string[]): string[] {
+  const failures: string[] = [];
+  for (const { slug, body } of transmittedReportBodies(requests)) {
+    for (const needle of secrets) {
+      if (body.includes(needle)) {
+        failures.push(`leak: "${needle}" present in the private report body sent to ${slug}`);
+      }
+    }
+  }
+  return failures;
+}
+
 export function assertIssueReport(
   spec: NonNullable<Expect["issue_report"]>,
   requests: LoggedRequest[],
 ): string[] {
   const failures: string[] = [];
   const issuesPath = `/repos/${spec.slug}/issues`;
-  const creates = requests.filter((r) => r.method === "POST" && r.pathname === issuesPath);
+  const creates = requests.filter(
+    (r) => accepted(r) && r.method === "POST" && r.pathname === issuesPath,
+  );
   const patches = requests.filter(
-    (r) => r.method === "PATCH" && r.pathname.startsWith(`${issuesPath}/`),
+    (r) => accepted(r) && r.method === "PATCH" && r.pathname.startsWith(`${issuesPath}/`),
   );
 
   if (spec.created_count !== undefined && creates.length !== spec.created_count) {
@@ -63,17 +94,14 @@ export function assertIssueReport(
     );
   }
 
-  // The delivered body: the create body if the issue was created this run, else
-  // the last PATCH body (an existing issue updated in place).
   const created = creates[0]?.body as { title?: unknown; labels?: unknown } | undefined;
   const deliveredBody = deliveredIssueBody(requests, spec.slug);
 
   if (spec.title !== undefined && created && created.title !== spec.title) {
     failures.push(`issue_report: title "${String(created.title)}" != expected "${spec.title}"`);
   }
-  // A created issue MUST carry the marker label - it is the lookup key that makes
-  // the one-issue-per-repo reuse work; without it every run would create a new
-  // issue. (Only checked on create; a reuse run PATCHes and adds no labels.)
+  // The marker label is the lookup key for one-issue-per-repo reuse. A reuse PATCH re-sends labels only when
+  // the title fallback scan found the marker stripped (the labels check below pins that), so the create carries the assertion.
   if (created) {
     const labels = Array.isArray(created.labels) ? created.labels.map(String) : [];
     if (!labels.includes(MARKER_LABEL)) {
@@ -82,9 +110,7 @@ export function assertIssueReport(
       );
     }
   }
-  // The lookup is by the marker LABEL (one indexed request), not a title/creator
-  // scan: assert the issues list GET carried labels=<marker>. This pins the
-  // load-bearing lookup mechanism the reuse path depends on.
+  // Pins that the label-filtered lookup happened at all; the title scan is a fallback after a miss, not a replacement.
   if (spec.lookup_by_label) {
     const listedByLabel = requests.some(
       (r) =>
@@ -98,10 +124,8 @@ export function assertIssueReport(
       );
     }
   }
-  // The exact label-name array the last labels-setting write carried: the
-  // marker-reattach witness. A fallback-scan hit must reattach the stripped
-  // marker without clobbering human-added labels, so order and content are
-  // both pinned.
+  // The marker-reattach witness: a fallback-scan hit must reattach the stripped marker without
+  // clobbering human-added labels, so order and content are both pinned.
   if (spec.labels) {
     const labelWrites = [...creates, ...patches]
       .map((r) => (r.body as { labels?: unknown } | undefined)?.labels)
@@ -129,13 +153,17 @@ export function assertIssueReport(
       failures.push(`issue_report: report body for ${spec.slug} missing "${needle}"`);
     }
   }
+  // Every accepted body, not only the final one: an earlier write already published what a later one replaced. An
+  // undelivered report lacks everything; body_contains, or created_count, is what pins delivery.
+  for (const needle of spec.body_lacks ?? []) {
+    if (deliveredIssueBodies(requests, spec.slug).some((body) => body.includes(needle))) {
+      failures.push(`issue_report: report body for ${spec.slug} must not contain "${needle}"`);
+    }
+  }
   if (spec.state !== undefined) {
-    // The final state is the last create/patch that set one.
     const stateWrites = [...creates, ...patches]
       .map((r) => (r.body as { state?: unknown } | undefined)?.state)
       .filter((s): s is string => typeof s === "string");
-    // A create defaults the issue open; only an explicit state on a later write
-    // changes it, so the last explicit state wins (else "open" from the create).
     const finalState = stateWrites.at(-1) ?? (creates.length > 0 ? "open" : undefined);
     if (finalState !== spec.state) {
       failures.push(

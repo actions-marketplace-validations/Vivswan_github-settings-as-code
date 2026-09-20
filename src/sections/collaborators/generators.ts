@@ -1,42 +1,41 @@
 /**
- * The collaborators section's fuzz generator fragment: the settings generator
- * plus the pending-invitation live-state seeder, aggregated by
- * test/e2e/generators.ts. Imports the shared role vocabulary (roles.ts) and
- * only the test-tree leaf seams (gen-support.ts, prng.ts) - the src -> test
- * inversion is deliberate; the bundle entry is src/main.ts, so this file
- * never reaches lib/index.js.
+ * The collaborators fuzz generator fragment and the pending-invitation live-state seeder. It imports
+ * test-tree seams on purpose: the bundle entry is src/main.ts, so this file never reaches lib/index.js.
  */
 
-import { type EntriesForm, type Json, maybeWrapUndeclared } from "../../../test/e2e/gen-support.js";
+import {
+  type EntriesForm,
+  generatorFromSlice,
+  type Json,
+  maybeWrapUndeclared,
+  uniqueBy,
+} from "../../../test/e2e/gen-support.js";
 import type { Rng } from "../../../test/e2e/prng.js";
 import { DEFAULT_ROLE, roleForPermission } from "../shared/roles.js";
+import { CollaboratorConfig } from "./schema.js";
+
+const genCollaborator = generatorFromSlice(CollaboratorConfig, {
+  fields: {
+    username: (rng) => rng.pick(["octocat", "hubot", "dev"]),
+    permission: (rng) => rng.pick(["pull", "push", "maintain", "admin"]),
+  },
+  present: { permission: 0.8 },
+});
 
 export function genCollaborators(rng: Rng): EntriesForm {
-  const used = new Set<string>();
-  const out: Json[] = [];
-  const count = rng.int(3) + 1;
-  for (let i = 0; i < count; i++) {
-    const username = `${rng.pick(["octocat", "hubot", "dev"])}-${i}`;
-    if (used.has(username.toLowerCase())) {
-      continue;
-    }
-    used.add(username.toLowerCase());
-    out.push({ username, permission: rng.pick(["pull", "push", "maintain", "admin"]) });
-  }
-  return maybeWrapUndeclared(rng, out);
+  const collaborators = Array.from({ length: rng.int(3) + 1 }, () => genCollaborator(rng));
+  return maybeWrapUndeclared(
+    rng,
+    uniqueBy(collaborators, ["username"], (login) => login.toLowerCase()),
+  );
 }
 
 /** The undeclared pending-invitation invitee; no generated username collides with it. */
 const UNDECLARED_INVITEE = "zz-undeclared-invitee";
 
 /**
- * Pending-invitation live state for the declared collaborators: some
- * declared users get a pending invitation (matching the declared permission,
- * mismatched, or expired), and sometimes an undeclared invitee rides along.
- * Every relation converges under a fully-granted apply - matched invitations
- * are left alone, mismatches PATCHed, expired ones re-sent, the undeclared
- * one cancelled (or kept as a note) - so the fixpoint and convergence gates
- * hold without the oracle modeling a collaborators witness kind.
+ * Every relation seeded here (matching, mismatched, expired, or an undeclared invitee) converges
+ * under a fully-granted apply, so the fixpoint gates hold without a collaborators witness kind.
  */
 export function genInvitationsState(rng: Rng, declared: Json[]): Json[] {
   const out: Json[] = [];

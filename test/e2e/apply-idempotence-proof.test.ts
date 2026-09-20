@@ -1,74 +1,86 @@
-/**
- * Unit tests for the apply-idempotence layer: the declaration tables
- * (apply-idempotence.ts) and the proof engine's pure classifiers
- * (apply-idempotence-proof.ts). Each exported classifier is tested directly
- * so the corresponding e2e assertion is provably able to fire.
- */
+/** Each exported classifier is tested directly so the corresponding e2e assertion is provably able to fire. */
 
 import { describe, expect, test } from "bun:test";
-import type { SectionKey } from "../../src/schema.js";
-import {
-  ALWAYS_REWRITE_ENDPOINT_FAMILIES,
-  alwaysRewriteEndpointKeys,
-  COMPARE_BEFORE_WRITE,
-} from "./apply-idempotence.js";
+import { endpointMethod } from "../../src/sections/contract/endpoints.js";
+import { allEndpoints, type SectionEndpointKey } from "../../src/sections/registry.js";
+import { ALWAYS_REWRITE_ENDPOINT_FAMILIES, recurringEndpointKeys } from "./apply-idempotence.js";
 import {
   changedFamilies,
+  type ExemptWriteWitness,
   missingSecondApplyRewrites,
-  recordUnconditionalWrites,
+  recordExemptWrites,
   secondApplyWriteFailures,
-  type UnconditionalWriteWitness,
-  unwitnessedUnconditionalSections,
+  unwitnessedExemptEndpoints,
 } from "./apply-idempotence-proof.js";
 import type { LoggedRequest } from "./mock/contract.js";
 
-describe("always-rewrite lockstep (endpoint flag <-> mock state families)", () => {
+const write = (method: string, pathname: string): LoggedRequest => ({
+  method,
+  pathname,
+  query: "",
+  status: 200,
+});
+
+describe("recurrence (endpoint flags <-> harness declarations)", () => {
   test("every alwaysRewrite endpoint declares its mock state family, and nothing else does", () => {
-    // The required-rewrite obligation lives on the EndpointDecl (per
-    // endpoint); the snapshot exclusion derives from the endpoint-to-family
-    // mapping. Pinning the mapping's KEYS against the flags means a new
-    // flagged endpoint fails here until it names its state family - even
-    // when its section already carries another flagged endpoint.
-    expect(alwaysRewriteEndpointKeys()).toEqual(
+    // The required-rewrite obligation lives on the EndpointDecl; the snapshot exclusion derives
+    // from this mapping, so a newly flagged endpoint fails here until it names its family.
+    expect(recurringEndpointKeys("always")).toEqual(
       Object.keys(ALWAYS_REWRITE_ENDPOINT_FAMILIES).sort(),
     );
-    // The mapping itself, pinned literally: the families are mock storage
-    // names (state.ts), which nothing can derive - a wrong family here would
-    // silently stop stripping updated_at for that store.
-    expect(ALWAYS_REWRITE_ENDPOINT_FAMILIES).toEqual({
-      "actions_secrets.put": "actions_secrets",
-      "dependabot_secrets.put": "dependabot_secrets",
-      "codespaces_secrets.put": "codespaces_secrets",
-      "agents_secrets.put": "agents_secrets",
-      "environments.putSecret": "environment_secrets",
-    });
+  });
+
+  test("the unverifiable flag sits on declared WRITE endpoints that are not alwaysRewrite", () => {
+    // A flag on a read or on a sealed PUT (where "always" already binds) would change the recurrence rule silently.
+    const declared = allEndpoints();
+    expect(recurringEndpointKeys("may")).not.toEqual([]);
+    for (const key of recurringEndpointKeys("may")) {
+      const endpoint = declared[key as SectionEndpointKey];
+      expect(endpointMethod(endpoint.route)).not.toBe("GET");
+      expect(endpoint.alwaysRewrite).toBeUndefined();
+    }
   });
 });
 
-describe("secondApplyWriteFailures (apply-idempotence zero-write subset)", () => {
-  const write = (method: string, pathname: string): LoggedRequest => ({
-    method,
-    pathname,
-    query: "",
-    status: 200,
-  });
-
-  test("a write to a compare-before-write section fires the assertion", () => {
+describe("secondApplyWriteFailures (apply-idempotence zero-write rule)", () => {
+  test("a write to a compare-before-write endpoint fires the assertion", () => {
     const failures = secondApplyWriteFailures([write("POST", "/repos/e2e-owner/e2e-repo/labels")]);
     expect(failures).toHaveLength(1);
     expect(failures[0]).toContain('"labels"');
-    expect(failures[0]).toContain("compares before writing");
+    expect(failures[0]).toContain("live state already matched");
   });
 
-  test("a write to an unconditional-PUT section passes", () => {
-    // Rulesets and environments PUT existing resources on every apply, so a
-    // second-apply write there is legitimate; only state stability binds them.
-    expect(
-      secondApplyWriteFailures([
-        write("PUT", "/repos/e2e-owner/e2e-repo/rulesets/90000000"),
+  test("the exemption is per endpoint: a section's alwaysRewrite write passes while its drift-gated sibling fires", () => {
+    const pairs: Array<[LoggedRequest, LoggedRequest]> = [
+      [write("PUT", "/repos/e2e-owner/e2e-repo/lfs"), write("PATCH", "/repos/e2e-owner/e2e-repo")],
+      [
+        write("PUT", "/repos/e2e-owner/e2e-repo/actions/secrets/DEPLOY_TOKEN"),
+        write("DELETE", "/repos/e2e-owner/e2e-repo/actions/secrets/STALE"),
+      ],
+      [
+        write("PUT", "/repos/e2e-owner/e2e-repo/environments/production/secrets/DEPLOY_TOKEN"),
         write("PUT", "/repos/e2e-owner/e2e-repo/environments/production"),
-      ]),
-    ).toEqual([]);
+      ],
+    ];
+    for (const [exempt, gated] of pairs) {
+      expect(secondApplyWriteFailures([exempt])).toEqual([]);
+      const failures = secondApplyWriteFailures([exempt, gated]);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toContain(`${gated.method} ${gated.pathname}`);
+    }
+  });
+
+  test("an unverifiable webhook write may recur; the same section's drift-gated writes may not", () => {
+    const hooks = "/repos/e2e-owner/e2e-repo/hooks";
+    expect(secondApplyWriteFailures([write("PATCH", `${hooks}/601/config`)])).toEqual([]);
+    expect(secondApplyWriteFailures([write("POST", hooks)])).toEqual([]);
+    const failures = secondApplyWriteFailures([
+      write("PATCH", `${hooks}/601`),
+      write("DELETE", `${hooks}/602`),
+    ]);
+    expect(failures).toHaveLength(2);
+    expect(failures.join("\n")).toContain(`PATCH ${hooks}/601`);
+    expect(failures.join("\n")).toContain(`DELETE ${hooks}/602`);
   });
 
   test("a write matching no section endpoint fires the outside-section failure", () => {
@@ -80,44 +92,57 @@ describe("secondApplyWriteFailures (apply-idempotence zero-write subset)", () =>
     expect(failures).toHaveLength(1);
     expect(failures[0]).toContain("outside any section endpoint");
   });
-
-  test("every compare-before-write section's own writes are flagged, per offender", () => {
-    const failures = secondApplyWriteFailures([
-      write("PATCH", "/repos/e2e-owner/e2e-repo/labels/bug"),
-      write("POST", "/repos/e2e-owner/e2e-repo/milestones"),
-      write("DELETE", "/repos/e2e-owner/e2e-repo/autolinks/1"),
-      write("PUT", "/repos/e2e-owner/e2e-repo/collaborators/alice"),
-      write("PUT", "/repos/e2e-owner/e2e-repo/actions/workflows/7/enable"),
-    ]);
-    expect(failures).toHaveLength(5);
-  });
 });
 
 describe("missingSecondApplyRewrites (apply-idempotence always-rewrite subset)", () => {
-  const write = (method: string, pathname: string): LoggedRequest => ({
-    method,
-    pathname,
-    query: "",
-    status: 200,
-  });
   const secretPut = write("PUT", "/repos/e2e-owner/e2e-repo/actions/secrets/DEPLOY_TOKEN");
 
   test("a first-apply secret PUT the second apply skipped fires the assertion", () => {
     const failures = missingSecondApplyRewrites([secretPut], []);
     expect(failures).toHaveLength(1);
     expect(failures[0]).toContain("actions/secrets/DEPLOY_TOKEN");
-    expect(failures[0]).toContain("re-written on EVERY apply");
+    expect(failures[0]).toContain("re-issued on EVERY apply");
   });
 
-  test("a re-issued secret PUT passes; other sections' writes never bind", () => {
-    // A rulesets PUT on the first run creates no re-write obligation - only
-    // always-rewrite sections do.
+  test("a same-path write in the other direction is not a re-issue", () => {
+    const lfs = "/repos/e2e-owner/e2e-repo/lfs";
+    const failures = missingSecondApplyRewrites([write("PUT", lfs)], [write("DELETE", lfs)]);
+    expect(failures).toHaveLength(2);
+    expect(failures[0]).toContain(`DELETE ${lfs} 0 time(s) and the second 1`);
+    expect(failures[1]).toContain(`PUT ${lfs} 1 time(s) and the second 0`);
+    expect(missingSecondApplyRewrites([write("PUT", lfs)], [write("PUT", lfs)])).toEqual([]);
+    expect(
+      missingSecondApplyRewrites([write("PUT", lfs), write("PUT", lfs)], [write("PUT", lfs)]),
+    ).toHaveLength(1);
+    expect(
+      missingSecondApplyRewrites([write("PUT", lfs)], [write("PUT", lfs), write("PUT", lfs)]),
+    ).toHaveLength(1);
+    const withQuery = (query: string): LoggedRequest => ({ ...write("PUT", lfs), query });
+    expect(missingSecondApplyRewrites([withQuery("a=1")], [withQuery("a=2")])).toHaveLength(2);
+    expect(missingSecondApplyRewrites([withQuery("a=1")], [withQuery("a=1")])).toEqual([]);
+  });
+
+  test("a re-issued secret PUT passes; unflagged writes never bind, an unverifiable one included", () => {
     expect(
       missingSecondApplyRewrites(
-        [secretPut, write("PUT", "/repos/e2e-owner/e2e-repo/rulesets/90000000")],
+        [
+          secretPut,
+          write("PUT", "/repos/e2e-owner/e2e-repo/rulesets/90000000"),
+          write("PATCH", "/repos/e2e-owner/e2e-repo/hooks/601/config"),
+        ],
         [secretPut],
       ),
     ).toEqual([]);
+  });
+
+  test("the read-less check suite preferences PATCH binds like a sealed PUT", () => {
+    // Not a secret and not a PUT: the obligation is the alwaysRewrite flag,
+    // whatever the method, so a second apply that skips it fires.
+    const patch = write("PATCH", "/repos/e2e-owner/e2e-repo/check-suites/preferences");
+    const failures = missingSecondApplyRewrites([patch], []);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("PATCH /repos/e2e-owner/e2e-repo/check-suites/preferences");
+    expect(missingSecondApplyRewrites([patch], [patch])).toEqual([]);
   });
 
   test("a first-apply secret DELETE creates no re-write obligation", () => {
@@ -132,9 +157,6 @@ describe("missingSecondApplyRewrites (apply-idempotence always-rewrite subset)",
   });
 
   test("every family's sealed PUT binds: dependabot, codespaces, environment secrets", () => {
-    // The obligation derives from the EndpointDecl alwaysRewrite flag, so a
-    // skipped first-apply PUT fires for each family - and crucially, the
-    // ENVIRONMENT PUT itself (same section, no flag) creates no obligation.
     const firstWrites = [
       write("PUT", "/repos/e2e-owner/e2e-repo/dependabot/secrets/REGISTRY_TOKEN"),
       write("PUT", "/repos/e2e-owner/e2e-repo/codespaces/secrets/DOTFILES_PAT"),
@@ -150,61 +172,58 @@ describe("missingSecondApplyRewrites (apply-idempotence always-rewrite subset)",
   });
 });
 
-describe("unwitnessedUnconditionalSections (apply-idempotence corpus witness)", () => {
-  const write = (method: string, pathname: string): LoggedRequest => ({
-    method,
-    pathname,
-    query: "",
-    status: 200,
-  });
-  /** A witness map with every false-listed section fully covered. */
-  const coveredWitness = (): UnconditionalWriteWitness => {
-    const witness: UnconditionalWriteWitness = new Map();
-    for (const [section, compares] of Object.entries(COMPARE_BEFORE_WRITE)) {
-      if (!compares) {
-        witness.set(section as SectionKey, { first: 1, second: 1 });
-      }
-    }
-    return witness;
-  };
+describe("unwitnessedExemptEndpoints (apply-idempotence corpus witness)", () => {
+  const coveredWitness = (): ExemptWriteWitness =>
+    new Map(
+      [...recurringEndpointKeys("always"), ...recurringEndpointKeys("may")].map((key) => [
+        key,
+        { first: 1, second: 1 },
+      ]),
+    );
 
   test("a fully covered corpus produces no failures", () => {
-    expect(unwitnessedUnconditionalSections(coveredWitness())).toEqual([]);
+    expect(unwitnessedExemptEndpoints(coveredWitness())).toEqual([]);
   });
 
-  test("an empty corpus flags EVERY false-listed section as unwitnessed", () => {
-    const failures = unwitnessedUnconditionalSections(new Map());
-    const falseListed = Object.values(COMPARE_BEFORE_WRITE).filter((v) => !v).length;
-    expect(failures).toHaveLength(falseListed);
+  test("an empty corpus flags EVERY exempt endpoint as unwitnessed, once each", () => {
+    const failures = unwitnessedExemptEndpoints(new Map());
+    const exempt = recurringEndpointKeys("always").length + recurringEndpointKeys("may").length;
+    expect(failures).toHaveLength(exempt);
     for (const failure of failures) {
       expect(failure).toContain("NO apply_idempotent scenario");
     }
   });
 
-  test("first-apply writes without any second-apply write name the opposite remedy", () => {
+  test("unverifiable writes seen only on first applies name the drop-the-exemption remedy, per section", () => {
     const witness = coveredWitness();
-    witness.set("teams", { first: 2, second: 0 });
-    const failures = unwitnessedUnconditionalSections(witness);
+    for (const key of recurringEndpointKeys("may")) {
+      witness.set(key, { first: 2, second: 0 });
+    }
+    const failures = unwitnessedExemptEndpoints(witness);
     expect(failures).toHaveLength(1);
-    expect(failures[0]).toContain('"teams"');
-    expect(failures[0]).toContain("never re-issued by any second apply");
+    expect(failures[0]).toContain('"webhooks"');
+    expect(failures[0]).toContain("no second apply in the corpus re-issued");
+    witness.set("webhooks.updateConfig", { first: 2, second: 2 });
+    expect(unwitnessedExemptEndpoints(witness)).toEqual([]);
   });
 
-  test("recordUnconditionalWrites counts only false-listed sections, per side", () => {
-    const witness: UnconditionalWriteWitness = new Map();
-    recordUnconditionalWrites(
+  test("recordExemptWrites counts only exempt endpoints, per side", () => {
+    const witness: ExemptWriteWitness = new Map();
+    recordExemptWrites(
       witness,
       [
-        // labels compares before writing, so it never enters the witness;
-        // report traffic matches no section endpoint and is skipped too.
         write("POST", "/repos/e2e-owner/e2e-repo/labels"),
         write("POST", "/repos/e2e-owner/svc-private/issues"),
-        write("PUT", "/repos/e2e-owner/e2e-repo/rulesets/90000000"),
+        write("PATCH", "/repos/e2e-owner/e2e-repo"),
+        write("PUT", "/repos/e2e-owner/e2e-repo/lfs"),
+        write("PATCH", "/repos/e2e-owner/e2e-repo/hooks/601/config"),
       ],
-      [write("PUT", "/repos/e2e-owner/e2e-repo/rulesets/90000000")],
+      [write("PUT", "/repos/e2e-owner/e2e-repo/lfs")],
     );
-    expect([...witness.keys()]).toEqual(["rulesets"]);
-    expect(witness.get("rulesets")).toEqual({ first: 1, second: 1 });
+    expect([...witness.entries()].sort()).toEqual([
+      ["repository.lfsPut", { first: 1, second: 1 }],
+      ["webhooks.updateConfig", { first: 1, second: 0 }],
+    ]);
   });
 });
 

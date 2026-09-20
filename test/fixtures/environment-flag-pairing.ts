@@ -1,13 +1,6 @@
 /**
- * The environments flag-pairing invariant (declaring
- * deployment_branch_policies requires a sibling deployment_branch_policy
- * with custom_branch_policies: true) is implemented TWICE: the runtime zod
- * superRefine on the EnvironmentConfig schema and the JSON Schema if/then
- * its meta stamps onto the published schema (both in src/schema.ts).
- * These fixtures are the one set both implementations are tested against -
- * the published-schema test runs them through AJV, the environments section
- * test through the zod shape, and an agreement test asserts the two verdicts
- * match per fixture, so the copies cannot drift apart silently.
+ * The flag-pairing invariant is implemented TWICE (the zod superRefine and the JSON Schema if/then, both in src/sections/environments/schema.ts);
+ * these fixtures are the one set both are tested against, and an agreement test asserts the verdicts match per fixture.
  */
 
 export interface FlagPairingFixture {
@@ -19,11 +12,7 @@ export interface FlagPairingFixture {
   valid: boolean;
 }
 
-/**
- * The environment name every fixture entry declares, exported so the tests
- * that assert on the refinement's error wording (which embeds the name)
- * derive it instead of restating "prod".
- */
+/** Exported so tests asserting on the refinement's error wording (which embeds the name) derive it instead of restating "prod". */
 export const FIXTURE_ENV_NAME = "prod";
 
 export const FLAG_PAIRING_FIXTURES: readonly FlagPairingFixture[] = [
@@ -72,7 +61,7 @@ export const FLAG_PAIRING_FIXTURES: readonly FlagPairingFixture[] = [
     entry: {
       name: FIXTURE_ENV_NAME,
       deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
-      deployment_branch_policies: { undeclared: "keep", entries: [{ name: "main" }] },
+      deployment_branch_policies: { _undeclared: "keep", entries: [{ name: "main" }] },
     },
     valid: true,
   },

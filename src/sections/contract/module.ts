@@ -1,122 +1,56 @@
-/** The section contract: handler context, section metadata, and the SectionModule shape. */
-
 import { z } from "zod";
 import type { RepoRef } from "../../discovery/targets.js";
-import type { GithubClient } from "../../github/api.js";
+import type { GitHubClient } from "../../github/api.js";
 import type { SectionKey, SettingsFile, UndeclaredPolicySection } from "../../schema.js";
-import type { MustBeNever, UndeclaredPolicy, UndeclaredPolicyList } from "../../types.js";
-import { type EndpointDecl, endpointKind, endpointMethod } from "./endpoints.js";
+import type {
+  DeepReadonly,
+  MustBeNever,
+  UndeclaredPolicy,
+  UndeclaredPolicyList,
+} from "../../types.js";
+import {
+  type EndpointDecl,
+  endpointKind,
+  endpointMethod,
+  endpointPath,
+  type GatedReadDecl,
+  type Route,
+} from "./endpoints.js";
 import type { GraphqlOpDecl } from "./graphql.js";
 import { grantFor, type SectionPermission } from "./permissions.js";
+import type { PlanContext, PlannedOp, SectionPlan, SnapshotContext } from "./plan.js";
 
-/** The facets of a section context shared by both mode arms. */
 interface SectionContextBase {
-  api: GithubClient;
+  api: GitHubClient;
   /** The target repository, parsed once at the boundary (see RepoRef). */
   repo: RepoRef;
 }
 
 /**
- * The context a section handler runs under, discriminated on `check` so the
- * mode carries its own capabilities:
- * - `check: true` (check mode and the apply-mode preflight) is the
- *   read-only phase: references are validated for syntax only, the
- *   environment is never read, and `resolveSecret?: never` makes a resolver
- *   in this phase unrepresentable.
- * - `check: false` (apply) ALWAYS carries `resolveSecret`, which maps a
- *   whole-value `$NAME` secret reference to its plaintext: the engine
- *   resolves EVERY declared secret value up front (after the preflight
- *   barrier, before the first mutation of any section) and registers each
- *   plaintext with output masking before any handler runs, so a handler
- *   only ever looks up an already-resolved name. When the document declares
- *   no secret values the resolver still exists, closed over an empty map,
- *   and any lookup fails with the engine's BUG error - a call it can never
- *   legitimately receive.
- * Handlers narrow on the SectionRun built from this context (beginRun), so
- * the apply branch gets the resolver structurally instead of re-checking
- * for it at runtime.
+ * The read-only phases (check mode, the preflight probe, every plan-time read) run under `check: true`;
+ * apply's resolver has every declared secret resolved up front by the engine (ExecTools in ./plan.ts).
  */
 export type SectionContext =
   | (SectionContextBase & { check: true; resolveSecret?: never })
   | (SectionContextBase & { check: false; resolveSecret: (reference: string) => string });
 
-/** The check-mode arm of SectionContext, the ApplySectionContext sibling. */
-type CheckSectionContext = Extract<SectionContext, { check: true }>;
+export type EndpointDict = Readonly<Record<string, EndpointDecl>>;
 
-/** The apply-mode arm of SectionContext, for helpers only apply may call. */
-export type ApplySectionContext = Extract<SectionContext, { check: false }>;
+export type GraphqlDict = Readonly<Record<string, GraphqlOpDecl>>;
 
 /**
- * What check mode may report: drift and notes. `changes?: never` makes a
- * change line in check mode unrepresentable - the arm has no list to push
- * one onto - instead of merely ignored by the engine.
+ * GET /orgs/{org} is public, so no token permission; its 404 is the personal-account signal. A section whose
+ * other reads can never be denied marks it the primary read (`primaryRead: { notFound: "absent" }`).
  */
-interface CheckResult {
-  /** Mirrors SectionContext.check; beginRun() copies it at construction. */
-  readonly check: true;
-  /** Drift lines: live state diverging from the settings file. */
-  drift: string[];
-  /** Informational notes (unmanaged resources left alone, skips). */
-  notes: string[];
-  changes?: never;
-}
-
-/** What apply mode may report: mutations performed, and notes. */
-interface ApplyResult {
-  readonly check: false;
-  /** Mutations performed, one line each. */
-  changes: string[];
-  /** Informational notes (unmanaged resources left alone, skips). */
-  notes: string[];
-  drift?: never;
-}
+export const ORG_PROBE = {
+  route: "GET /orgs/{org}",
+  statuses: { 200: "the organization", 404: "not an organization (a personal account)" },
+  permission: "none",
+} as const satisfies EndpointDecl;
 
 /**
- * A section's outcome, discriminated on the same `check` flag as the
- * context that produced it. The engine narrows on `result.check`, so the
- * check branch structurally cannot read changes and the apply branch
- * cannot read drift.
- */
-export type SectionResult = CheckResult | ApplyResult;
-
-/**
- * A handler's mode-correlated working state: the context arm and the result
- * arm, paired under ONE discriminant so narrowing `run.check` narrows both
- * together - the check branch gets `run.result.drift`, the apply branch gets
- * `run.result.changes` AND `run.ctx.resolveSecret`, and a mixed pairing (a
- * check context with an apply result) is unrepresentable. beginRun() is the
- * sole sanctioned constructor and copies ctx.check, so `result.check`
- * mirrors the mode the handler ran under; run()'s signature cannot encode
- * that correlation on its own (it would force a cast into every handler),
- * so the engine asserts it once where the result comes back. Mode-neutral
- * facts (`notes`, the request helpers' `ctx` argument) read fine off the
- * unnarrowed union.
- */
-export type SectionRun =
-  | { readonly check: true; readonly ctx: CheckSectionContext; readonly result: CheckResult }
-  | { readonly check: false; readonly ctx: ApplySectionContext; readonly result: ApplyResult };
-
-/** Open a section run: pair the context with the empty result of its mode. */
-export function beginRun(ctx: SectionContext): SectionRun {
-  return ctx.check
-    ? { check: true, ctx, result: { check: true, drift: [], notes: [] } }
-    : { check: false, ctx, result: { check: false, changes: [], notes: [] } };
-}
-
-/** A section's REST endpoint dictionary: role -> declaration. */
-type EndpointDict = Readonly<Record<string, EndpointDecl>>;
-
-/** A section's GraphQL operation dictionary: role -> declaration. */
-type GraphqlDict = Readonly<Record<string, GraphqlOpDecl>>;
-
-/**
- * The identity every helper needs to classify an error: the section's key
- * and its fine-grained-PAT grant advice. Handlers pass `this`, so the
- * advice always travels with the section that owns it. `E` and `G` carry
- * the section's LITERAL endpoint and GraphQL dictionaries (each module
- * declares them `as const`), so the `${key}.${role}` key unions the
- * registry derives - and everything downstream of them: the e2e mock's
- * handler tables, its dispatch, USED_PATHS - are exact types, not strings.
+ * `E` and `G` must be the module's LITERAL (`as const`) dictionaries: ../registry.ts derives the
+ * `${key}.${role}` unions from them, and the e2e mock's handler tables are typed by those unions.
  */
 export interface SectionMeta<
   K extends SectionKey = SectionKey,
@@ -124,96 +58,69 @@ export interface SectionMeta<
   G extends GraphqlDict = GraphqlDict,
 > {
   readonly key: K;
-  /**
-   * The machine-readable permission this section requires, from which its
-   * grant prose is derived via sectionGrant.
-   */
+  /** Drives the grant prose (sectionGrant), the e2e mock's permission gate, and the fuzz oracle. */
   readonly permission: SectionPermission;
-  /**
-   * Extra prose sectionGrant appends to the derived grant advice, for a
-   * section whose denials need more than the permission grant (an ambiguous
-   * 403, a per-key permission override). Omit it when the derived grant
-   * says everything.
-   */
+  /** Appended to the derived grant advice when a denial can mean more than a missing grant (an ambiguous 403). */
   readonly grantCaveat?: string;
   /**
-   * Owner-kind sensitivity. "org" marks a section whose resources exist
-   * only under an ORGANIZATION owner: its handler probes the owner (the
-   * bare GET /orgs/{org} endpoint, 404 tolerated) and NO-OPS with a note on
-   * a personal account, so check reports clean and apply reports applied
-   * there. Omitted (the default), the section works under any repository
-   * owner. The single source for owner-kind modeling outside the handler:
-   * the fuzz oracle's personal-account fold derives its section set from
-   * this, and the registry unit test pins the declaration to the org-probe
-   * endpoint that implements it - so a new org-only section declares it
-   * here and the consumers follow.
+   * "org": the resources exist only under an ORGANIZATION owner. The registry wraps the module's plan() and
+   * snapshot() in the owner gate (./owner.ts), which probes the `org` role (ORG_PROBE, 404 tolerated) and
+   * no-ops with a note on a personal account, so no section body spells the probe; the registry's lockstep
+   * type admits the flag only beside that role. The single source of owner-kind modeling: the fuzz oracle's
+   * personal-account fold reads it, and test/sections/registry.test.ts pins it to the probe endpoint.
    */
   readonly ownerSensitivity?: "org";
-  /**
-   * Every REST endpoint this section may call, keyed by role (list, create,
-   * update, remove, probe, ...). Handlers build their paths by passing these
-   * declarations to the request helpers; the mock server and USED_PATHS
-   * derivation iterate Object.values(...).
-   */
+  /** Every REST endpoint the section may call, by role; the e2e mock's routes and USED_PATHS derive from it. */
   readonly endpoints: E;
   /**
-   * Every GraphQL operation this section may issue, keyed by role exactly
-   * like `endpoints`. Handlers pass these declarations to the GraphQL
-   * request helpers; the mock's dispatch table, the coverage tripwire, and
-   * the fuzz oracle iterate allGraphqlOps(). Omitted by REST-only sections.
+   * Every GraphQL operation the section may issue, by role; the e2e mock, the coverage tripwire, and the
+   * fuzz generators iterate allGraphqlOps().
    */
   readonly graphql?: G;
   /**
-   * The DEFAULT policy for live resources this section does NOT declare, the
-   * single source the README Sections table and COVERAGE derive their
-   * deletion claims from. Which sections sit in each bucket is read off the
-   * registry (./registry.ts), not restated here. For the sections that
-   * enumerate sibling resources, the settings file can override the default
-   * per run with the wrapped `{undeclared, entries}` form (see
-   * undeclaredPolicy below):
-   * - "delete": the section lists live resources and DELETES undeclared ones
-   *   by default; `undeclared: keep` softens that to notes.
-   * - "keep": the section lists live resources but KEEPS undeclared ones by
-   *   default, surfacing each as a note; `undeclared: delete` hardens that
-   *   to deletion.
-   * - "untouched": the section never enumerates sibling resources, so an
-   *   undeclared one is simply never seen and no policy applies.
+   * The generated Sections table's Undeclared-default column derives from it, and test/sections/docs-registry.test.ts
+   * fails a COVERAGE Notes cell that contradicts it; the wrapped `{_undeclared, entries}` form overrides it per run.
    *
-   * The conditional type makes the pairing unrepresentable to get wrong: a
-   * section in UNDECLARED_POLICY_SECTIONS must say "delete" or "keep",
-   * and one outside it must say "untouched" - so defaultUndeclaredPolicy
-   * can never be reached for a section the merge does not normalize.
+   *   "delete"     -> lists live resources and DELETES undeclared ones; `_undeclared: keep` softens to notes
+   *   "keep"       -> lists live resources and KEEPS undeclared ones as notes; `_undeclared: delete` hardens
+   *   "untouched"  -> takes no `_undeclared` knob; the section applies no undeclared policy
+   *
+   * The conditional type pins the pairing: a section in UNDECLARED_POLICY_SECTIONS says "delete" or "keep", one outside it "untouched".
    */
   readonly undeclaredDefault: K extends UndeclaredPolicySection ? UndeclaredPolicy : "untouched";
+  /** Read by engine/layers.ts for the layered merge; a knobbed section that declares none always replaces. */
+  readonly layering?: K extends UndeclaredPolicySection ? KeyedListLayering : never;
 }
 
 /**
- * A section's fine-grained-PAT grant advice, used verbatim in permission
- * errors: the prose grantFor derives from the section's permission, plus its
- * caveat when one is declared. The README's "Sections" table mirrors these
- * in its PAT permission column.
+ * engine/layers.ts pairs two entries when their key sets intersect, the planner's own duplicate test,
+ * so a merged document is always one the planner accepts.
  */
+export interface KeyedListLayering {
+  /**
+   * Folded as the planner folds them (a label claims its name plus its pre-rename name); null when the
+   * entry carries none, which the layer boundary refuses.
+   */
+  readonly keys: (entry: Readonly<Record<string, unknown>>) => readonly string[] | null;
+  /** The entry field the keys come from, for refusal prose ("name", "type"). */
+  readonly keyField: string;
+  /** A matched pair: "replace" (higher wins wholesale) or "merge" (key by key, nested keyed lists below). */
+  readonly combine: "replace" | "merge";
+  /** Fields of a merged entry that are themselves keyed lists (rulesets' `rules`). */
+  readonly nested?: Readonly<Record<string, KeyedListLayering>>;
+}
+
+/** Used verbatim in permission errors; the Sections table on docs/reference/sections.md mirrors it in its PAT permission column. */
 export function sectionGrant(section: Pick<SectionMeta, "permission" | "grantCaveat">): string {
   return grantFor(section.permission, section.grantCaveat);
 }
 
-/**
- * The declaration behind a failing request, as error classification reads
- * it: a REST endpoint or a GraphQL operation. An honest union rather than a
- * structural facet - `{}` must not satisfy it - and the GraphqlOpDecl arm's
- * `hints?: never` makes a hint on a GraphQL operation (which has no HTTP
- * status for it to key on) a compile error. throwFor and endpointPermission
- * take this, so both kinds classify through one code path.
- */
+/** A union, not a structural facet, so `{}` cannot satisfy it; throwFor and endpointPermission classify both kinds through it. */
 export type FailingOp = EndpointDecl | GraphqlOpDecl;
 
-/**
- * The permission this endpoint or GraphQL operation actually requires: its
- * own override when one is declared, otherwise the section's permission.
- * "none" means public. The single place downstream consumers (e.g. the e2e
- * mock's permission gate) resolve the effective permission, so section vs
- * per-operation precedence lives in one spot.
- */
+/** The one place the override-vs-section precedence lives; the e2e mock's permission gate resolves through it too. "none" means public. */
+export function endpointPermission(section: SectionMeta, op: GatedReadDecl): SectionPermission;
+export function endpointPermission(section: SectionMeta, op: FailingOp): SectionPermission | "none";
 export function endpointPermission(
   section: SectionMeta,
   op: FailingOp,
@@ -222,49 +129,141 @@ export function endpointPermission(
 }
 
 /**
- * One entry in the flattened REST + GraphQL view of sectionOperations():
- * `wire` says whether the request READS or WRITES on the wire (a GET or a
- * query vs a mutating method or a mutation), `grade` the access level GitHub
- * gates it at (endpointKind, so an accessGrade override write-gates a wire
- * read; a GraphQL operation's kind is both), and `permission` the effective
- * permission (endpointPermission).
+ * `wire` is what the request does; `grade` is what GitHub gates it at, so an accessGrade override
+ * write-gates a wire read (a GraphQL operation's kind is both). `phase` matters for reads (writes always carry "plan" and run at apply):
+ *
+ *   read, phase "plan"       -> available to plan(), so check mode and preflight may meet it
+ *   read, phase "execution"  -> issued by a thunk, apply only (see EndpointDecl.phase)
  */
 export interface SectionOperation {
+  readonly role: string;
   readonly wire: "read" | "write";
   readonly grade: "read" | "write";
   readonly permission: SectionPermission | "none";
+  readonly phase: "plan" | "execution";
 }
 
 /**
- * Every operation a section may issue - its REST endpoints and GraphQL
- * operations flattened into one list. Consumers deriving cross-cutting facts
- * from "everything this section can call" (overrideAdviceLevel in ./errors.ts, the
- * fuzz oracle's no-read and write-gated section sets, the registry
- * mixed-grade guard, the README PAT-form and permissions-doc sweeps) walk
- * THIS view instead of section.endpoints alone, so a derivation can never
- * quietly ignore the GraphQL dictionary. The _OperationDictionariesFlattened
- * pin below keeps the flattening total: a new operation dictionary on
- * SectionMeta fails to compile until it is folded in here.
+ * REST and GraphQL flattened, so a derivation over "everything this section can call" cannot skip the
+ * GraphQL dictionary; _OperationDictionariesFlattened pins the flattening total.
  */
 export function sectionOperations(section: SectionMeta): SectionOperation[] {
   return [
-    ...Object.values(section.endpoints).map((endpoint) => ({
+    ...Object.entries(section.endpoints).map(([role, endpoint]) => ({
+      role,
       wire: endpointMethod(endpoint.route) === "GET" ? ("read" as const) : ("write" as const),
       grade: endpointKind(endpoint),
       permission: endpointPermission(section, endpoint),
+      phase: endpoint.phase ?? ("plan" as const),
     })),
-    ...Object.values(section.graphql ?? {}).map((op) => ({
+    ...Object.entries(section.graphql ?? {}).map(([role, op]) => ({
+      role,
       wire: op.kind,
       grade: op.kind,
       permission: endpointPermission(section, op),
+      phase: op.phase ?? ("plan" as const),
     })),
   ];
 }
 
-/** The SectionMeta properties sectionOperations flattens. */
+/** Execution-phase reads are excluded: only a thunk reaches them, so neither check mode nor preflight meets them. */
+export function planningReads(section: SectionMeta): SectionOperation[] {
+  return sectionOperations(section).filter((op) => op.wire === "read" && op.phase === "plan");
+}
+
+/**
+ * How GitHub gates a section's planning reads under a read-only grant. Read by the fuzz oracle and the docs.
+ *
+ *   "plain"        -> every read succeeds (also a section with no reads)
+ *   "write-gated"  -> denied at the first read
+ *   "mixed"        -> reads until the handler reaches a gated one
+ */
+export type ReadGating = "plain" | "write-gated" | "mixed";
+
+export function readGating(section: SectionMeta): ReadGating {
+  const reads = planningReads(section);
+  const gated = reads.filter((op) => op.grade === "write").length;
+  if (gated === 0) {
+    return "plain";
+  }
+  return gated === reads.length ? "write-gated" : "mixed";
+}
+
+export interface WriteGatedRead {
+  readonly route: Route;
+  readonly permission: SectionPermission;
+}
+
+/** GraphQL reads are never here: a GraphQL read is gated at read (its kind IS the gate), so the REST dictionary is complete. */
+export function writeGatedReads(section: SectionMeta): WriteGatedRead[] {
+  return Object.values(section.endpoints)
+    .filter((endpoint): endpoint is GatedReadDecl => endpoint.accessGrade === "write")
+    .map((endpoint) => ({
+      route: endpoint.route,
+      permission: endpointPermission(section, endpoint),
+    }));
+}
+
+/** What a fine-grained 404 on a section's primary read means (see EndpointDecl.primaryRead). */
+export type DenialPosture = NonNullable<EndpointDecl["primaryRead"]>["notFound"];
+
+/**
+ * A section with no planning read classifies nothing before its first write, so it is "absent".
+ * Read by the fuzz oracle and the e2e mock.
+ */
+export function denialPosture(section: SectionMeta): DenialPosture {
+  const primaries = Object.values(section.endpoints).flatMap((endpoint) =>
+    endpoint.primaryRead === undefined ? [] : [endpoint],
+  );
+  if (primaries.length > 1) {
+    throw new Error(
+      `BUG: ${section.key} declares primaryRead on ${primaries.length} endpoints; at most one read carries the 404 posture`,
+    );
+  }
+  const primary = primaries[0];
+  if (primary !== undefined && primary.phase === "execution") {
+    throw new Error(
+      `BUG: ${section.key} declares primaryRead on the execution-phase read ${primary.route}; plan() never issues it, so no denied first read can be classified from it`,
+    );
+  }
+  const posture = primary?.primaryRead?.notFound;
+  if (posture !== undefined) {
+    return posture;
+  }
+  if (planningReads(section).length > 0) {
+    throw new Error(
+      `BUG: ${section.key} reads but declares no primaryRead posture, so a denied first read cannot be classified`,
+    );
+  }
+  return "absent";
+}
+
+/**
+ * The primary read whose 404 a section reads as "absent" while a fine-grained token missing the
+ * grant is answered with the same 404. Null when the read is public (a 404 there has one reading)
+ * or the section classifies a 404 as a denial already.
+ */
+export function gatedAbsentRead(section: SectionMeta): EndpointDecl | null {
+  const primary = Object.values(section.endpoints).find(
+    (endpoint) => endpoint.primaryRead?.notFound === "absent",
+  );
+  return primary === undefined || endpointPermission(section, primary) === "none" ? null : primary;
+}
+
+/**
+ * The note a snapshot carries when such a read DID answer 404 and the section read nothing:
+ * unlike plan(), no write follows to surface a denial, so the note names both readings.
+ */
+export function concealedAbsenceNote(section: SectionMeta, read: EndpointDecl): string {
+  return (
+    `${section.key}: GitHub answered GET ${endpointPath(read.route)} with 404, read here as ` +
+    "nothing to snapshot. A fine-grained token missing the grant gets the same answer; if the " +
+    `repository does have this resource, ${sectionGrant(section)}, then snapshot again`
+  );
+}
+
 type FlattenedOperationDictionaries = "endpoints" | "graphql";
 
-/** Every SectionMeta property holding a dictionary of operation declarations. */
 type OperationDictionaryKeys = {
   [K in keyof SectionMeta]-?: NonNullable<SectionMeta[K]> extends Readonly<
     Record<string, FailingOp>
@@ -274,130 +273,220 @@ type OperationDictionaryKeys = {
 }[keyof SectionMeta];
 
 /**
- * The compile-time pin behind sectionOperations' completeness claim: a new
- * operation dictionary added to SectionMeta lands in OperationDictionaryKeys
- * structurally and fails here until sectionOperations (and the list above)
- * flatten it - the _UnlistedSection idiom from schema.ts. The structural
- * match sees `Readonly<Record<string, ...>>` properties (the form both
- * dictionaries use today); a dictionary declared as a named interface would
- * evade it, so keep the record form on any future operation dictionary.
+ * A new operation dictionary on SectionMeta fails here until sectionOperations flattens it.
+ * The structural match sees only `Readonly<Record<string, ...>>` properties: a dictionary declared as a
+ * named interface would evade it, so keep the record form on any future one.
  */
 type _OperationDictionariesFlattened = MustBeNever<
   Exclude<OperationDictionaryKeys, FlattenedOperationDictionaries>
 >;
 
 /**
- * The check-mode note of a WRITE-ONLY section: one that declares no read
- * operation at all, so check mode can verify nothing (and issues no request)
- * while apply re-asserts the declared state on every run. Derived from the
- * section's own operation list rather than restated per section: a read
- * endpoint added later makes the note's claim false, so the helper throws
- * the BUG loudly instead of letting the prose and the declarations drift
- * apart. `resource` names what cannot be read back ("check suite
- * preferences"); `reasserts` names what apply rewrites ("the declared
- * preferences").
+ * Derived from the section's operation list rather than restated per section: a planning read added
+ * later would make the cannot-verify claim false, so the helper throws instead of letting the prose drift
+ * (an execution-phase read, which check mode never issues, does not count).
  */
 export function writeOnlyCheckNote(
   section: SectionMeta,
   opts: { resource: string; reasserts: string },
 ): string {
-  if (sectionOperations(section).some((op) => op.wire === "read")) {
+  if (planningReads(section).length > 0) {
     throw new Error(
       `BUG: ${section.key} declares a read operation, so it is not write-only and the cannot-verify note would be false; diff against the read instead`,
     );
   }
-  return `${section.key}: GitHub exposes no read endpoint for ${opts.resource}, so check mode cannot verify them; apply re-asserts ${opts.reasserts} on every run`;
+  return cannotVerifyNote(section.key, {
+    why: `GitHub exposes no read endpoint for ${opts.resource}`,
+    what: "them",
+    reasserts: `re-asserts ${opts.reasserts}`,
+  });
 }
 
 /**
- * The declared value a section receives once its key is present: the
- * section's slice of the validated settings document. The document was
- * parsed once at the boundary (validateSettingsDoc runs every section's
- * shape before any handler sees the value), so run() and secretValues()
- * carry the proof in their parameter type instead of re-asserting it with
- * a per-section cast. Only `undefined` (the absent-section marker the
- * engine filters) is excluded; a nullable section (interaction_limits)
- * keeps its `null`.
+ * The ONE wording for a declared value check mode cannot compare (a secret GitHub never echoes, a
+ * toggle with no read endpoint, a duration GitHub reports only as its computed expiry): why, what
+ * stays unverified, and what apply does about it on every run.
+ */
+export function cannotVerifyNote(
+  label: string,
+  opts: {
+    /** Why GitHub cannot show the value ("GitHub never reveals a webhook secret"). */
+    why: string;
+    /** What stays unverified ("the declared value", "them"). */
+    what: string;
+    /** Apply's every-run verb phrase ("re-sends it", "re-asserts the declared preferences"). */
+    reasserts: string;
+  },
+): string {
+  return `${label}: ${opts.why}, so check mode cannot verify ${opts.what}; apply ${opts.reasserts} on every run`;
+}
+
+/**
+ * validateSettingsDoc (engine/orchestrate.ts) has run every section's shape before a handler sees this,
+ * so plan() carries the proof in its parameter type instead of a per-section cast. Only `undefined` (the
+ * absent-section marker) is excluded: a nullable section (interaction_limits) keeps its `null`.
  */
 type SectionInput<K extends SectionKey> = Exclude<SettingsFile[K], undefined>;
 
-/**
- * One settings section, self-contained: identity and grant advice
- * (SectionMeta), the loose shape validation accepts for its declared
- * value, and the handler. Modules register in ./registry.ts.
- */
-export interface SectionModule<
+interface SectionModuleBase<
   K extends SectionKey = SectionKey,
   E extends EndpointDict = EndpointDict,
   G extends GraphqlDict = GraphqlDict,
 > extends SectionMeta<K, E, G> {
   /**
-   * Loose zod shape for the declared value: only the natural keys the
-   * handler needs are checked, and unknown fields pass through untouched,
-   * so validation does not fight the passthrough-first forward-compatibility
-   * tenet. The sanctioned exceptions are STRICT nested sub-shapes for
-   * values whose endpoint offers no passthrough destination (actions.cache,
-   * where each key is the entire body of its own endpoint, and the
-   * environment secrets and deployment_protection_rules entries, whose
-   * write bodies are built from the named fields alone), where an extra
-   * key can only be a typo.
+   * Declared fields are checked and unknown fields pass through, so validation does not fight
+   * passthrough-first forward compatibility. STRICT nested sub-shapes are sanctioned only where the
+   * endpoint offers no passthrough destination (actions.cache, the environment secrets and
+   * deployment_protection_rules entries), where an extra key can only be a typo.
    */
   shape: z.ZodType;
   /**
-   * Declared only on CLOSED sections - those whose API calls never forward
-   * extra entry keys (collaborators, teams, workflows), where an
-   * unrecognized key is always a typo that would otherwise apply
-   * "successfully" and never converge. Consumed by validateSectionShapes,
-   * so the rejection happens during upfront document validation, BEFORE any
-   * section has written anything. Open passthrough sections must NOT
-   * declare this: their extra keys genuinely reach GitHub, and future API
-   * fields have to keep working. The conditional type enforces both edges:
-   * `known` is a mapped record over EVERY entry key from SettingsFile, so a
-   * config field the declaration omits fails to compile (a new schema field
-   * forces a decision here) and a key the entry type does not carry is an
-   * excess property - no per-section lockstep pin needed. A non-list
-   * section cannot declare a closedSurface at all (the property collapses
-   * to never). EntryOf sees through the wrapped `{undeclared, entries}`
-   * form, so a closed section that also takes the policy knob
-   * (collaborators) keeps its closed-surface validation in both forms.
+   * Declared only by CLOSED sections, whose API calls never forward extra entry keys (collaborators, teams,
+   * workflows), so an unrecognized key would apply "successfully" and never converge; open passthrough
+   * sections must NOT declare it, since their extra keys reach GitHub.
+   *
+   *   `known` mapped over EVERY entry key          -> a new schema field forces a decision here; a phantom key is an excess property
+   *   EntryOf sees through the wrapped form        -> a closed section that also takes the knob (collaborators) stays closed in both forms
+   *   validateSectionShapes (engine/validate.ts)   -> rejects before any section writes
    */
   closedSurface?: [EntryOf<NonNullable<SettingsFile[K]>>] extends [never]
     ? never
     : {
-        /**
-         * Every entry key the section recognizes, one required `true` per
-         * key of the entry type - the exhaustiveness lives in this shape.
-         * Key order is the order error prose lists them in.
-         */
+        /** Key order is the order the error prose lists them in. */
         known: {
           readonly [P in Extract<keyof EntryOf<NonNullable<SettingsFile[K]>>, string>]: true;
         };
-        /** The entry's natural key, to name it in the error. */
-        describe: (entry: EntryOf<NonNullable<SettingsFile[K]>>) => string;
+        /**
+         * Method syntax on purpose: a function-typed property is contravariant in its parameter, which
+         * would stop the module's exact type from erasing to SectionModule<SectionKey> in ../registry.ts.
+         */
+        describe(entry: EntryOf<NonNullable<SettingsFile[K]>>): string;
         /** What the unrecognized key would silently do, as message prose. */
         consequence: string;
       };
   /**
-   * The declared values of this section's DESIGNATED SECRET FIELDS (e.g.
-   * every webhooks entry's config.secret), extracted from the raw declared
-   * value, each labelled with its owning entry (see DeclaredSecretValue).
-   * Declared only by sections that carry secret fields. The engine
-   * collects these before any section runs: it validates each value as a
-   * whole-value `$NAME` reference (syntax only in check mode and preflight)
-   * and, in apply mode, resolves them all up front - masking every
-   * plaintext - so ctx.resolveSecret never misses. Values are returned raw;
-   * nothing here reads the environment.
+   * Declared only by sections with designated secret fields (every webhooks entry's config.secret); the
+   * values are returned raw, and nothing here reads the environment.
+   *
+   *   check mode and preflight   -> the engine validates each as a whole-value `$NAME` reference
+   *   apply                      -> the engine resolves and masks them all up front, so ctx.resolveSecret never misses
    */
   secretValues?(declared: SectionInput<K>): DeclaredSecretValue[];
-  run(ctx: SectionContext, desired: SectionInput<K>): Promise<SectionResult>;
 }
 
 /**
- * One designated secret-field value as a section declares it: the raw value
- * (a `$NAME` reference when well-formed) plus a label naming the OWNING
- * ENTRY - a secret name, an environment-plus-secret pair, a webhook url -
- * so a validation error can point at the offending entry among many. The
- * label is configuration the settings file already spells, never a value.
+ * What a section reads back as a settings document: its live state in the section's own declared
+ * form, or `undefined` when nothing exists (the engine omits the key). `notes` carry what the value
+ * cannot: a secret's unreadable value, a feature the repository lacks.
+ */
+export interface SectionSnapshot<K extends SectionKey = SectionKey> {
+  readonly value: SettingsFile[K] | undefined;
+  readonly notes: readonly string[];
+}
+
+/**
+ * plan() only READS (through the port in PlanContext) and returns the operations that would converge the
+ * repository; the engine renders them as drift in check mode and executes them in apply mode.
+ * Modules register in ../registry.ts.
+ *
+ *   snapshot() required  -> the section declares a read (a GET or a GraphQL query), so the live state it
+ *                           compares against can be read back; SnapshotFacet flags a module annotated over its
+ *                           literal dictionaries without one, and ../registry.ts flags every registrant without one
+ *   snapshot() absent    -> only a write-only section (no read at all), which snapshot reports unsupported
+ *                           (snapshotUnsupportedNote)
+ */
+export type SectionModule<
+  K extends SectionKey = SectionKey,
+  E extends EndpointDict = EndpointDict,
+  G extends GraphqlDict = GraphqlDict,
+> = SectionModuleBase<K, E, G> &
+  SnapshotFacet<K, E, G> & {
+    plan(
+      ctx: PlanContext<E, G, K>,
+      desired: SectionInput<K>,
+    ): Promise<SectionPlan<PlannedOp<E, G>>>;
+    /** Pinned so a non-literal object carrying a run() handler is not assignable either. */
+    run?: never;
+  };
+
+/** Whether a LITERAL dictionary pair declares any read; the erased pair (the engine's view) keeps snapshot optional. */
+export type DeclaresRead<E extends EndpointDict, G extends GraphqlDict> = string extends keyof E
+  ? false
+  : [
+        | { [R in keyof E]: E[R]["route"] extends `GET ${string}` ? true : never }[keyof E]
+        | { [R in keyof G]: G[R] extends { readonly kind: "read" } ? true : never }[keyof G],
+      ] extends [never]
+    ? false
+    : true;
+
+type SnapshotFacet<K extends SectionKey, E extends EndpointDict, G extends GraphqlDict> =
+  DeclaresRead<E, G> extends true
+    ? { snapshot(ctx: SnapshotContext<E, G, K>): Promise<SectionSnapshot<K>> }
+    : { snapshot?(ctx: SnapshotContext<E, G, K>): Promise<SectionSnapshot<K>> };
+
+/**
+ * Freezes in place through every nested object and array; functions are left as they are (nothing
+ * reads their properties). The registry views freeze the tagged copies they build with it.
+ */
+export function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (typeof value === "object" && value !== null) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) {
+      deepFreeze(child);
+    }
+  }
+  return value as DeepReadonly<T>;
+}
+
+/** Every SectionMeta field plus closedSurface (its `known` map gates validation); the pin below fails on a module field sorted into neither list. */
+const DECLARATION_FIELDS = [
+  "key",
+  "permission",
+  "grantCaveat",
+  "ownerSensitivity",
+  "endpoints",
+  "graphql",
+  "undeclaredDefault",
+  "layering",
+  "closedSurface",
+] as const satisfies readonly (keyof SectionModule)[];
+
+/** `shape` stays as zod built it; the rest are handlers. */
+type HandlerField = "shape" | "plan" | "snapshot" | "secretValues" | "run";
+
+type _EveryModuleFieldSorted = MustBeNever<
+  Exclude<keyof SectionModule, (typeof DECLARATION_FIELDS)[number] | HandlerField>
+>;
+
+/**
+ * Called once per module as ../registry.ts registers it, so a route, status, hint, permission, GraphQL
+ * outcome, or closed-surface key cannot move after that in the action, the CLI, or the library alike; the
+ * readonly types stop only compiled assignments. The module object itself is frozen shallowly.
+ */
+export function freezeDeclarations<M extends SectionModule>(module: M): M {
+  for (const field of DECLARATION_FIELDS) {
+    deepFreeze(module[field]);
+  }
+  return Object.freeze(module);
+}
+
+/**
+ * The one reason a registered section has no snapshot(): it reads nothing, so there is nothing to read back
+ * (SectionModule makes snapshot() required otherwise). Write-only is derived from the operations, as
+ * writeOnlyCheckNote does, so the two notes cannot disagree.
+ */
+export function snapshotUnsupportedNote(section: SectionMeta): string {
+  if (planningReads(section).length > 0) {
+    throw new Error(
+      `BUG: ${section.key} declares a read operation but no snapshot(); a section that reads must read back, so declare snapshot() on the module`,
+    );
+  }
+  return `${section.key}: GitHub exposes no read endpoint for this section, so there is nothing to snapshot; apply re-asserts the declared value on every run`;
+}
+
+/**
+ * `label` names the OWNING ENTRY (a secret name, a webhook url) so a validation error can point at it;
+ * it is configuration the settings file already spells, never a value.
  */
 export interface DeclaredSecretValue {
   readonly label: string;
@@ -405,14 +494,41 @@ export interface DeclaredSecretValue {
 }
 
 /**
- * Reject non-plain mappings before an object shape sees them: zod's object
- * schemas accept any non-array object, so a YAML-tagged scalar like
- * !!timestamp (which parses to a Date) would otherwise validate as an empty
- * mapping and silently configure nothing. Scalars, arrays, and null pass
- * through so the piped shape reports its own, more precise error for them.
- * Applied by the sections whose value is one mapping with no required
- * keys (repository, the code-scanning setups, interaction_limits) -
- * everywhere else a required natural key already fails the impostor.
+ * The secret values of a list section's declared value, one `extract` per entry. DEFENSIVE by contract:
+ * secretValues runs before shape validation, so a malformed container or entry contributes nothing
+ * rather than throwing, and the actionable error always comes from validation.
+ */
+export function secretValuesOf(
+  declared: unknown,
+  extract: (entry: Readonly<Record<string, unknown>>) => readonly DeclaredSecretValue[],
+): DeclaredSecretValue[] {
+  const isWrapper =
+    typeof declared === "object" &&
+    declared !== null &&
+    !Array.isArray(declared) &&
+    Array.isArray((declared as { entries?: unknown }).entries);
+  if (!Array.isArray(declared) && !isWrapper) {
+    return [];
+  }
+  // "keep" is a placeholder: only the entries are read.
+  const { entries } = undeclaredPolicy(
+    declared as readonly unknown[] | UndeclaredPolicyList<unknown>,
+    "keep",
+  );
+  return entries.flatMap((entry) =>
+    typeof entry === "object" && entry !== null && !Array.isArray(entry)
+      ? [...extract(entry as Readonly<Record<string, unknown>>)]
+      : [],
+  );
+}
+
+/**
+ * zod's object schemas accept any non-array object, so a YAML-tagged scalar like !!timestamp (a Date)
+ * would validate as an empty mapping and silently configure nothing.
+ *
+ *   scalars, arrays, null    -> pass through, so the piped shape reports its own error
+ *   applied by               -> the sections whose whole value is one mapping (repository, the setups, interaction_limits)
+ *   document-wide backstop   -> findNonPlain in engine/validate.ts
  */
 export function requirePlainMapping(shape: z.ZodType): z.ZodType {
   return z
@@ -432,7 +548,6 @@ export function requirePlainMapping(shape: z.ZodType): z.ZodType {
     .pipe(shape);
 }
 
-/** The zod internals loosen() reads: the def discriminator and its children. */
 interface LoosenDef {
   type: string;
   shape?: Record<string, z.ZodType>;
@@ -448,7 +563,6 @@ function defOf(schema: z.ZodType): LoosenDef {
   return (schema as unknown as { _zod: { def: LoosenDef } })._zod.def;
 }
 
-/** Clone a schema with a patched def, keeping its checks (refinements). */
 function cloneWith(schema: z.ZodType, patch: Partial<LoosenDef>): z.ZodType {
   const def = (schema as unknown as { _zod: { def: Record<string, unknown> } })._zod.def;
   return z.util.clone(
@@ -458,22 +572,14 @@ function cloneWith(schema: z.ZodType, patch: Partial<LoosenDef>): z.ZodType {
 }
 
 /**
- * The tolerant runtime derivative of an authored schema from src/schema.ts:
- * every plain (strip) object becomes a passthrough looseObject, so unknown
- * keys ride through to GitHub instead of being dropped and superRefine
- * checks that read undeclared keys can see them. Deliberately preserved as
- * authored:
- * - strictObject stays strict (the {undeclared, entries} wrapper and the
- *   nested shapes whose endpoints offer no passthrough destination);
- * - every refine/superRefine survives (clones carry the checks), so the
- *   runtime-only invariants keep firing;
- * - a knobbed-section union (entry array | strict wrapper) is rewrapped as
- *   a container-routed check, so a failing entry keeps its precise issue
- *   path (`labels[2].name`, or `labels.entries[2].name` in the wrapped
- *   form) instead of a plain union's pathless "Invalid input".
- * Leaf types (strings, enums, numbers, literals, records) pass through
- * untouched; an unrecognized CONTAINER type fails loudly rather than ship a
- * shape that silently skipped loosening.
+ * Every plain (strip) object becomes a passthrough looseObject, so unknown keys ride through to GitHub
+ * and superRefine checks reading undeclared keys can see them. Preserved as authored:
+ *
+ *   strictObject             -> stays strict
+ *   refine/superRefine       -> survives (clones carry the checks); one on the knobbed union itself throws instead
+ *   knobbed-section union    -> rewrapped as a container-routed check, so a failing entry keeps its issue path
+ *                               (`labels[2].name`) instead of a plain union's pathless "Invalid input"
+ *   unrecognized CONTAINER   -> throws, rather than ship a shape that silently skipped loosening
  */
 export function loosen(schema: z.ZodType): z.ZodType {
   const def = defOf(schema);
@@ -483,9 +589,7 @@ export function loosen(schema: z.ZodType): z.ZodType {
       const loosened = Object.fromEntries(
         Object.entries(shape).map(([key, value]) => [key, loosen(value)]),
       );
-      // The catchall is loosened like any other child (z.never stays never,
-      // so strict objects stay strict; an absent catchall means strip, which
-      // becomes passthrough).
+      // z.never stays never (strict stays strict); an absent catchall means strip, which becomes passthrough.
       const catchall = def.catchall === undefined ? z.unknown() : loosen(def.catchall);
       return cloneWith(schema, { shape: loosened, catchall });
     }
@@ -501,9 +605,6 @@ export function loosen(schema: z.ZodType): z.ZodType {
       const knob = detectKnobUnion(options);
       if (knob !== null) {
         if ((def.checks?.length ?? 0) > 0) {
-          // The rewrap replaces the union with a container-routed custom
-          // check, which cannot carry the union's own refinements; attach
-          // the invariant to the entry array or the wrapper instead.
           throw new Error(
             "loosen(): a knobbed-section union carries its own refinements, which the routed rewrap would silently drop - attach them to the entry array or the wrapper",
           );
@@ -522,7 +623,6 @@ export function loosen(schema: z.ZodType): z.ZodType {
   }
 }
 
-/** The schema types loosen() passes through untouched (no children to derive). */
 const LOOSEN_LEAF_TYPES: ReadonlySet<string> = new Set([
   "string",
   "number",
@@ -534,11 +634,8 @@ const LOOSEN_LEAF_TYPES: ReadonlySet<string> = new Set([
   "null",
 ]);
 
-/**
- * Recognize a knobbed-section union: exactly the entry array plus the strict
- * {undeclared, entries} wrapper (see knobbed() in src/sections/shared/schema-helpers.ts).
- */
-function detectKnobUnion(
+/** The knobbed() union (../shared/schema-helpers.ts): the entry array beside the strict {_undeclared, entries} wrapper; engine/canonical.ts walks it by this detector too. */
+export function detectKnobUnion(
   options: readonly z.ZodType[],
 ): { list: z.ZodType; wrapper: z.ZodType } | null {
   if (options.length !== 2) {
@@ -557,15 +654,11 @@ function detectKnobUnion(
   return list !== undefined && wrapper !== undefined ? { list, wrapper } : null;
 }
 
-/**
- * The runtime shape for a knobbed list section: the union of the plain entry
- * array and the strict `{undeclared, entries}` wrapper, routed by container
- * type instead of z.union so a failing entry keeps its precise issue path.
- */
+/** A transform, not a union, so a failing entry keeps its precise issue path and the output is the routed shape's parsed data. */
 function routedListShape(list: z.ZodType, wrapper: z.ZodType): z.ZodType {
   return z
     .custom<unknown>(() => true)
-    .superRefine((value, ctx) => {
+    .transform((value, ctx) => {
       const shape = Array.isArray(value)
         ? list
         : typeof value === "object" && value !== null
@@ -574,26 +667,21 @@ function routedListShape(list: z.ZodType, wrapper: z.ZodType): z.ZodType {
       if (shape === null) {
         ctx.addIssue({
           code: "custom",
-          message: `Invalid input: expected a list of entries, or a mapping with "entries" (and an optional "undeclared" policy), but this section parsed as ${value === null ? "null" : typeof value}`,
+          message: `Invalid input: expected a list of entries, or a mapping with "entries" (and an optional "_undeclared" policy), but this section parsed as ${value === null ? "null" : typeof value}`,
         });
-        return;
+        return z.NEVER;
       }
       const parsed = shape.safeParse(value);
       if (!parsed.success) {
         for (const issue of parsed.error.issues) {
           ctx.addIssue({ ...issue });
         }
+        return z.NEVER;
       }
+      return parsed.data;
     });
 }
 
-/**
- * The entry type of a list section's declared value, whichever form it
- * takes: a plain entry array, or the wrapped `{undeclared, entries}` form.
- * Distributes over the union, so a knobbed section (whose SettingsFile type
- * is that union) resolves to its one entry type; a non-list section
- * resolves to never.
- */
 export type EntryOf<T> = T extends readonly (infer E)[]
   ? E
   : T extends { entries: readonly (infer E)[] }
@@ -601,13 +689,8 @@ export type EntryOf<T> = T extends readonly (infer E)[]
     : never;
 
 /**
- * Unwrap a list section's declared value into its policy and entries. The
- * plain array form takes `defaultPolicy`; the wrapped form's explicit
- * `undeclared` wins, and an omitted one falls back to the same default. The
- * default is a REQUIRED parameter on purpose: a nested list in a future
- * feature cannot derive its default from its section's undeclaredDefault,
- * so the call site always says which default applies. Entries are returned
- * by reference, not cloned.
+ * `defaultPolicy` is REQUIRED on purpose: a nested list cannot derive its default from its section's
+ * undeclaredDefault, so the call site always says which applies. Entries are returned by reference.
  */
 export function undeclaredPolicy<E>(
   declared: readonly E[] | UndeclaredPolicyList<E>,
@@ -617,16 +700,10 @@ export function undeclaredPolicy<E>(
     return { policy: defaultPolicy, entries: declared };
   }
   const wrapped = declared as UndeclaredPolicyList<E>;
-  return { policy: wrapped.undeclared ?? defaultPolicy, entries: wrapped.entries };
+  return { policy: wrapped._undeclared ?? defaultPolicy, entries: wrapped.entries };
 }
 
-/**
- * The section-level default for undeclaredPolicy, read off the section's own
- * undeclaredDefault declaration so the two can never disagree. The parameter
- * type restricts callers to the knobbed sections, where the conditional
- * undeclaredDefault type already excludes "untouched" - asking for a
- * non-enumerating section's default is a compile error, not a runtime BUG.
- */
+/** The parameter type admits only the knobbed sections, so asking for a non-enumerating section's default is a compile error, not a runtime BUG. */
 export function defaultUndeclaredPolicy(
   section: SectionMeta<UndeclaredPolicySection>,
 ): UndeclaredPolicy {
@@ -634,12 +711,8 @@ export function defaultUndeclaredPolicy(
 }
 
 /**
- * The keep-note for one live resource the settings file does not declare,
- * reported when the governing policy is "keep". Only the WORDS live here -
- * which branch runs stays in each section's own control flow on purpose -
- * so the sweep prose cannot drift between sections. `action` is what the
- * opposite knob would make apply do ("DELETE it", "REMOVE them", "CANCEL
- * the invitation"), including any consequence worth naming.
+ * Only the WORDS live here, so the keep-note cannot drift between sections; which branch runs stays in
+ * each section's own control flow on purpose.
  */
 export function undeclaredNote(opts: {
   /** The subject naming the live resource: `label "stale"`, `autolink JIRA-`. */
@@ -650,26 +723,40 @@ export function undeclaredNote(opts: {
   add?: string;
   /** What adding it would manage ("it", or "their access" for people). */
   manage?: string;
-  /** What `undeclared: delete` would make apply do, with any consequence. */
+  /** What `_undeclared: delete` would make apply do, with any consequence. */
   action: string;
 }): string {
   const state = opts.state ?? "exists on the repo but is not declared";
   const add = opts.add ?? "it";
   const manage = opts.manage ?? "it";
-  return `${opts.subject} ${state} in the settings file; kept under "undeclared: keep" - add ${add} to the settings file to manage ${manage}, or set "undeclared: delete" to have apply ${opts.action}`;
+  return `${opts.subject} ${state} in the settings file; kept under "_undeclared: keep" - add ${add} to the settings file to manage ${manage}, or set "_undeclared: delete" to have apply ${opts.action}`;
 }
 
 /**
- * The check-mode drift line for one live resource the settings file does not
- * declare, reported when the governing policy is "delete" - the
- * undeclaredNote sibling. The middle clause derives from the list's DEFAULT
- * policy, so it can never contradict the section again: under a keep
- * default this branch is only reachable because the file set
- * `undeclared: delete`, so the line says so; under a delete default the
- * deletion is the list's own posture and no knob was needed. Callers pass
- * the same default they unwrapped the policy with (the section's
- * undeclaredDefault via defaultUndeclaredPolicy, or a nested list's own
- * fixed default).
+ * The drift line for a field whose live value differs, operands always in this order: declared first,
+ * live second. Both arrive rendered (JSON.stringify, or a section's own spelling such as "unset").
+ */
+export function valueDrift(
+  label: string,
+  declared: string,
+  live: string,
+  opts: {
+    /** Qualifies the live value, in parentheses: a raw state behind the compared one, why order counts. */
+    qualifier?: string;
+    /** The apply clause; null when a generic line beside it already names the remedy (a recreate's field lines). */
+    remedy?: string | null;
+  } = {},
+): string {
+  const qualifier = opts.qualifier === undefined ? "" : ` (${opts.qualifier})`;
+  const remedy =
+    opts.remedy === null ? "" : `; ${opts.remedy ?? "apply will set the declared value"}`;
+  return `${label}: declared ${declared} != live ${live}${qualifier}${remedy}`;
+}
+
+/**
+ * The knob clause derives from the list's DEFAULT policy so it can never contradict the section: under a
+ * keep default this branch is reachable only because the file set `_undeclared: delete`, so the line says
+ * so. Pass the same default the policy was unwrapped with.
  */
 export function undeclaredDrift(
   listDefault: UndeclaredPolicy,
@@ -678,11 +765,7 @@ export function undeclaredDrift(
     label: string;
     /** What apply will do, with any consequence worth naming. */
     action: string;
-    /**
-     * How the undeclared resource presents, when the plain "not in the
-     * settings file" understates it (a PENDING INVITATION rather than an
-     * existing collaborator). The knob clause is appended after it.
-     */
+    /** When "not in the settings file" understates it (a PENDING INVITATION rather than a collaborator); the knob clause follows it. */
     state?: string;
     /** The pronoun for "add ... to the settings file" ("it" unless plural). */
     add?: string;
@@ -690,9 +773,21 @@ export function undeclaredDrift(
     keep?: string;
   },
 ): string {
-  const knob = listDefault === "keep" ? ' and "undeclared: delete" is set' : "";
+  const knob = listDefault === "keep" ? ' and "_undeclared: delete" is set' : "";
   const state = opts.state ?? "not in the settings file";
   const add = opts.add ?? "it";
   const keep = opts.keep ?? "it";
   return `${opts.label}: undeclared - ${state}${knob}, so apply will ${opts.action}; add ${add} to the settings file to keep ${keep}`;
+}
+
+/**
+ * The drift line for a declared resource the live side lacks. `where` completes "but not ..." when "on the
+ * repo" understates it ("on the environment", "enabled on the environment"); `action` when apply does more
+ * than create it.
+ */
+export function missingDrift(
+  label: string,
+  opts: { where?: string; action?: string } = {},
+): string {
+  return `${label}: missing - declared in the settings file but not ${opts.where ?? "on the repo"}; apply will ${opts.action ?? "create it"}`;
 }

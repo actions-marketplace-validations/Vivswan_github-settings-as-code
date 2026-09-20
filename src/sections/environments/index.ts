@@ -1,60 +1,68 @@
-/**
- * `environments:` section - upsert deployment environments by name via PUT.
- * Undeclared environments are left untouched. A declared nested `variables`
- * key reconciles that environment's Actions variables through their own
- * endpoints (undeclared variables WITHIN a declared key are deleted by
- * default; the wrapped `{undeclared: keep, entries}` form softens that to
- * notes). A declared nested `secrets` key reconciles that environment's
- * Actions secrets through the shared secrets engine, one scope per
- * environment (undeclared secrets WITHIN a declared key are KEPT by default
- * - their values are unrecoverable - and `{undeclared: delete, entries}`
- * opts into deletion). A declared nested `deployment_branch_policies` key
- * reconciles that environment's custom branch-policy patterns (it requires
- * the singular `deployment_branch_policy` sibling to set
- * `custom_branch_policies: true`; a pattern's type is immutable upstream, so
- * a type change is delete plus recreate, and undeclared patterns WITHIN a
- * declared key are deleted by default). A declared nested
- * `deployment_protection_rules` key reconciles that environment's custom
- * deployment protection rules - GitHub App gates, enable/disable only,
- * declared by App slug and resolved to the integration id at apply time
- * (undeclared rules WITHIN a declared key are KEPT by default; disabling a
- * deployment gate is security-relevant, so `{undeclared: delete, entries}`
- * opts in).
- */
-
+import { z } from "zod";
 import { subsetDiff } from "../../engine/diff.js";
+import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
-  beginRun,
   type DeclaredSecretValue,
   loosen,
+  missingDrift,
   type SectionModule,
-  type SectionResult,
 } from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
-import { call, probeAbsent, rejectDuplicates } from "../contract/requests.js";
+import { hasDrift, plainData } from "../contract/plan.js";
+import { rejectDuplicates } from "../contract/requests.js";
 import { listSecretValues } from "../shared/secrets-engine.js";
+import { projectOntoSchema } from "../shared/snapshot-helpers.js";
 import { ENDPOINTS } from "./endpoints.js";
+import { NESTED_KEYS, planNested, splitEntry } from "./nested.js";
 import {
-  NESTED_KEYS,
-  NESTED_RECONCILERS,
-  reconcileNested,
-  splitEntry,
-  validateNested,
-} from "./nested.js";
-import { GRAPHQL_OPS, type PinDeclaration, pinKey, reconcilePins } from "./pins.js";
-import { type EnvironmentConfig, EnvironmentsConfig } from "./schema.js";
+  type EnvironmentsPlan,
+  environmentNodeId,
+  GRAPHQL_OPS,
+  type PinDeclaration,
+  planPinned,
+  snapshotPins,
+} from "./pins.js";
+import { EnvironmentConfig, EnvironmentsConfig } from "./schema.js";
+import { sharedSecretNotes, snapshotNested, withPins } from "./snapshot.js";
+
+/**
+ * The environment body (the probe's, and each listing item's): the protection rules GET nests, which
+ * flattenEnvironment un-nests, and the branch-policy flags the nested planners read. Every field the
+ * section touches is declared, so an off-shape body fails the read instead of a translation.
+ */
+const LiveEnvironmentBody = z.looseObject({
+  node_id: z.string().optional(),
+  protection_rules: z
+    .array(
+      z.looseObject({
+        type: z.string().optional(),
+        wait_timer: z.number().optional(),
+        prevent_self_review: z.boolean().optional(),
+        reviewers: z
+          .array(
+            z.looseObject({
+              type: z.string().optional(),
+              reviewer: z.looseObject({ id: z.number() }).optional(),
+            }),
+          )
+          .optional(),
+      }),
+    )
+    .optional(),
+  deployment_branch_policy: z
+    .looseObject({ custom_branch_policies: z.boolean().optional() })
+    .nullable()
+    .optional(),
+});
+export type LiveEnvironmentBody = z.infer<typeof LiveEnvironmentBody>;
+
+/** One item of the environment listing: the name plan() probes by is pinned; the id tells two same-fold names apart. */
+const LiveEnvironment = LiveEnvironmentBody.extend({ id: z.number().optional(), name: z.string() });
 
 const permission: SectionPermission = { repo: ["environments"] };
 
-/**
- * The grant caveat for the branch-policy pattern and protection-rule
- * endpoints, which GitHub gates OUTSIDE the Environments permission
- * (verified against the fine-grained permissions reference): the pattern
- * list and the protection-rule list need Actions read, while the available
- * protection-rule Apps read and the writes of both families need
- * Administration. Appended to the section grant so a denial anywhere in the
- * section names the extra grants.
- */
+// GitHub gates the pattern and protection-rule endpoints outside the Environments permission (per
+// the fine-grained permissions reference); appended to the grant so any denial in the section names them.
 const NESTED_OVERRIDES_CAVEAT =
   'declared "deployment_branch_policies" and "deployment_protection_rules" keys additionally need "Actions" (read) and "Administration" (read and write)';
 
@@ -67,13 +75,9 @@ export const environmentsSection = {
   graphql: GRAPHQL_OPS,
   shape: loosen(EnvironmentsConfig),
   /**
-   * The declared value of every entry's secrets list, across all declared
-   * environments, for the engine's up-front reference resolution - each
-   * label carries the ENVIRONMENT alongside the secret name, since several
-   * environments can declare same-named secrets. DEFENSIVE
-   * like the shared extractor: a malformed container contributes nothing
-   * instead of throwing, so the actionable error always comes from shape
-   * validation.
+   * Labels carry the environment: sibling environments can declare same-named secrets.
+   * A malformed container contributes nothing rather than throwing, so the actionable error
+   * always comes from shape validation.
    */
   secretValues(declared: unknown): DeclaredSecretValue[] {
     if (!Array.isArray(declared)) {
@@ -92,115 +96,122 @@ export const environmentsSection = {
       }));
     });
   },
-  async run(ctx, desired): Promise<SectionResult> {
-    const run = beginRun(ctx);
+  async plan(ctx, desired) {
     rejectDuplicates(
       this,
       desired,
       (env) => env.name.toLowerCase(),
       (env) => env.name,
     );
-    // Validate every nested list upfront, BEFORE any write: a duplicate
-    // discovered mid-loop would leave earlier environments applied and later
-    // ones untouched.
-    for (const env of desired) {
-      for (const key of NESTED_KEYS) {
-        validateNested(key, env);
-      }
-    }
-    // The node id of each declared environment, captured from the PUT body
-    // in apply mode for the pin mutations - the bodies carry the new-format
-    // EN_ ids, so no extra lookup is ever needed. Check mode never mutates,
-    // so it captures none. Keyed by the section's own case-insensitive
-    // natural key.
-    const nodeIds = new Map<string, string>();
-    const captureNodeId = (name: string, body: unknown): void => {
-      const nodeId = (body as { node_id?: unknown } | null)?.node_id;
-      if (typeof nodeId === "string") {
-        nodeIds.set(pinKey(name), nodeId);
-      }
-    };
+    const plan: EnvironmentsPlan = { ops: [], notes: [], drift: [] };
     /** Each entry's declared pin state, in file order (order IS the pin order). */
-    const pinDeclarations: PinDeclaration[] = [];
+    const pins: PinDeclaration[] = [];
     for (const env of desired) {
       const { settings, nested, routed } = splitEntry(env);
       const name = env.name;
-      if (routed.pinned !== undefined) {
-        pinDeclarations.push({ name, pinned: routed.pinned });
-      }
-      if (run.check) {
-        const probe = await probeAbsent(ctx, this, ENDPOINTS.probe, {
-          params: { environment_name: name },
-        });
-        if ("missing" in probe) {
-          run.result.drift.push(
-            `environments[${name}]: missing - declared in the settings file but not on the repo; apply will create it`,
-          );
-          for (const key of NESTED_KEYS) {
-            if (nested[key] !== undefined) {
-              run.result.notes.push(NESTED_RECONCILERS[key].missingNote(name));
-            }
-          }
-        } else {
-          run.result.drift.push(
-            ...subsetDiff(settings, flattenEnvironment(probe.data), `environments[${name}]`),
-          );
-          const liveEnv = (probe.data ?? {}) as Record<string, unknown>;
-          for (const key of NESTED_KEYS) {
-            await reconcileNested(ctx, this, key, name, nested, run, liveEnv);
-          }
+      const params = { environment_name: name };
+      const probe = await ctx.read.probe.probeAbsent(LiveEnvironmentBody, {
+        params,
+        describe: `environment "${name}"`,
+      });
+      const live = "missing" in probe ? undefined : probe.data;
+      const drift =
+        live === undefined
+          ? [missingDrift(`environments[${name}]`)]
+          : subsetDiff(settings, flattenEnvironment(live), `environments[${name}]`);
+      // The pin mutations' node id, off the probe or a created environment's PUT response. A probed
+      // body is validated only when a mutation needs it.
+      const probedNodeId = live === undefined ? undefined : { node_id: live.node_id };
+      let createdNodeId: string | undefined;
+      const nodeId = (): string => {
+        if (probedNodeId !== undefined) {
+          return environmentNodeId(name, probedNodeId);
         }
-      } else {
-        const updated = await call(ctx, this, ENDPOINTS.update, {
-          params: { environment_name: name },
-          payload: settings,
+        if (createdNodeId === undefined) {
+          throw new Error(
+            `BUG: environments: the pin of "${name}" ran before the PUT that creates the environment`,
+          );
+        }
+        return createdNodeId;
+      };
+      if (hasDrift(drift)) {
+        plan.ops.push({
+          role: "update",
+          params,
+          payload: plainData(settings),
+          drift,
+          change: `applied environment "${name}"`,
           describe: `upserting environment "${name}"`,
+          capture:
+            live === undefined && routed.pinned !== undefined
+              ? (response) => {
+                  createdNodeId = environmentNodeId(name, response);
+                }
+              : undefined,
         });
-        captureNodeId(name, updated);
-        run.result.changes.push(`applied environment "${name}"`);
-        for (const key of NESTED_KEYS) {
-          await reconcileNested(ctx, this, key, name, nested, run, undefined);
-        }
+      }
+      if (routed.pinned !== undefined) {
+        pins.push({ name, pinned: routed.pinned, nodeId });
+      }
+      for (const key of NESTED_KEYS) {
+        const planned = await planNested(ctx, this, key, name, nested, live);
+        plan.ops.push(...planned.ops);
+        plan.notes.push(...planned.notes);
       }
     }
-    // Pins reconcile AFTER every environment PUT: a declared pin's node id
-    // comes from its own PUT above, and a PUT failure has already aborted
-    // the section through the ordinary error flow before any pin mutation
-    // could fire. Key-gated: without a declared `pinned` key the section
-    // stays REST-only and never touches /graphql.
-    if (pinDeclarations.length > 0) {
-      await reconcilePins(ctx, this, pinDeclarations, nodeIds, run);
+    // Pins plan after every environment op: a created environment's id comes from its PUT.
+    // Without a `pinned` key the section never touches /graphql.
+    if (pins.length > 0) {
+      const pinned = await planPinned(ctx, pins);
+      plan.ops.push(...pinned.ops);
+      plan.notes.push(...pinned.notes);
     }
-    return run.result;
+    return plan;
   },
-} satisfies SectionModule<"environments">;
+  async snapshot(ctx) {
+    const listed = await ctx.read.list.listAllEnveloped("environments", LiveEnvironment);
+    if (listed.length === 0) {
+      return { value: undefined, notes: [] };
+    }
+    // Environment names are case-insensitive on GitHub, the fold plan() probes and pins by.
+    liveByIdentity(
+      this,
+      "environment",
+      listed,
+      (live) => live.name.toLowerCase(),
+      (live) => liveIdentity(live.name, { environment_id: live.id }),
+    );
+    const notes: string[] = [];
+    const entries: EnvironmentConfig[] = [];
+    for (const live of listed) {
+      const settings = projectOntoSchema(EnvironmentConfig, flattenEnvironment(live));
+      const { nested, notes: nestedNotes } = await snapshotNested(ctx, this, live.name, live);
+      entries.push({ ...settings, ...nested });
+      notes.push(...nestedNotes);
+    }
+    const pinned = withPins(entries, await snapshotPins(ctx));
+    notes.push(...pinned.notes, ...sharedSecretNotes(pinned.entries));
+    return { value: pinned.entries, notes };
+  },
+} satisfies SectionModule<"environments", typeof ENDPOINTS, typeof GRAPHQL_OPS>;
 
 /**
- * GET /environments/{name} nests wait_timer / prevent_self_review / reviewers
- * inside protection_rules[]; translate back into the PUT request shape so
- * check mode compares like with like. Exported so the e2e state tests assert
- * their environmentFromPut transformer inverts this exact function (not a
- * lookalike copy).
+ * GET nests wait_timer / prevent_self_review / reviewers inside protection_rules[]; translated back
+ * to the PUT shape so check compares like with like. Exported so the e2e state tests can assert
+ * their environmentFromPut inverts this exact function.
  */
-export function flattenEnvironment(live: unknown): Record<string, unknown> {
-  const raw = (live ?? {}) as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...raw };
-  const rules = (raw.protection_rules ?? []) as Array<Record<string, unknown>>;
-  for (const rule of rules) {
+export function flattenEnvironment(live: LiveEnvironmentBody): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...live };
+  for (const rule of live.protection_rules ?? []) {
     if (rule.type === "wait_timer") {
       out.wait_timer = rule.wait_timer;
     } else if (rule.type === "required_reviewers") {
       if (rule.prevent_self_review !== undefined) {
         out.prevent_self_review = rule.prevent_self_review;
       }
-      const reviewers = (rule.reviewers ?? []) as Array<{
-        type: unknown;
-        reviewer?: { id?: unknown };
-      }>;
-      out.reviewers = reviewers.map((r) => ({ type: r.type, id: r.reviewer?.id }));
+      out.reviewers = (rule.reviewers ?? []).map((r) => ({ type: r.type, id: r.reviewer?.id }));
     } else {
-      // Future rule types: un-nest their payload keys generically so check
-      // mode can compare declared settings instead of reporting false drift.
+      // Unknown rule types un-nest generically, or a declared setting of theirs would read as drift.
       for (const [key, value] of Object.entries(rule)) {
         if (!["id", "node_id", "type", "url"].includes(key)) {
           out[key] = value;

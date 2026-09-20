@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import * as core from "@actions/core";
+import { describe, expect, test } from "bun:test";
 import { Decrypter, generateX25519Identity, identityToRecipient } from "age-encryption";
+import { err, ok } from "neverthrow";
 import {
   ARTIFACT_FILE,
   ARTIFACT_NAME,
@@ -34,7 +34,8 @@ describe("encryptReport", () => {
   test("round-trips through the age library's own decrypter", async () => {
     const { identity, recipient } = await testKeypair();
     const ciphertext = await encryptReport(recipient, "the private report body");
-    expect(ciphertext).not.toContain(new TextEncoder().encode("private"));
+    // Buffer.includes is a subsequence search; Uint8Array toContain compares elements and would pass with the plaintext bytes present.
+    expect(Buffer.from(ciphertext).includes(Buffer.from("private"))).toBe(false);
     const decrypter = new Decrypter();
     decrypter.addIdentity(identity);
     expect(await decrypter.decrypt(ciphertext, "text")).toBe("the private report body");
@@ -44,17 +45,17 @@ describe("encryptReport", () => {
 describe("parseRecipient", () => {
   test("accepts a generated age recipient", async () => {
     const { recipient } = await testKeypair();
-    expect(parseRecipient(recipient)).toEqual({ ok: true });
+    expect(parseRecipient(recipient)).toEqual(ok());
   });
 
   test.each([
     "",
-    "not-a-key",
     "age1shortandinvalid", // gitleaks:allow
     "AGE-SECRET-KEY-1NOTPUBLIC",
-  ])("rejects a malformed recipient: %j", (recipient) => {
-    const result = parseRecipient(recipient);
-    expect(result.ok).toBe(false);
+  ])("rejects a malformed recipient with the library's reason: %j", (recipient) => {
+    expect(parseRecipient(recipient)).toEqual(
+      err({ code: "age-recipient-invalid", reason: expect.any(String) }),
+    );
   });
 });
 
@@ -62,7 +63,7 @@ describe("deliverArtifactReport", () => {
   test("hands the uploader port ciphertext under the fixed artifact names", async () => {
     const { identity, recipient } = await testKeypair();
     const { uploader, uploads } = captureUploader();
-    const result = await deliverArtifactReport("secret document", recipient, uploader);
+    const result = await deliverArtifactReport(uploader, "secret document", recipient);
     expect(result).toEqual({ uploaded: true });
     expect(uploads).toHaveLength(1);
     expect(uploads[0]?.name).toBe(ARTIFACT_NAME);
@@ -82,55 +83,22 @@ describe("deliverArtifactReport", () => {
         throw new Error("Unable to get the ACTIONS_RUNTIME_TOKEN env variable");
       },
     };
-    const result = await deliverArtifactReport("doc", recipient, uploader);
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("could not upload the private report artifact");
-    expect(result.warning).toContain("ACTIONS_RUNTIME_TOKEN");
+    expect(await deliverArtifactReport(uploader, "doc", recipient)).toEqual({
+      warning:
+        "could not upload the private report artifact: Unable to get the ACTIONS_RUNTIME_TOKEN " +
+        "env variable. Re-run, or set private-report: none if it persists",
+    });
   });
 
   test("a malformed recipient is a warning and the uploader is never called", async () => {
     const { uploader, uploads } = captureUploader();
-    const result = await deliverArtifactReport("doc", "not-a-key", uploader);
-    expect("warning" in result).toBe(true);
-    expect(uploads).toHaveLength(0);
-  });
-});
-
-describe("default uploader without a runtime token", () => {
-  const savedToken = process.env.ACTIONS_RUNTIME_TOKEN;
-
-  afterEach(() => {
-    if (savedToken === undefined) {
-      delete process.env.ACTIONS_RUNTIME_TOKEN;
-    } else {
-      process.env.ACTIONS_RUNTIME_TOKEN = savedToken;
-    }
-  });
-
-  test("missing token yields exactly ONE warning and never invokes the artifact client", async () => {
-    delete process.env.ACTIONS_RUNTIME_TOKEN;
-    // DefaultArtifactClient emits its OWN core.warning before throwing, so a
-    // double-warning would show up as extra core.warning calls. The guard must
-    // return our single warning without ever reaching the client.
-    const warnSpy = spyOn(core, "warning").mockImplementation(() => {});
-    try {
-      const { recipient } = await testKeypair();
-      const result = await deliverArtifactReport("secret document", recipient);
-
-      // exactly one warning, and it is ours (the client's own text never appears)
-      if (!("warning" in result)) {
-        throw new Error("expected a warning");
-      }
-      expect(result.warning).toContain("could not upload the private report artifact");
-      expect(result.warning).toContain("ACTIONS_RUNTIME_TOKEN");
-      // the client was never reached, so it emitted no core.warning of its own
-      expect(warnSpy).toHaveBeenCalledTimes(0);
-      // and no report content ever leaves the module
-      expect(result.warning).not.toContain("secret document");
-    } finally {
-      warnSpy.mockRestore();
-    }
+    const result = await deliverArtifactReport(uploader, "doc", "not-a-key");
+    // The middle of the warning is the age library's own wording, so only our prefix and advice are pinned.
+    expect(result).toEqual({
+      warning: expect.stringMatching(
+        /^could not upload the private report artifact: .+\. Re-run, or set private-report: none if it persists$/,
+      ),
+    });
+    expect(uploads).toEqual([]);
   });
 });

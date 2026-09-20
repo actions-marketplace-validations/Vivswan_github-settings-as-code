@@ -1,18 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { parse as parseYaml } from "yaml";
 import { MARKER_LABEL, MARKER_LABEL_CONFIG } from "../../src/report/issue-report.js";
 import { SECTION_KEYS } from "../../src/schema.js";
+import { ROOT } from "../root.js";
 import {
   ADMIN_OWNER,
   ADMIN_REPO,
   ADMIN_SLUG,
   E2E_TOKEN,
+  layerFile,
+  RUNNER_ROOT_FILES,
   TOKEN_USER_LOGIN,
   VIOLATION_PREFIX,
 } from "./constants.js";
-import { DENIAL_SEMANTICS } from "./denial-semantics.js";
 import { mulberry32, Rng } from "./prng.js";
-import { markerLabelFixtureMismatches, parseScenario } from "./schema.js";
+import {
+  collectYmlFiles,
+  loadScenarios,
+  markerLabelFixtureMismatches,
+  parseScenario,
+  scenarioRoots,
+} from "./schema.js";
 
 describe("prng", () => {
   test("mulberry32 is deterministic for a seed", () => {
@@ -195,6 +206,215 @@ describe("scenario schema", () => {
     );
     expect(s.denial_style).toBe(403);
   });
+
+  // The runner keeps its own files at the root of the child's working directory, so a destination
+  // that resolves to that root (or above it) would let the dir form's walk collect them as snapshots;
+  // the child trims surrounding whitespace, so a padded spelling would name a different path than the runner reads.
+  test.each<[label: string, inputs: Record<string, string>]>([
+    ["the working directory itself", { snapshot_dir: "." }],
+    ["a parent segment", { snapshot_dir: "../snapshots" }],
+    ["an absolute path", { snapshot_file: "/tmp/snapshot.yml" }],
+    ["an empty segment", { snapshot_file: "out//snapshot.yml" }],
+    ["surrounding whitespace", { snapshot_dir: "snapshots " }],
+  ])("rejects a snapshot destination that is not a plain subpath: %s", (_label, inputs) => {
+    expect(() =>
+      parseScenario(
+        {
+          name: "x",
+          settings: {},
+          inputs: { mode: "snapshot", ...inputs },
+          expect: { exit_code: 0 },
+        },
+        "dest.yml",
+      ),
+    ).toThrow(/relative path below the working directory/);
+  });
+
+  // The runner writes these at the root before the child runs; a destination starting with one
+  // would overwrite it, or hand it to the dir form's walk. Derived from the runner's own list; both
+  // destination inputs share the one schema, so the file form carries the names and one dir row the wiring.
+  test.each<[name: string, inputs: Record<string, string>]>([
+    ...Object.values(RUNNER_ROOT_FILES).map((name): [string, Record<string, string>] => [
+      `snapshot_file: ${name}`,
+      { snapshot_file: name },
+    ]),
+    [
+      `a nested snapshot_dir under ${RUNNER_ROOT_FILES.settings}`,
+      { snapshot_dir: `${RUNNER_ROOT_FILES.settings}/out` },
+    ],
+    [`a merge layer, ${layerFile(0)}`, { snapshot_file: layerFile(0) }],
+  ])(
+    "rejects a snapshot destination starting with a runner-owned root file: %s",
+    (_name, inputs) => {
+      expect(() =>
+        parseScenario(
+          {
+            name: "x",
+            settings: {},
+            inputs: { mode: "snapshot", ...inputs },
+            expect: { exit_code: 0 },
+          },
+          "reserved.yml",
+        ),
+      ).toThrow(/may not start with a file the runner keeps/);
+    },
+  );
+
+  test("accepts a nested snapshot destination and the dir form's snapshot_converges", () => {
+    const s = parseScenario(
+      {
+        name: "x",
+        settings: {},
+        inputs: { mode: "snapshot", snapshot_dir: "out/snapshots" },
+        repos: { "e2e-owner/svc-a": {} },
+        expect: { exit_code: 0, snapshot_converges: true },
+      },
+      "dir.yml",
+    );
+    expect(s.inputs?.snapshot_dir).toBe("out/snapshots");
+    expect(s.expect.snapshot_converges).toBe(true);
+  });
+
+  test("snapshot_converges outside mode: snapshot is dead configuration, so it is rejected", () => {
+    expect(() =>
+      parseScenario(
+        { name: "x", settings: {}, expect: { exit_code: 0, snapshot_converges: true } },
+        "apply.yml",
+      ),
+    ).toThrow(/snapshot_converges only applies with inputs.mode: snapshot/);
+  });
+
+  test.each(["converges", "apply_idempotent"] as const)("expect.fixpoint: %s parses", (proof) => {
+    const s = parseScenario(
+      { name: "x", settings: {}, expect: { exit_code: 0, fixpoint: proof } },
+      "fixpoint.yml",
+    );
+    expect(s.expect.fixpoint).toBe(proof);
+  });
+
+  test("expect.fixpoint rejects a value outside the two proofs", () => {
+    expect(() =>
+      parseScenario(
+        { name: "x", settings: {}, expect: { exit_code: 0, fixpoint: "idempotent" } },
+        "fixpoint.yml",
+      ),
+    ).toThrow(/expect\.fixpoint/);
+  });
+
+  test.each(["converges", "apply_idempotent"] as const)(
+    "the retired boolean expect.%s: true fails naming fixpoint and the rewrite",
+    (old) => {
+      expect(() =>
+        parseScenario(
+          { name: "x", settings: {}, expect: { exit_code: 0, [old]: true } },
+          "old.yml",
+        ),
+      ).toThrow(
+        `Unrecognized key: "${old}"; the expect key "${old}" was renamed to "fixpoint" - write fixpoint: ${old} and rewrite the scenario`,
+      );
+    },
+  );
+
+  test("an unknown expect key that is not a retired boolean stays a bare unrecognized-key issue", () => {
+    expect(() =>
+      parseScenario({ name: "x", settings: {}, expect: { exit_code: 0, bogus: true } }, "b.yml"),
+    ).toThrow(/expect: Unrecognized key: "bogus"$/m);
+  });
+});
+
+describe("scenario corpus loader (collectYmlFiles)", () => {
+  test("every scenario file name is dashed lowercase and names its scenario, so a section key's underscore never leaks into the corpus and --scenario <file stem> selects the file", () => {
+    const files = scenarioRoots().flatMap((root) => collectYmlFiles(root));
+    expect(files.length).toBeGreaterThan(0);
+    const offenders = files.filter(
+      (path) => !/^[a-z0-9]+(?:-[a-z0-9]+)*\.yml$/.test(basename(path)),
+    );
+    expect(offenders).toEqual([]);
+    const misnamed = files.filter(
+      (path) =>
+        (parseYaml(readFileSync(path, "utf8")) as { name?: unknown }).name !==
+        basename(path, ".yml"),
+    );
+    expect(misnamed).toEqual([]);
+  });
+
+  function withTempRoot(body: (root: string) => void): void {
+    const root = mkdtempSync(join(tmpdir(), "e2e-corpus-"));
+    try {
+      body(root);
+    } finally {
+      // The unreadable-root test leaves the directory at 000; restore it so
+      // the removal can descend into it.
+      chmodSync(root, 0o700);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("a root that does not exist yields [] (a section may have no scenarios/ yet)", () => {
+    withTempRoot((root) => {
+      expect(collectYmlFiles(join(root, "absent"))).toEqual([]);
+    });
+  });
+
+  test("a readable empty root yields []", () => {
+    withTempRoot((root) => {
+      expect(collectYmlFiles(root)).toEqual([]);
+    });
+  });
+
+  // chmod 000 does not bar root from reading a directory, so as root there is
+  // no unreadable root to test against; the skip names that rather than
+  // asserting on a read that would succeed.
+  const runningAsRoot = process.getuid?.() === 0;
+  test.skipIf(runningAsRoot)(
+    "an unreadable root fails naming it and the error, never passing as an empty corpus",
+    () => {
+      withTempRoot((root) => {
+        // A real file inside: were the permission bits ignored, the walk would
+        // return this file rather than [], so the assertion cannot pass by
+        // the read silently succeeding.
+        writeFileSync(join(root, "one.yml"), "name: one\n");
+        chmodSync(root, 0o000);
+        const named = new RegExp(
+          `^cannot read the scenario directory ${root.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: .*EACCES`,
+        );
+        expect(() => collectYmlFiles(root)).toThrow(named);
+        // loadScenarios is what run.ts and the coverage tripwire call, so the
+        // failure must reach them through it.
+        expect(() => loadScenarios([root])).toThrow(named);
+      });
+    },
+  );
+
+  test.skipIf(runningAsRoot)(
+    "an unreadable section directory fails the whole corpus, naming its scenarios/ root",
+    () => {
+      // The roots are never filtered by existence: existsSync cannot tell an absent scenarios/ from one
+      // under a mode-000 <key>/, so scenarioRoots lists it and the loader is what tells absent from unreadable.
+      withTempRoot((sections) => {
+        const key = SECTION_KEYS[0];
+        const section = join(sections, key);
+        const unreadable = join(section, "scenarios");
+        mkdirSync(unreadable, { recursive: true });
+        writeFileSync(join(unreadable, "one.yml"), "name: one\n");
+        chmodSync(section, 0o000);
+        try {
+          const roots = scenarioRoots(sections);
+          expect(roots[0]).toBe(join(import.meta.dir, "scenarios"));
+          expect(roots).toContain(unreadable);
+          expect(() => loadScenarios(roots.slice(1))).toThrow(
+            new RegExp(
+              `^cannot read the scenario directory ${unreadable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: .*EACCES`,
+            ),
+          );
+        } finally {
+          // withTempRoot restores only the top of the tree; this nested
+          // directory needs its own restore before the recursive removal.
+          chmodSync(section, 0o700);
+        }
+      });
+    },
+  );
 });
 
 describe("marker-label fixture pin (markerLabelFixtureMismatches)", () => {
@@ -259,60 +479,9 @@ describe("marker-label fixture pin (markerLabelFixtureMismatches)", () => {
   });
 });
 
-describe("denial semantics", () => {
-  test("covers every section exactly once", () => {
-    expect(Object.keys(DENIAL_SEMANTICS).sort()).toEqual([...SECTION_KEYS].sort() as string[]);
-  });
-
-  test("the six absent sections are exactly branches, check_suite_preferences, custom_properties, environments, pages, teams", () => {
-    const absent: string[] = SECTION_KEYS.filter((k) => DENIAL_SEMANTICS[k] === "absent");
-    expect(absent.sort()).toEqual(
-      [
-        "branches",
-        "check_suite_preferences",
-        "custom_properties",
-        "environments",
-        "pages",
-        "teams",
-      ].sort(),
-    );
-  });
-
-  test("every other section is denied", () => {
-    const denied: string[] = SECTION_KEYS.filter((k) => DENIAL_SEMANTICS[k] === "denied");
-    expect(denied.sort()).toEqual(
-      [
-        "actions",
-        "actions_variables",
-        "actions_secrets",
-        "agents_secrets",
-        "agents_variables",
-        "dependabot_secrets",
-        "codespaces_secrets",
-        "autolinks",
-        "code_scanning_default_setup",
-        "code_quality_setup",
-        "collaborators",
-        "deploy_keys",
-        "interaction_limits",
-        "labels",
-        "milestones",
-        "repository",
-        "rulesets",
-        "webhooks",
-        "workflows",
-        "secret_scanning_custom_patterns",
-      ].sort(),
-    );
-  });
-});
-
 describe("harness identity constants", () => {
   test("no identity constant contains the inert token (leak-sweep disjointness)", () => {
-    // The runner sweeps EVERY public surface for E2E_TOKEN as a substring; an
-    // identity constant containing it (TOKEN_USER_LOGIN once nearly did, back
-    // when the token was "e2e-token") would turn a legitimate rendering of
-    // that fixture into a phantom token leak.
+    // An identity constant containing E2E_TOKEN (TOKEN_USER_LOGIN nearly did) turns a legitimate rendering into a phantom leak.
     const rendered = { ADMIN_OWNER, ADMIN_REPO, ADMIN_SLUG, TOKEN_USER_LOGIN, VIOLATION_PREFIX };
     for (const [name, value] of Object.entries(rendered)) {
       expect(`${name}="${value}"`.includes(E2E_TOKEN)).toBe(false);
@@ -320,22 +489,17 @@ describe("harness identity constants", () => {
   });
 
   test("section mock fragments mint identity from state.slug, never the harness constants", async () => {
-    // Served bodies must name the OWNING state's slug: the same bug (urls
-    // minted from ADMIN_SLUG, served verbatim for multi-repo targets)
-    // appeared independently in five fragments, so the class is banned at the
-    // import boundary - a fragment always has the owning state in scope and
-    // has no legitimate use for an identity constant.
-    const root = join(import.meta.dir, "..", "..");
+    // Urls minted from ADMIN_SLUG were served verbatim for multi-repo targets in five fragments, so the
+    // class is banned at the import boundary: a fragment always has the owning state in scope.
     const offenders: string[] = [];
     let fragments = 0;
-    for await (const file of new Bun.Glob("src/sections/*/mock.ts").scan(root)) {
+    for await (const file of new Bun.Glob("src/sections/*/mock.ts").scan(ROOT)) {
       fragments++;
-      const text = await Bun.file(join(root, file)).text();
+      const text = await Bun.file(join(ROOT, file)).text();
       if (/from "[^"]*\/test\/e2e\/constants\.js"/.test(text)) {
         offenders.push(file);
       }
     }
-    // Non-vacuity: the glob must actually find the fragments it polices.
     expect(fragments).toBeGreaterThan(0);
     expect(offenders.sort()).toEqual([]);
   });

@@ -1,8 +1,6 @@
 /**
- * The rulesets section's fuzz generator fragment, aggregated by
- * test/e2e/generators.ts. Imports only the test-tree leaf seams
- * (gen-support.ts, prng.ts) - the src -> test inversion is deliberate; the
- * bundle entry is src/main.ts, so this file never reaches lib/index.js.
+ * The rulesets fuzz generator fragment, aggregated by test/e2e/generators.ts. It imports only the
+ * test-tree leaf seams on purpose: the bundle entry is src/main.ts, so this file never reaches lib/index.js.
  */
 
 import { type EntriesForm, maybeWrapUndeclared } from "../../../test/e2e/gen-support.js";
@@ -22,6 +20,13 @@ export function genRulesets(rng: Rng): EntriesForm {
         },
       },
       rules: [{ type: rng.pick(["deletion", "non_fast_forward", "required_signatures"]) }],
+      // The fuzz seeds no live rulesets, so this reaches the write payloads only; the
+      // hidden-key read path is the rulesets-check-bypass-hidden scenario.
+      ...rng.pick([
+        {},
+        { bypass_actors: [] },
+        { bypass_actors: [{ actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always" }] },
+      ]),
     };
   });
   return maybeWrapUndeclared(rng, entries);

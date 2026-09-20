@@ -1,30 +1,34 @@
 /**
- * A REAL HandlerContext for handler-level unit tests: the endpoint comes
- * from the section declarations (never fabricated), and param() serves only
- * the tokens the caller supplies, throwing with the declared route otherwise
- * - the same loud-if-touched contract the pipeline's own extraction keeps.
- * Tests import this instead of casting a partial context, so an impossible
- * context (a handler under a key its section never declared) cannot be
- * constructed.
+ * A REAL HandlerContext for handler unit tests, built from the declarations so a context under a key its section never
+ * declared cannot be constructed; param() keeps the pipeline's loud-if-touched contract (dispatch.ts, paramAccessor).
  */
 
 import { allEndpoints, type SectionEndpointKey } from "../../../src/sections/registry.js";
-import type { MockState } from "./state.js";
+import { GRADE_RANK, type MaskGrade } from "../schema.js";
+import { requestHeaders } from "./dispatch.js";
+import { type MockState, named } from "./state.js";
 import type { Handler } from "./support.js";
 
 export function handlerTestContext(
   key: SectionEndpointKey,
   state: MockState,
-  opts: { body?: unknown; params?: Record<string, string>; query?: Record<string, string> } = {},
+  opts: {
+    body?: unknown;
+    params?: Record<string, string>;
+    query?: Record<string, string>;
+    /** Request headers in any casing; the context lower-cases them like the pipeline does. */
+    headers?: Record<string, string>;
+    /** The token's grade on the endpoint's permission; write, the mask default, unless a test narrows it. */
+    grade?: MaskGrade;
+  } = {},
 ): Parameters<Handler>[0] {
-  // The key union already proves the endpoint exists; the lookup needs no
-  // runtime guard.
   const endpoint = allEndpoints()[key];
+  const params = named(opts.params);
   return {
     state,
     endpoint,
     param: (name: string): string => {
-      const value = opts.params?.[name];
+      const value = params[name];
       if (value === undefined) {
         throw new Error(
           `handlerTestContext: no "${name}" param supplied for ${key} (${endpoint.route})`,
@@ -34,5 +38,7 @@ export function handlerTestContext(
     },
     query: opts.query ?? {},
     body: opts.body,
+    headers: requestHeaders(opts.headers ?? {}),
+    grants: (kind) => GRADE_RANK[opts.grade ?? "write"] >= GRADE_RANK[kind],
   };
 }

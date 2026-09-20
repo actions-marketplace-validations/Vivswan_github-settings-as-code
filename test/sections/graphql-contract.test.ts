@@ -1,11 +1,3 @@
-/**
- * The GraphQL request helpers and their error classification: callGraphql's
- * throwFor routing (with `GRAPHQL <opName>` in the method/path slot),
- * tryCallGraphql's observed-type tolerance, listGraphqlConnection's cursor
- * loop over its declared connection, and overrideAdviceLevel's awareness of
- * GraphQL writes.
- */
-
 import { describe, expect, test } from "bun:test";
 import { overrideAdviceLevel, PermissionDenied } from "../../src/sections/contract/errors.js";
 import {
@@ -14,12 +6,7 @@ import {
   graphqlOp,
   toleratedGraphqlErrors,
 } from "../../src/sections/contract/graphql.js";
-import {
-  type SectionContext,
-  type SectionMeta,
-  sectionGrant,
-} from "../../src/sections/contract/module.js";
-import { grantFor } from "../../src/sections/contract/permissions.js";
+import type { SectionContext, SectionMeta } from "../../src/sections/contract/module.js";
 import {
   callGraphql,
   listGraphqlConnection,
@@ -89,9 +76,9 @@ describe("callGraphql", () => {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(PermissionDenied);
-    const denied = thrown as PermissionDenied;
-    expect(denied.detail).toContain("reading repository toggles failed - GRAPHQL RepoToggles: 403");
-    expect(denied.detail).toContain(sectionGrant(section));
+    expect((thrown as PermissionDenied).detail).toBe(
+      'the token was denied GRAPHQL RepoToggles (reading repository toggles): 403 Resource not accessible. To fix, grant "Administration" (read and write) under the PAT\'s Repository permissions',
+    );
   });
 
   test("a 422 takes the generic rejection branch, naming the operation", async () => {
@@ -100,7 +87,11 @@ describe("callGraphql", () => {
     });
     await expect(
       callGraphql(ctx(api), section, READ_OP, { owner: "o", repo: "r" }),
-    ).rejects.toThrow(/repository: GRAPHQL RepoToggles: 422 bad value\. The API rejected/);
+    ).rejects.toThrow(
+      new Error(
+        'repository: GRAPHQL RepoToggles: 422 bad value. The API rejected the request; fix the "repository" values in the settings file to satisfy the message above',
+      ),
+    );
   });
 
   test("an op-level permission override renders its own grant at the graded level", async () => {
@@ -112,8 +103,7 @@ describe("callGraphql", () => {
       ...section,
       graphql: {
         read: op,
-        // A sibling WRITE on the same override permission grades the advice
-        // at write - the overrideAdviceLevel contract, now over GraphQL ops.
+        // A sibling WRITE on the same override permission grades the advice at write (the overrideAdviceLevel contract, over GraphQL ops).
         write: {
           name: "UpdateToggles",
           kind: "write",
@@ -135,7 +125,9 @@ describe("callGraphql", () => {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(PermissionDenied);
-    expect((thrown as PermissionDenied).detail).toContain(grantFor({ repo: ["contents"] }));
+    expect((thrown as PermissionDenied).detail).toBe(
+      'the token was denied GRAPHQL RepoToggles: 404 Not Found (a 404 here can also mean the resource does not exist). To fix, grant "Contents" (read and write) under the PAT\'s Repository permissions',
+    );
     expect(overrideAdviceLevel(sectionWithWrite, { repo: ["contents"] })).toBe("write");
   });
 });
@@ -156,7 +148,9 @@ describe("tryCallGraphql tolerance", () => {
       },
     });
     const result = await tryCallGraphql(ctx(api), section, tolerantOp, { owner: "o", repo: "r" });
-    expect("error" in result && result.error.status).toBe(404);
+    expect(result).toEqual({
+      error: { status: 404, message: "Not Found", body: "", graphqlTypes: ["NOT_FOUND"] },
+    });
   });
 
   test("an undeclared observed type still classifies through throwFor", async () => {
@@ -171,9 +165,8 @@ describe("tryCallGraphql tolerance", () => {
   });
 
   test("tolerance reads the observed types, never the folded status", async () => {
-    // The 404 status alone would look like the declared NOT_FOUND, but the
-    // response's actual types include an undeclared sibling: the status fold
-    // is lossy, so the full set must be declared for tolerance to hold.
+    // The 404 status alone would look like the declared NOT_FOUND, but the status fold is lossy: the full observed set must be declared for tolerance
+    // to hold.
     const api = new MockApi({
       "GRAPHQL RepoToggles": {
         error: {
@@ -210,9 +203,7 @@ describe("tryCallGraphql tolerance", () => {
   });
 
   test("an explicit tolerate naming an undeclared outcome does not compile", () => {
-    // graphqlOp preserves the literal `outcomes` keys, so the declared
-    // subset is pinned at the type level (the REST `as const satisfies`
-    // symmetry) - broadening tolerate is a compile error, not a runtime BUG.
+    // graphqlOp preserves the literal `outcomes` keys, so broadening tolerate is a compile error, not a runtime BUG.
     const api = new MockApi({});
     const smuggle = () =>
       tryCallGraphql(
@@ -224,13 +215,11 @@ describe("tryCallGraphql tolerance", () => {
         { tolerate: ["UNPROCESSABLE"] },
       );
     void smuggle;
-    expect(api.calls).toHaveLength(0);
+    expect(api.calls).toEqual([]);
   });
 
   test("a RATE_LIMITED response always classifies as a rate limit", async () => {
-    // RATE_LIMITED is not declarable as an outcome (the type excludes it),
-    // so the observed type can never be tolerated and throwFor's rate-limit
-    // branch renders the advice.
+    // RATE_LIMITED is not declarable as an outcome (the type excludes it), so the observed type can never be tolerated.
     const api = new MockApi({
       "GRAPHQL RepoToggles": {
         error: {
@@ -244,7 +233,11 @@ describe("tryCallGraphql tolerance", () => {
     });
     await expect(
       tryCallGraphql(ctx(api), section, tolerantOp, { owner: "o", repo: "r" }),
-    ).rejects.toThrow(/rate limit was hit/);
+    ).rejects.toThrow(
+      new Error(
+        "repository: GRAPHQL RepoToggles: 403 slow down. The API rate limit was hit; re-run the workflow after the limit resets, or use a token with a higher rate limit",
+      ),
+    );
   });
 
   test("an INSUFFICIENT_SCOPES response always classifies as a denial", async () => {
@@ -280,9 +273,7 @@ describe("declaration readers", () => {
   });
 
   test("the annotated-const idiom pins variables shapes at compile time", () => {
-    // Type-level only; the body never runs. The annotation on READ_OP carries
-    // its variables shape through GraphqlVariablesOf, so a missing or
-    // misnamed variable at a helper call site does not compile.
+    // The annotation on READ_OP carries its variables shape through GraphqlVariablesOf.
     const _never = () => {
       const api = new MockApi({});
       // @ts-expect-error - `repo` is missing
@@ -362,9 +353,7 @@ describe("listGraphqlConnection", () => {
   });
 
   test("a declared error outcome comes back as { error } instead of throwing", async () => {
-    // The probeAbsent posture over a connection: an operation declaring
-    // NOT_FOUND (the environments pins read) has a fine-grained denial come
-    // back as a value its caller reads as "resource absent".
+    // The probeAbsent posture over a connection: a fine-grained denial comes back as a value the caller reads as "resource absent".
     const tolerantPaged = {
       ...pagedOp,
       outcomes: { ok: "the rules", NOT_FOUND: "denied reads as absent" },
@@ -378,13 +367,14 @@ describe("listGraphqlConnection", () => {
       owner: "o",
       repo: "r",
     });
-    expect("error" in listed && listed.error.status).toBe(404);
+    expect(listed).toEqual({
+      error: { status: 404, message: "Not Found", body: "", graphqlTypes: ["NOT_FOUND"] },
+    });
   });
 
   test("a tolerated type arriving MID-walk still classifies as an error", async () => {
-    // Absence describes the whole resource: a NOT_FOUND after a successful
-    // first page means the connection vanished under the loop, and reading
-    // it as "absent" would silently discard the collected pages.
+    // Absence describes the whole resource: a NOT_FOUND after a successful first page means the connection vanished under the loop, and reading it as
+    // "absent" would discard the collected pages.
     const tolerantPaged = {
       ...pagedOp,
       outcomes: { ok: "the rules", NOT_FOUND: "denied reads as absent" },
@@ -411,8 +401,6 @@ describe("listGraphqlConnection", () => {
   });
 
   test("a query without $cursor does not compile as a paginated read", () => {
-    // The cursor contract moved from listGraphqlConnection's runtime BUG
-    // throw into GraphqlPaginatedReadDecl's query template type.
     // @ts-expect-error - the paginated arm's query type requires $cursor
     const cursorless: GraphqlPaginatedReadDecl = {
       ...READ_OP,
@@ -435,14 +423,37 @@ describe("listGraphqlConnection", () => {
     const api = pagedApi([{ repository: { rules: { nodes: "not-a-list" } } }]);
     await expect(
       listGraphqlConnection(ctx(api), section, pagedOp, { owner: "o", repo: "r" }),
-    ).rejects.toThrow(/without a "repository.rules" connection/);
+    ).rejects.toThrow(
+      new Error(
+        'repository: GRAPHQL RepoRules returned a response without a "repository.rules" connection carrying nodes and pageInfo{hasNextPage, endCursor}, so the list cannot be paginated. The operation\'s query must select both under that path',
+      ),
+    );
   });
 
   test("hasNextPage without a fresh endCursor fails instead of looping", async () => {
-    const api = pagedApi([page(["a"], null, true)]);
-    await expect(
-      listGraphqlConnection(ctx(api), section, pagedOp, { owner: "o", repo: "r" }),
-    ).rejects.toThrow(/hasNextPage without a new endCursor/);
+    // A null endCursor on the first page or a later one, and a repeated one, all leave the walk unable to advance; one request past the
+    // fixture is the loop the guard stops.
+    for (const pages of [
+      [page(["a"], null, true)],
+      [page(["a"], "CUR1", true), page(["b"], null, true)],
+      [page(["a"], "CUR1", true), page(["b"], "CUR1", true)],
+    ]) {
+      const api = pagedApi(pages);
+      const serve = api.tryGraphql;
+      api.tryGraphql = async (op, variables, slug, mark) => {
+        if (api.calls.length >= pages.length) {
+          throw new Error("the walk requested a page past the fixture instead of failing");
+        }
+        return serve(op, variables, slug, mark);
+      };
+      await expect(
+        listGraphqlConnection(ctx(api), section, pagedOp, { owner: "o", repo: "r" }),
+      ).rejects.toThrow(
+        new Error(
+          'repository: GRAPHQL RepoRules reported hasNextPage without a new endCursor at "repository.rules", so the pagination cannot advance. The operation\'s query must select pageInfo{hasNextPage, endCursor}',
+        ),
+      );
+    }
   });
 
   test("errors inside the loop classify through throwFor", async () => {

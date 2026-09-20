@@ -1,10 +1,15 @@
-# Nightly upstream-freshness probes. Generated from the repo-platform nightly
-# starter and never overwritten by template sync. The checks job re-cuts the
-# trimmed OpenAPI spec from upstream HEAD (a path-level staleness check) and
-# typechecks against the latest @octokit/types, so pinned-dependency staleness
-# fails a night instead of surprising the next manual bump; the report job
-# below files or updates one label-deduplicated tracking issue on a red night
-# and closes it on a green one (see repo-platform's docs/nightly.md).
+# Nightly upstream-freshness probes and the whole-corpus e2e run. Generated
+# from the fleet sync's nightly starter and never overwritten by a later
+# sync. The checks job re-cuts the trimmed OpenAPI spec from upstream HEAD
+# (a path-level staleness check) and typechecks against the latest
+# @octokit/types, so pinned-dependency staleness fails a night instead of
+# surprising the next manual bump; the float-canary job re-resolves the
+# lockfile from scratch the way the Dependabot lockfile workflow does, so a
+# breaking upstream release fails a night instead of reddening every open
+# Dependabot PR; the e2e job runs the curated corpus and the endpoint-coverage
+# tripwire against a freshly fetched spec; the report job below files or
+# updates one label-deduplicated tracking issue on a red night and closes it
+# on a green one (see the platform repository's docs/nightly.md).
 name: Nightly
 
 on:
@@ -27,15 +32,11 @@ permissions:
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - name: Install dependencies
-        id: install
-        run: bun install --frozen-lockfile --ignore-scripts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        id: setup
 
       # PR CI proves USED_PATHS against the pinned descriptor; this probe
       # re-cuts against upstream HEAD (deliberately bypassing the cached
@@ -71,12 +72,12 @@ jobs:
           fi
 
       # always() so a red spec probe cannot mask this one (the job still
-      # fails if either step failed); gated on install because there is
-      # nothing to probe when setup itself broke. --no-save keeps the
+      # fails if either step failed); gated on the setup step because there
+      # is nothing to probe when setup itself broke. --no-save keeps the
       # lockfile and package.json untouched; the upgraded node_modules stays
       # ambient for the rest of this job, so keep later steps out of it.
       - name: Probe the latest @octokit/types
-        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: |
           bun add --no-save --ignore-scripts @octokit/types@latest
           log="$(mktemp)"
@@ -94,16 +95,74 @@ jobs:
               echo "::error::@octokit/types@latest fires upstream-gap tripwires; run bun .github/scripts/graduate-upstream-gaps.ts for these files:"
               echo "$tripped"
             else
-              echo "::error::typecheck against @octokit/types@latest failed outside the upstream-gap tripwires; a types major may have broken the build (see log above)"
+              echo "::error::typecheck against @octokit/types@latest failed outside the upstream-gap tripwires;" \
+                "a types major may have broken the build (see log above)"
             fi
             exit 1
           fi
 
-  # Runs whatever happened to the checks job, and treats a CANCELLED checks
-  # job as red: a job that hits its timeout is cancelled, not failed, and a
+  # Predicts what the dependabot-bun-lockfile workflow's from-scratch resolve
+  # will hand the next Dependabot PR: package.json is pinned exactly (the
+  # package-pins test guards that), so only transitive ranges can float, and
+  # a float that breaks the gate fails here first. Its own job because the
+  # checks job's @octokit/types probe leaves node_modules upgraded, and this
+  # probe needs a clean tree to re-resolve from.
+  float-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The from-scratch resolve is this job's install.
+      - uses: ./.github/actions/setup
+        with:
+          install: "false"
+      # Delete before resolving, exactly like the Dependabot workflow: bun
+      # keeps a stale lockfile as a valid resolution, and only a
+      # from-scratch resolve floats what that workflow would float.
+      - name: Re-resolve from scratch
+        run: |
+          rm bun.lock
+          bun install --ignore-scripts
+          git --no-pager diff --stat -- bun.lock
+          git checkout -- bun.lock
+      # The gate's suite loads two fetched artifacts; the composite restores or fetches
+      # each. It runs AFTER the floated install so a miss runs the fetch on the floated graph.
+      - uses: ./.github/actions/fetch-test-artifacts
+      - name: Run the gate on the floated resolution
+        run: bun run check
+
+  # The whole curated corpus (PR CI runs only the sections a PR changed) plus the endpoint-coverage tripwire,
+  # against the pinned spec fetched fresh: PR CI restores a cached spec for speed, so this fetch is where a used
+  # path GitHub stopped documenting surfaces. The bundle runs under node24, so node is installed beside bun.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Fetch the trimmed OpenAPI spec (drift tripwire)
+        run: bun .github/scripts/trim-openapi.ts
+      - name: Curated corpus
+        run: bun test/e2e/run.ts
+      - name: Endpoint-coverage tripwire
+        run: bun .github/scripts/check-endpoint-coverage.ts
+      # The tracking issue points at the run; the failing scenarios' reports and request logs are here.
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-artifacts-${{ github.run_attempt }}
+          path: test/e2e/.artifacts/
+          if-no-files-found: ignore
+
+  # Runs whatever happened to the probe jobs, and treats a CANCELLED probe
+  # as red: a job that hits its timeout is cancelled, not failed, and a
   # hang is exactly what a nightly run exists to catch.
   report:
-    needs: [checks]
+    needs: [checks, float-canary, e2e]
     if: always()
     runs-on: ubuntu-latest
     # A few gh calls behind a bun setup; a hung reporter is the residual
@@ -117,8 +176,8 @@ jobs:
     steps:
       - name: File or update the nightly issue
         id: file-issue
-        if: needs.checks.result == 'failure' || needs.checks.result == 'cancelled'
-        uses: Vivswan/repo-platform/actions/fuzz-issue@main
+        if: needs.checks.result != 'success' || needs.float-canary.result != 'success' || needs.e2e.result != 'success'
+        uses: Vivswan/repo-platform/actions/fuzz-issue@stable
         # This job checks nothing out (kept tight), so gh has no git
         # context; GH_REPO points it at this repository (run 31563375394
         # failed on exactly this).
@@ -131,10 +190,11 @@ jobs:
           # No artifacts directory is passed: this stream files the generic
           # nightly-failure report (workflow, commit, run link) rather than
           # the fuzzer's failure-report contract. The tuple below is used
-          # only when the label has to be created and matches the
-          # settings-sync declaration.
-          label-color: "B60205"
+          # only when the label has to be created and matches the nightly
+          # module's tracking label, which the fleet settings layer applies.
+          label-color: "D93F0B"
           label-description: Automated nightly CI failure
+          stream: generic
 
       # A GITHUB_TOKEN-created issue fires no triggers, so dispatch auto-assign.
       - name: Trigger auto-assign for the filed issue
@@ -146,8 +206,8 @@ jobs:
         run: gh workflow run auto-assign.yml -f "issue=$ISSUE_NUMBER" || echo "::warning::could not dispatch auto-assign.yml"
 
       - name: Close the nightly issue on a green night
-        if: needs.checks.result == 'success'
-        uses: Vivswan/repo-platform/actions/fuzz-issue@main
+        if: needs.checks.result == 'success' && needs.float-canary.result == 'success' && needs.e2e.result == 'success'
+        uses: Vivswan/repo-platform/actions/fuzz-issue@stable
         env:
           GH_REPO: ${{ github.repository }}
         with:

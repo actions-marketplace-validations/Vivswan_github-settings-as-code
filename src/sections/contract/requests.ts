@@ -1,8 +1,15 @@
-/** Declaration-driven request helpers: REST and GraphQL calls, probes, and page loops. */
-
-import type { ApiError } from "../../github/api.js";
+import {
+  type ApiError,
+  isRateLimitError,
+  type RequestMark,
+  SECRET_RESPONSE_WITHHELD,
+  SECRET_TRANSPORT_WITHHELD,
+  transportFailure,
+  withheld,
+} from "../../github/api.js";
 import { paginate } from "../../github/paginate.js";
 import {
+  type DeclaredErrorStatus,
   type EndpointDecl,
   endpointMethod,
   expand,
@@ -20,26 +27,52 @@ import {
 import type { SectionContext, SectionMeta } from "./module.js";
 
 /**
- * The trailing options argument for a request helper, whose optionality
- * depends on the route. When the route has no path params (owner/repo
- * aside), the options object is optional and `params` is forbidden. When
- * the route has params, the options object is REQUIRED and must carry
- * `params` with exactly the route's keys. Modeling this as a rest tuple
- * (not an optional object param) is what makes omitting the whole argument
- * a compile error for a route that needs params - the `[never]` trick alone
- * cannot forbid an omitted argument. `Extra` carries per-helper extras
- * (query/payload/tolerate/accept).
+ * A rest tuple, not an optional object param: that is what makes omitting the whole argument a compile
+ * error for a route that needs params (the `[never]` trick alone cannot forbid an omitted argument).
+ * `Extra` carries per-helper extras (query/payload/tolerate/accept).
  */
 export type OptsArg<E extends EndpointDecl, Extra> = [PathParams<E["route"]>] extends [never]
   ? [opts?: { params?: undefined } & Extra]
   : [opts: { params: Readonly<Record<PathParams<E["route"]>, string>> } & Extra];
 
 /**
- * Call the API; convert permission failures into PermissionDenied (handled
- * by the orchestrator's partial-success policy), everything else into a
- * hard error carrying the API's message verbatim. The path is built from
- * the endpoint declaration, so a section can only ever call what it
- * declares, with exactly the params the route requires.
+ * A request the executor marked as carrying a resolved secret has its failure rebuilt HERE, on the engine's side of
+ * the client port, so the guarantee holds for a library caller's own GitHubClient: such a client's 422 body echoing a
+ * webhook secret would otherwise render through throwFor into outcomes[].detail and a delivered report. A throw is
+ * replaced too, since a transport error is free text that can quote the request body.
+ *
+ * The rate-limit classification is read from the message BEFORE the rebuild drops it: the port carries no headers,
+ * so a client may signal a limit only that way, and a limit misread as a denial is a silently skipped section under
+ * on-missing-permission: warn, where a denial misread as a limit still fails the run loudly.
+ */
+async function issue<D>(
+  label: string,
+  carriesSecret: boolean,
+  send: (mark: RequestMark | undefined) => Promise<{ data: D } | { error: ApiError }>,
+): Promise<{ data: D } | { error: ApiError }> {
+  if (!carriesSecret) {
+    return send(undefined);
+  }
+  let result: { data: D } | { error: ApiError };
+  try {
+    result = await send({ carriesSecret: true });
+  } catch {
+    throw transportFailure(label, SECRET_TRANSPORT_WITHHELD, "the GitHub API");
+  }
+  if (!("error" in result)) {
+    return result;
+  }
+  const classified = isRateLimitError(result.error)
+    ? { ...result.error, rateLimited: true as const }
+    : result.error;
+  return { error: withheld(classified, SECRET_RESPONSE_WITHHELD) };
+}
+
+/**
+ * Permission failures become PermissionDenied (the orchestrator's partial-success policy handles them); everything
+ * else is a hard error carrying the API's message. `payload?: never` (here and on tryCall) is what makes a payload
+ * reach the wire only through the erased executor cores, whose `carriesSecret` is required: an optional-absent key
+ * alone would still admit a widened variable, which excess-property checks do not see.
  */
 export async function call<E extends EndpointDecl>(
   ctx: SectionContext,
@@ -47,29 +80,43 @@ export async function call<E extends EndpointDecl>(
   endpoint: E,
   ...args: OptsArg<
     E,
-    { query?: Readonly<Record<string, string>>; payload?: unknown; describe?: string }
+    { query?: Readonly<Record<string, string>>; payload?: never; describe?: string }
   >
 ): Promise<unknown> {
-  const opts = args[0];
+  return callDeclared(ctx, section, endpoint, { ...args[0], carriesSecret: false });
+}
+
+/**
+ * The erased core of call(): the plan executor reaches it with an endpoint resolved from a planned role,
+ * whose params were typed when the plan was built; a handler calls call(), where the route type checks the params.
+ */
+export async function callDeclared(
+  ctx: SectionContext,
+  section: SectionMeta,
+  endpoint: EndpointDecl,
+  opts: {
+    params?: Readonly<Record<string, string>>;
+    query?: Readonly<Record<string, string>>;
+    payload?: unknown;
+    carriesSecret: boolean;
+    describe?: string;
+  },
+): Promise<unknown> {
   const method = endpointMethod(endpoint.route);
-  const path = expand(endpoint, ctx, opts?.params, opts?.query);
-  const result = await ctx.api.tryRequest(method, path, opts?.payload);
+  const path = expand(endpoint, ctx, opts.params, opts.query);
+  const result = await issue(`${method} ${path}`, opts.carriesSecret, (mark) =>
+    ctx.api.tryRequest(method, path, opts.payload, mark),
+  );
   if ("error" in result) {
     throwFor(section, method, path, result.error, {
-      operation: opts?.describe,
+      operation: opts.describe,
       op: endpoint,
     });
   }
   return result.data;
 }
 
-/**
- * Like call(), but tolerated error statuses come back as { error } for the
- * caller to interpret (e.g. a 409 that means "drift" or "in progress", not
- * failure); every other error classifies through throwFor. Tolerated
- * statuses default to the endpoint's declared >= 400 statuses; pass an
- * explicit `tolerate` only to tolerate FEWER than declared.
- */
+/** Tolerated statuses come back as { error }; an explicit `tolerate` only ever tolerates FEWER than declared. */
 export async function tryCall<E extends EndpointDecl>(
   ctx: SectionContext,
   section: SectionMeta,
@@ -78,20 +125,70 @@ export async function tryCall<E extends EndpointDecl>(
     E,
     {
       query?: Readonly<Record<string, string>>;
-      payload?: unknown;
-      tolerate?: readonly (keyof E["statuses"] & number)[];
+      payload?: never;
+      tolerate?: readonly DeclaredErrorStatus<E>[];
       describe?: string;
     }
   >
 ): Promise<{ data: unknown } | { error: ApiError }> {
   const opts = args[0];
+  return tryCallDeclared(ctx, section, endpoint, {
+    ...opts,
+    carriesSecret: false,
+    tolerated: declaredTolerance(endpoint, opts?.tolerate),
+  });
+}
+
+/**
+ * An explicit list may only name declared tolerable statuses (the erased executor could spell another,
+ * so this boundary refuses it); advisory tolerates all.
+ */
+export function declaredTolerance(
+  endpoint: EndpointDecl,
+  explicit?: readonly number[],
+): (status: number) => boolean {
+  if (explicit !== undefined) {
+    const declared = toleratedStatuses(endpoint);
+    const undeclared = explicit.filter((status) => !declared.includes(status));
+    if (undeclared.length > 0) {
+      throw new Error(
+        `BUG: ${endpoint.route} was asked to tolerate status(es) ${undeclared.join(", ")}, which it does not declare as a tolerable error status; a tolerance may only name declared 4xx statuses other than 401 and 429`,
+      );
+    }
+    return (status) => explicit.includes(status);
+  }
+  if (endpoint.advisory === true) {
+    return () => true;
+  }
+  const declared = toleratedStatuses(endpoint);
+  return (status) => declared.includes(status);
+}
+
+/** The erased core of tryCall(). A rate limit is a transport failure whatever status carries it: never tolerated. */
+export async function tryCallDeclared(
+  ctx: SectionContext,
+  section: SectionMeta,
+  endpoint: EndpointDecl,
+  opts: {
+    params?: Readonly<Record<string, string>>;
+    query?: Readonly<Record<string, string>>;
+    payload?: unknown;
+    carriesSecret: boolean;
+    tolerated: (status: number) => boolean;
+    describe?: string;
+  },
+): Promise<{ data: unknown } | { error: ApiError }> {
   const method = endpointMethod(endpoint.route);
-  const path = expand(endpoint, ctx, opts?.params, opts?.query);
-  const tolerate: readonly number[] = opts?.tolerate ?? toleratedStatuses(endpoint);
-  const result = await ctx.api.tryRequest(method, path, opts?.payload);
-  if ("error" in result && !tolerate.includes(result.error.status)) {
+  const path = expand(endpoint, ctx, opts.params, opts.query);
+  const result = await issue(`${method} ${path}`, opts.carriesSecret, (mark) =>
+    ctx.api.tryRequest(method, path, opts.payload, mark),
+  );
+  if (
+    "error" in result &&
+    (isRateLimitError(result.error) || !opts.tolerated(result.error.status))
+  ) {
     throwFor(section, method, path, result.error, {
-      operation: opts?.describe,
+      operation: opts.describe,
       op: endpoint,
     });
   }
@@ -99,11 +196,8 @@ export async function tryCall<E extends EndpointDecl>(
 }
 
 /**
- * GET a resource whose absence is a normal state: tolerated statuses come
- * back as { missing: true }, every other error classifies through throwFor.
- * The shared idiom behind "does this branch/site/environment/toggle exist"
- * probes. Tolerated statuses default to the endpoint's declared >= 400
- * statuses; pass an explicit `tolerate` only to tolerate FEWER than declared.
+ * The shared idiom behind "does this branch/site/environment/toggle exist" probes: tolerated statuses
+ * read as { missing: true }. Pass `tolerate` only to tolerate FEWER than declared.
  */
 export async function probeAbsent<E extends EndpointDecl>(
   ctx: SectionContext,
@@ -113,7 +207,7 @@ export async function probeAbsent<E extends EndpointDecl>(
     E,
     {
       query?: Readonly<Record<string, string>>;
-      tolerate?: readonly (keyof E["statuses"] & number)[];
+      tolerate?: readonly DeclaredErrorStatus<E>[];
       accept?: string;
       describe?: string;
     }
@@ -121,10 +215,11 @@ export async function probeAbsent<E extends EndpointDecl>(
 ): Promise<{ data: unknown } | { missing: true }> {
   const options = args[0];
   const path = expand(endpoint, ctx, options?.params, options?.query);
-  const tolerate: readonly number[] = options?.tolerate ?? toleratedStatuses(endpoint);
+  const tolerated = declaredTolerance(endpoint, options?.tolerate);
   const result = await ctx.api.tryRequest("GET", path, undefined, { accept: options?.accept });
   if ("error" in result) {
-    if (tolerate.includes(result.error.status)) {
+    // A rate-limited 403 is not an absent resource (the tryCallDeclared rule).
+    if (!isRateLimitError(result.error) && tolerated(result.error.status)) {
       return { missing: true };
     }
     throwFor(section, "GET", path, result.error, {
@@ -135,11 +230,7 @@ export async function probeAbsent<E extends EndpointDecl>(
   return { data: result.data };
 }
 
-/**
- * Section-flavored pagination: delegate the page loop to github/paginate,
- * classify errors through throwFor; `extract` adapts the response shape
- * (bare array, or a {total_count, <key>: []} envelope).
- */
+/** `extract` adapts the response shape (bare array, or a {total_count, <key>: []} envelope). */
 async function listPages(
   ctx: SectionContext,
   section: SectionMeta,
@@ -147,10 +238,11 @@ async function listPages(
   path: string,
   extract: (data: unknown) => unknown[] | null,
   shape: string,
+  describe?: string,
 ): Promise<unknown[]> {
   const result = await paginate(ctx.api, path, extract, undefined, endpoint.pageSize);
   if ("error" in result) {
-    throwFor(section, "GET", path, result.error, { op: endpoint });
+    throwFor(section, "GET", path, result.error, { operation: describe, op: endpoint });
   }
   if ("malformed" in result) {
     throw new Error(
@@ -160,12 +252,11 @@ async function listPages(
   return result.items;
 }
 
-/** GET every page of a bare-array list endpoint. */
 export async function listAll<E extends EndpointDecl>(
   ctx: SectionContext,
   section: SectionMeta,
   endpoint: E,
-  ...args: OptsArg<E, { query?: Readonly<Record<string, string>> }>
+  ...args: OptsArg<E, { query?: Readonly<Record<string, string>>; describe?: string }>
 ): Promise<unknown[]> {
   const opts = args[0];
   const path = expand(endpoint, ctx, opts?.params, opts?.query);
@@ -176,19 +267,17 @@ export async function listAll<E extends EndpointDecl>(
     path,
     (data) => (Array.isArray(data) ? data : null),
     "a list",
+    opts?.describe,
   );
 }
 
-/**
- * Like listAll, for endpoints that wrap the list in an envelope object
- * (e.g. GET /actions/workflows returns {total_count, workflows: []}).
- */
+/** For endpoints wrapping the list in an envelope (GET /actions/workflows returns {total_count, workflows: []}). */
 export async function listAllEnveloped<E extends EndpointDecl>(
   ctx: SectionContext,
   section: SectionMeta,
   endpoint: E,
   envelopeKey: string,
-  ...args: OptsArg<E, { query?: Readonly<Record<string, string>> }>
+  ...args: OptsArg<E, { query?: Readonly<Record<string, string>>; describe?: string }>
 ): Promise<unknown[]> {
   const opts = args[0];
   const path = expand(endpoint, ctx, opts?.params, opts?.query);
@@ -202,25 +291,21 @@ export async function listAllEnveloped<E extends EndpointDecl>(
       return Array.isArray(chunk) ? chunk : null;
     },
     `a "${envelopeKey}" list`,
+    opts?.describe,
   );
 }
 
-/**
- * Issue a GraphQL operation; convert permission failures into
- * PermissionDenied, everything else into a hard error carrying the API's
- * message - the GraphQL sibling of call(). The failing request renders as
- * `GRAPHQL <opName>` where a REST error shows its method and path. The
- * variables are typed by the declaration's own `V`, so a call site cannot
- * omit or misname what the query expects.
- */
+/** The GraphQL sibling of call(); the failing request renders as `GRAPHQL <opName>` where a REST error shows method and path. */
 export async function callGraphql<O extends GraphqlOpDecl>(
   ctx: SectionContext,
   section: SectionMeta,
   op: O,
   variables: Readonly<GraphqlVariablesOf<O>>,
-  opts?: { describe?: string },
+  opts?: { describe?: string; carriesSecret?: boolean },
 ): Promise<Record<string, unknown>> {
-  const result = await ctx.api.tryGraphql(op, variables, ctx.repo.slug);
+  const result = await issue(`GRAPHQL ${op.name}`, opts?.carriesSecret === true, (mark) =>
+    ctx.api.tryGraphql(op, variables, ctx.repo.slug, mark),
+  );
   if ("error" in result) {
     throwFor(section, "GRAPHQL", op.name, result.error, { operation: opts?.describe, op });
   }
@@ -228,14 +313,9 @@ export async function callGraphql<O extends GraphqlOpDecl>(
 }
 
 /**
- * Whether an ApiError is tolerable under a set of declared error types: it
- * must carry the transport's graphqlTypes (an untyped or HTTP-level failure
- * is never tolerable) and EVERY observed type must be declared - the HTTP
- * status is a lossy fold (a mixed [FORBIDDEN, UNPROCESSABLE] response and a
- * pure FORBIDDEN both land on 403), so only the full type set can say what
- * actually happened. RATE_LIMITED and INSUFFICIENT_SCOPES can never appear
- * in `tolerate` (the type excludes them), so both always classify through
- * throwFor.
+ * EVERY observed type must be declared: the HTTP status is a lossy fold (a mixed [FORBIDDEN, UNPROCESSABLE]
+ * response and a pure FORBIDDEN both land on 403), so only the full type set says what happened. An
+ * untyped or HTTP-level failure is never tolerable.
  */
 function graphqlErrorTolerated(
   error: ApiError,
@@ -250,12 +330,9 @@ function graphqlErrorTolerated(
 }
 
 /**
- * Like callGraphql, but tolerated error types come back as { error } for the
- * caller to interpret; every other error classifies through throwFor. The
- * tolerated set defaults to the operation's declared error outcomes; pass an
- * explicit `tolerate` only to tolerate FEWER than declared. Tolerance reads
- * the error's OBSERVED GraphQL types (see graphqlErrorTolerated), never the
- * folded HTTP status.
+ * Tolerated error types come back as { error }; the set defaults to the declared outcomes, and an explicit
+ * `tolerate` only tolerates FEWER. Tolerance reads the OBSERVED GraphQL types (graphqlErrorTolerated),
+ * never the folded HTTP status.
  */
 export async function tryCallGraphql<O extends GraphqlOpDecl>(
   ctx: SectionContext,
@@ -263,10 +340,7 @@ export async function tryCallGraphql<O extends GraphqlOpDecl>(
   op: O,
   variables: Readonly<GraphqlVariablesOf<O>>,
   opts?: {
-    // The graphqlOp constructor preserves the literal `outcomes` keys, so
-    // this keyof pins the DECLARED subset at compile time: a tolerate
-    // naming an undeclared type does not compile (the REST
-    // `as const satisfies` symmetry).
+    // graphqlOp preserves the literal `outcomes` keys, so a tolerate naming an undeclared type does not compile.
     tolerate?: readonly (keyof O["outcomes"] & GraphqlTolerableError)[];
     describe?: string;
   },
@@ -282,29 +356,15 @@ export async function tryCallGraphql<O extends GraphqlOpDecl>(
 }
 
 /**
- * Collect every node of a GraphQL connection, the sibling of listAll: the
- * cursor loop lives here so paging behavior cannot drift between sections.
- * The operation must declare its `connection` (the type requires it), whose
- * `path` walks from the data root to the connection field selecting
- * `nodes { ... }` and `pageInfo { hasNextPage endCursor }`; the loop owns the
- * `$cursor` variable, passing null first and the previous page's endCursor
- * after, so the caller's variables must not carry one. The operation's
- * DECLARED error outcomes are tolerated exactly as tryCallGraphql tolerates
- * them, coming back as { error } for the caller to interpret (the
- * environments pins read declares NOT_FOUND, so a fine-grained denial reads
- * as an absent resource - the probeAbsent posture) - but only on the FIRST
- * page: absence describes the whole resource, and a tolerated type arriving
- * mid-walk means the connection vanished under the loop, a broken walk that
- * classifies through throwFor like any other error. An operation declaring
- * no error outcomes always resolves { items }.
+ * The cursor loop lives here so paging cannot drift between sections. Declared error outcomes come back
+ * as { error } only on the FIRST page: absence describes the whole resource, and a tolerated type
+ * mid-walk means the connection vanished under the loop.
  */
 export async function listGraphqlConnection<O extends GraphqlPaginatedReadDecl>(
   ctx: SectionContext,
   section: SectionMeta,
   op: O,
-  // The `cursor?: never` pin makes a call site that supplies its own cursor
-  // uncompilable - the loop below owns the variable; the paginated arm's
-  // query type already proved $cursor exists at the declaration.
+  // The `cursor?: never` pin: the loop owns the variable, so a call site supplying its own does not compile.
   variables: Readonly<GraphqlVariablesOf<O>> & { cursor?: never },
 ): Promise<{ items: unknown[] } | { error: ApiError }> {
   const path = op.connection.path;
@@ -335,8 +395,7 @@ export async function listGraphqlConnection<O extends GraphqlPaginatedReadDecl>(
     }
     const endCursor = pageInfo.endCursor;
     if (typeof endCursor !== "string" || endCursor === cursor) {
-      // hasNextPage without a fresh endCursor can only loop forever; treat it
-      // as the same broken-connection shape as a missing pageInfo.
+      // hasNextPage without a fresh endCursor would loop forever.
       throw new Error(
         `${section.key}: GRAPHQL ${op.name} reported hasNextPage without a new endCursor at "${path.join(".")}", so the pagination cannot advance. The operation's query must select pageInfo{hasNextPage, endCursor}`,
       );
@@ -346,17 +405,13 @@ export async function listGraphqlConnection<O extends GraphqlPaginatedReadDecl>(
 }
 
 /**
- * Reject two declared entries that resolve to the same natural key; they
- * would fight each other on every run instead of converging. The sweep
- * collects EVERY colliding pair and fails once with the full list, so N
- * duplicates cost one run to discover, not N.
+ * Shared by the declared-side and live-side duplicate rejections, so both name a collision the same way.
  */
-export function rejectDuplicates<T>(
-  section: SectionMeta,
+export function collidingPairs<T>(
   items: readonly T[],
   keyOf: (item: T) => string,
   describe: (item: T) => string,
-): void {
+): string[] {
   const seen = new Map<string, string>();
   const collisions: string[] = [];
   for (const item of items) {
@@ -368,9 +423,25 @@ export function rejectDuplicates<T>(
     }
     seen.set(key, describe(item));
   }
+  return collisions;
+}
+
+/**
+ * Two entries resolving to one natural key would fight each other on every run. Every collision is
+ * collected and reported once (each against the first entry under its key), so N duplicates cost one run
+ * to discover. `what` names the resource when "<section> entry" understates it (a nested list's items).
+ */
+export function rejectDuplicates<T>(
+  section: SectionMeta,
+  items: readonly T[],
+  keyOf: (item: T) => string,
+  describe: (item: T) => string,
+  what = `${section.key} entry`,
+): void {
+  const collisions = collidingPairs(items, keyOf, describe);
   if (collisions.length > 0) {
     throw new Error(
-      `${section.key}: the settings file declares entries that name the same ${section.key} entry: ${collisions.join("; ")}. Keep exactly one entry per resource`,
+      `${section.key}: the settings file declares entries that name the same ${what}: ${collisions.join("; ")}. Keep exactly one entry per resource`,
     );
   }
 }

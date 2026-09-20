@@ -1,19 +1,12 @@
 /**
- * The curated e2e entrypoint: `bun test/e2e/run.ts`. Loads every scenario
- * under the scenario roots (the flat test/e2e/scenarios/ directory plus the
- * per-section src/sections/<key>/scenarios/ directories), optionally filtered
- * by --sections or --scenario, runs each against a fresh mock, prints one
- * line per scenario plus a final table, and exits 1 if any scenario failed so
- * CI gates on it.
+ * The curated e2e entrypoint: `bun test/e2e/run.ts`. Exits 1 on any failure so CI gates on it.
  *
- * Flags:
- *   --sections a,b|all   run only scenarios that touch one of these sections
- *                        (a scenario touches a section when it is a top-level
- *                        key of the scenario's settings); default all
- *   --scenario <name>    run only the scenario with this exact name
+ *   --sections a,b|all   only scenarios touching one of these sections (a key of the settings, a multi
+ *                        target's settings, the defaults_file, or a merge layer); default all
+ *   --scenario <name>    only the scenario with this exact name
  */
 
-import { corpusUnwitnessedUnconditionalSections } from "./apply-idempotence-proof.js";
+import { corpusUnwitnessedExemptEndpoints } from "./apply-idempotence-proof.js";
 import { runScenario } from "./runner.js";
 import { loadScenarios, type Scenario, scenarioRoots } from "./schema.js";
 
@@ -39,31 +32,33 @@ function parseFlags(argv: string[]): Flags {
 }
 
 /**
- * Every section a scenario touches: the top-level `settings` keys plus each
- * multi-repo target's `repos.<slug>.settings` keys and the `defaults_file`
- * keys. A multi-repo scenario declares its sections per target, not at the top
- * level, so filtering on `settings` alone would drop it from a --sections run.
+ * A multi scenario declares sections per target, a merge one may declare a section only in a lower
+ * layer, and a snapshot one declares none (its pinned documents and `sections` allowlist name them),
+ * so filtering on settings alone would drop all three.
  */
 function scenarioSections(scenario: Scenario): Set<string> {
   const keys = new Set<string>(Object.keys(scenario.settings ?? {}));
-  for (const spec of Object.values(scenario.repos ?? {})) {
-    if (spec.settings) {
-      for (const key of Object.keys(spec.settings)) {
-        keys.add(key);
-      }
+  for (const key of (scenario.inputs?.sections ?? "").split(",")) {
+    if (key.trim() !== "") {
+      keys.add(key.trim());
     }
   }
-  for (const key of Object.keys(scenario.defaults_file ?? {})) {
-    keys.add(key);
+  const docs: Array<Record<string, unknown> | undefined> = [
+    scenario.defaults_file,
+    ...(scenario.settings_layers ?? []),
+    scenario.expect.snapshot,
+  ];
+  for (const spec of Object.values(scenario.repos ?? {})) {
+    docs.push(spec.settings ?? undefined, spec.expect?.snapshot);
+  }
+  for (const doc of docs) {
+    for (const key of Object.keys(doc ?? {})) {
+      keys.add(key);
+    }
   }
   return keys;
 }
 
-/**
- * A scenario "touches" a section when that section appears in its settings, in
- * any multi-repo target's settings, or in its defaults file. --sections keeps
- * scenarios touching any listed section; --scenario matches an exact name.
- */
 function selectScenarios(all: Scenario[], flags: Flags): Scenario[] {
   let selected = all;
   if (flags.scenario) {
@@ -102,8 +97,7 @@ async function main(): Promise<number> {
       );
       return 1;
     }
-    // Before the corpus phase the scenarios dirs are empty; land green so the
-    // script itself is not a failure.
+    // An unreadable root already failed in loadScenarios, so an empty corpus here is genuinely empty: exit 0, the line is the signal.
     console.log(`no scenario .yml files found under ${roots.join(", ")}`);
     return 0;
   }
@@ -131,14 +125,12 @@ async function main(): Promise<number> {
     }
   }
 
-  // Corpus-level inverse of the per-run idempotence proof, only meaningful
-  // over the FULL corpus: a --sections/--scenario slice can legitimately
-  // starve a false-listed section's unconditional write path. Counted as its
-  // own line item so the pass/fail tally stays honest.
+  // The corpus witness is meaningful over the FULL corpus only: a --sections/--scenario slice can
+  // legitimately starve an exempt endpoint. Its own line keeps the tally honest.
   let total = scenarios.length;
   if (!flags.sections && !flags.scenario) {
     total++;
-    const unwitnessed = corpusUnwitnessedUnconditionalSections();
+    const unwitnessed = corpusUnwitnessedExemptEndpoints();
     if (unwitnessed.length > 0) {
       failed++;
       table.push("  FAIL  apply-idempotence corpus witness");

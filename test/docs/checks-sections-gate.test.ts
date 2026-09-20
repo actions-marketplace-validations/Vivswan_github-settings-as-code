@@ -1,18 +1,13 @@
 /**
- * Sentinel contract between the diff-aware section selector
- * (.github/scripts/changed-sections.ts) and the checks.yml e2e-smoke job that
- * branches on its printed token. The workflow compares raw strings in shell,
- * so a renamed ALL/NONE constant (or an edited job script) would silently
- * always-run or always-skip the smoke job; pin each comparison to the
- * constants the selector actually prints.
+ * The checks.yml e2e-smoke job compares the selector's printed token as a raw shell string, so its literals are pinned to the constants the selector
+ * prints.
  */
 
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ALL, NONE } from "../../.github/scripts/changed-sections.js";
-
-const ROOT = join(import.meta.dir, "..", "..");
+import { ROOT } from "../root.js";
 
 describe("checks.yml e2e-smoke section-selection sentinels", () => {
   const workflow = readFileSync(join(ROOT, ".github", "workflows", "checks.yml"), "utf8");

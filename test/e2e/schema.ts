@@ -1,34 +1,28 @@
 /**
- * Zod-validated Scenario type for the e2e harness. A scenario fully describes
- * one hermetic run: the settings file and action inputs, the token's
- * permission mask and how denials are shaped, the mock's starting live state,
- * and the expected outcome. The loader validates every scenario file against
- * this schema, so a malformed scenario fails loudly at load time (naming the
- * file and the offending field) rather than producing a confusing run.
+ * The zod Scenario type for the e2e harness: one hermetic run, from settings and inputs through the
+ * token's permission mask and the mock's starting state to the expected outcome.
  */
 
-import { type Dirent, existsSync, readdirSync, readFileSync } from "node:fs";
+import { type Dirent, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
-import { FILTER_INPUTS } from "../../src/action/inputs.js";
-import { RESERVED_REF_PREFIXES } from "../../src/action/secret-refs.js";
+import { RESERVED_REF_PREFIXES } from "../../src/engine/secret-refs.js";
+import { FILTER_INPUTS } from "../../src/flows/inputs.js";
 import { MARKER_LABEL, MARKER_LABEL_CONFIG } from "../../src/report/issue-report.js";
+import { SECTION_KEYS } from "../../src/schema.js";
 import type { PatResource } from "../../src/sections/contract/permissions.js";
+import { renamedKeyError } from "../../src/sections/shared/renamed-key.js";
 import type { MustBeNever } from "../../src/types.js";
+import { ROOT } from "../root.js";
+import { LAYER_FILE_PREFIX, RUNNER_ROOT_FILES } from "./constants.js";
 import type { LiveState } from "./mock/state.js";
 import { LIVE_STATE_KEYS } from "./mock/state.js";
 
-/** The tiers a scenario can run against. Only "mock" exists today; "live" is
- * reserved for a future App-token tier so scenarios can opt in later. */
+/** Only "mock" exists today; "live" is reserved for a future App-token tier scenarios can opt into. */
 const TierSchema = z.enum(["mock", "live"]);
 
-/**
- * The permission mask keys: every fine-grained PAT resource plus the
- * organization "members" grant (teams need it, and it is not a PatResource).
- * The `satisfies` keeps this list in lockstep with PatResource - a new
- * resource that is not listed here fails to compile.
- */
+/** Every fine-grained PAT resource plus the organization "members" grant, which teams need and is not a PatResource. */
 export const MASK_KEYS = [
   "administration",
   "issues",
@@ -50,19 +44,17 @@ export const MASK_KEYS = [
   "org_members",
 ] as const satisfies readonly (PatResource | "org_members")[];
 
-/** Compile-time tripwire: a PatResource missing from MASK_KEYS fails here. */
 type _MaskCoversEveryResource = MustBeNever<Exclude<PatResource, (typeof MASK_KEYS)[number]>>;
 
 const MaskKeySchema = z.enum(MASK_KEYS);
 
-/** Access level granted to a masked resource. */
 const MaskGradeSchema = z.enum(["none", "read", "write"]);
 
 /**
- * How denied resources answer. "fine_grained" (the default) mirrors real
- * fine-grained tokens: a denied read answers 404 "Not Found", a denied write
- * answers 403 "Resource not accessible by personal access token". The numeric
- * styles answer every denial uniformly with that status.
+ * How denied resources answer. "fine_grained" mirrors a real fine-grained token; the numeric styles
+ * answer every denial with that status.
+ *   denied read   -> 404 "Not Found"
+ *   denied write  -> 403 "Resource not accessible by personal access token"
  */
 const DenialStyleSchema = z.union([z.literal("fine_grained"), z.literal(403), z.literal(404)]);
 
@@ -70,230 +62,205 @@ const DenialStyleSchema = z.union([z.literal("fine_grained"), z.literal(403), z.
 const OwnerKindSchema = z.enum(["org", "user"]);
 
 /**
- * The action inputs a scenario can set; all optional with runner defaults.
- * required_sections and sections are comma-separated strings, matching the
- * action's own INPUT_REQUIRED-SECTIONS / INPUT_SECTIONS wire format.
+ * A snapshot destination stays a plain path below the child's working directory, spelled exactly as
+ * the child resolves it (the child trims surrounding whitespace, the runner reads the spelling), and
+ * off the runner's own root files: a destination resolving to the root or above it would hand them
+ * to the dir form's walk as snapshots, and one starting with a runner file would overwrite it.
  */
+const RESERVED_ROOT_NAMES: readonly string[] = Object.values(RUNNER_ROOT_FILES);
+function reservedRootName(segment: string): boolean {
+  return RESERVED_ROOT_NAMES.includes(segment) || segment.startsWith(LAYER_FILE_PREFIX);
+}
+const SnapshotDestinationSchema = z
+  .string()
+  .refine(
+    (path) =>
+      path === path.trim() &&
+      path.split("/").every((segment) => !["", ".", ".."].includes(segment)),
+    {
+      message:
+        'a snapshot destination is a relative path below the working directory: no surrounding whitespace and no empty, ".", or ".." segment',
+    },
+  )
+  .refine((path) => !reservedRootName(path.split("/")[0] ?? ""), {
+    message: `a snapshot destination may not start with a file the runner keeps at the working directory's root (${RESERVED_ROOT_NAMES.join(", ")}, ${LAYER_FILE_PREFIX}*)`,
+  });
+
+/** The action inputs a scenario can set; the list inputs stay comma-separated strings, the action's own wire format. */
 const InputsSchema = z
   .object({
-    mode: z.enum(["apply", "check"]).optional(),
+    mode: z.enum(["apply", "check", "merge", "snapshot"]).optional(),
+    /** The mode: merge run default for the keyed list sections (INPUT_LAYERING). */
+    layering: z.enum(["merge", "replace"]).optional(),
+    /**
+     * mode: snapshot only, exactly one of the two: where the child writes,
+     * relative to the scenario's temp dir (its working directory), forwarded
+     * verbatim as INPUT_SNAPSHOT-FILE / INPUT_SNAPSHOT-DIR.
+     */
+    snapshot_file: SnapshotDestinationSchema.optional(),
+    snapshot_dir: SnapshotDestinationSchema.optional(),
     on_missing_permission: z.enum(["fail", "warn"]).optional(),
     required_sections: z.string().optional(),
     sections: z.string().optional(),
     private_repos: z.enum(["redact", "show"]).optional(),
     private_report: z.enum(["none", "issue", "issue-on-failure", "artifact"]).optional(),
     /**
-     * The age recipient the `artifact` channel encrypts the report to,
-     * forwarded as INPUT_REPORT-PUBLIC-KEY. A config-rejection scenario sets a
-     * malformed value on purpose; a delivery scenario sets a valid generated
-     * recipient (see ARTIFACT_TEST_RECIPIENT in the runner).
+     * The age recipient the `artifact` channel encrypts the report to. A config-rejection scenario
+     * sets a malformed value on purpose; a delivery scenario sets ARTIFACT_TEST_RECIPIENT (generators.ts).
      */
     report_public_key: z.string().optional(),
   })
   .strict();
 
-/**
- * The expected outcome of a run. Every field is optional except exit_code; the
- * runner asserts only what a scenario declares, in a fixed order (violations
- * first, then exit code, then the rest), so a partial expectation still pins
- * the parts it names.
- */
-const ExpectSchema = z
-  .object({
-    /**
-     * The process exit code (0 clean/applied, 1 failed). A non-empty array
-     * lists every ALLOWED code: the fuzz oracle predicts a set of legal exits
-     * (per-section outcome classes can land on either side of the worst-of
-     * fold), and the runner asserts membership. Curated scenarios keep the
-     * plain number.
-     */
-    exit_code: z.union([z.number().int(), z.array(z.number().int()).min(1)]),
-    /** The `result` output ("clean", "drift", "applied", "failed", ...). */
-    result: z.string().optional(),
-    /**
-     * The published `skipped-sections` output as a set: the comma-joined
-     * value must contain exactly these section keys, in any order. This is
-     * the skipped-sections projection's end-to-end pin - a section skipped
-     * under on-missing-permission: warn must surface here, not only in the
-     * summary table.
-     */
-    skipped_sections: z.array(z.string()).optional(),
-    /** Per-section outcome parsed from the step-summary table. */
-    outcomes: z.record(z.string(), z.string()).optional(),
-    /**
-     * Ordered "METHOD /path" prefixes the write request log must contain as
-     * a subsequence. `{repo}` is a placeholder the loader expands to the
-     * scenario's owner/name before matching. A GraphQL operation is spelled
-     * "GRAPHQL <opName>" (every GraphQL call shares POST /graphql, so the
-     * operation name is the log's rendering), and a GraphQL READ never
-     * appears in the write log despite its POST method.
-     */
-    mutations: z.array(z.string()).optional(),
-    /**
-     * "METHOD /path" (or "GRAPHQL <opName>") prefixes that must NEVER appear
-     * in the request log.
-     */
-    never: z.array(z.string()).optional(),
-    /** Substrings the step summary must contain. */
-    summary_contains: z.array(z.string()).optional(),
-    /**
-     * Substrings the step summary must NOT contain: the redaction leak guard.
-     * A redacted target's slug and its private live values must never reach the
-     * publicly-readable summary, so a private scenario lists them here.
-     */
-    summary_lacks: z.array(z.string()).optional(),
-    /** Substrings stdout must contain. */
-    stdout_contains: z.array(z.string()).optional(),
-    /**
-     * Substrings stdout must NOT contain, matched AFTER the runner strips the
-     * `::add-mask::` lines core.setSecret emits (those lines legitimately carry
-     * the raw slug so the real runner can mask it; nothing else may). The
-     * redaction leak guard for logs and workflow-command annotations, which
-     * both land on stdout.
-     */
-    stdout_lacks: z.array(z.string()).optional(),
-    /**
-     * Substrings that must appear on NO publicly-readable surface at all: the
-     * step summary, stdout, stderr (both with the `::add-mask::` lines stripped),
-     * AND every action output value. This is the whole-surface leak invariant -
-     * the same checkLeaks primitive the fuzzer applies - for a scenario that
-     * needs to prove a slug or sentinel leaked NOWHERE, not just from one named
-     * surface. Prefer this over listing the same needle in summary_lacks AND
-     * stdout_lacks; reserve those two for a string that is allowed on one surface
-     * but forbidden on another.
-     */
-    leaks_nowhere: z.array(z.string()).optional(),
-    /**
-     * The private-report issue channel's delivery to one target repo. The runner
-     * inspects the recorded issue create/patch requests for that slug:
-     *   - `body_contains`: substrings the delivered report body must include (the
-     *     full unredacted detail, incl the sentinel) - the create body, or the
-     *     PATCH body on a reuse run.
-     *   - `title`: the created issue's title (checked only on create).
-     *   - a created issue must ALWAYS carry the marker label (the lookup key);
-     *     this is asserted unconditionally, not gated by a field.
-     *   - `lookup_by_label`: assert the issues list GET used the labels=<marker>
-     *     filter (the one-indexed-request lookup the reuse path depends on).
-     *   - `labels`: the exact label-name array carried by the LAST issue write
-     *     (create or PATCH) that set a labels field - the marker-reattach
-     *     witness: a fallback-scan hit must reattach the stripped marker
-     *     WITHOUT clobbering human-added labels.
-     *   - `state`: the final open/closed state after all create/patch writes.
-     *   - `created_count`: how many report issues were POSTed for the slug (1 =
-     *     created once; 0 = none, e.g. the permission-denied or reuse path).
-     * This is the only place the private slug and sentinel may legitimately appear.
-     */
-    issue_report: z
-      .object({
-        slug: z.string(),
-        title: z.string().optional(),
-        body_contains: z.array(z.string()).optional(),
-        state: z.enum(["open", "closed"]).optional(),
-        created_count: z.number().int().optional(),
-        lookup_by_label: z.boolean().optional(),
-        labels: z.array(z.string()).optional(),
-      })
-      .strict()
-      .optional(),
-    /**
-     * Requests (any method) the log must contain, e.g. a `page=2` read that
-     * proves pagination was exercised. Matched as substrings of "METHOD path".
-     */
-    requests_contain: z.array(z.string()).optional(),
-    /**
-     * When true, the mock must have received ZERO requests: the failure under
-     * test (e.g. a settings_raw parse failure, read from the local filesystem
-     * before the client is ever used) must fire before any API contact. The
-     * same invariant the input fuzzer asserts, available to curated scenarios.
-     */
-    zero_requests: z.boolean().optional(),
-    /**
-     * When true, the runner reruns the scenario in check mode against the SAME
-     * mutated mock and expects exit 0 with zero writes (the convergence proof).
-     * Folded into `fixpoint: "converges"` by the transform below.
-     */
-    converges: z.boolean().optional(),
-    /**
-     * When true, the runner re-runs the scenario in APPLY mode a second time
-     * against the SAME mutated mock and proves apply is a fixpoint: the second
-     * apply exits 0; no compare-before-write section (COMPARE_BEFORE_WRITE in
-     * apply-idempotence.ts) issues a write; the mock's working state is
-     * unchanged family by family (unconditional-PUT sections may write again,
-     * but must rewrite the same state); and a final check-mode run converges
-     * (exit 0, zero writes), so `converges` cannot be set alongside.
-     * Requires an apply-mode scenario WITHOUT the issue report channel: that
-     * channel embeds a fresh timestamp in the report issue (state moves every
-     * run) and injects the marker label into the labels declaration, so no
-     * run under it is a fixpoint. Folded into `fixpoint: "apply_idempotent"`
-     * by the transform below.
-     */
-    apply_idempotent: z.boolean().optional(),
-    /**
-     * The canonical spelling of the armed fixpoint re-run proof, which the
-     * transform below emits - accepted on input so a dumped artifact
-     * scenario.yml (stringified AFTER the transform) reparses. Set this or
-     * one legacy boolean, never both.
-     */
-    fixpoint: z.enum(["converges", "apply_idempotent"]).optional(),
-    /**
-     * Multi-repo: the expected per-target rollup, parsed from the action's
-     * `repos-result` JSON output, keyed by "owner/name" slug -> result string
-     * ("applied" | "clean" | "drift" | "skipped" | "failed" | ...).
-     */
-    repos_result: z.record(z.string(), z.string()).optional(),
-  })
-  .strict()
-  // apply_idempotent's final check-mode run IS the convergence proof, so a
-  // scenario arming both would rerun a proof it already gets.
-  .refine((expected) => !(expected.converges && expected.apply_idempotent), {
-    message: "apply_idempotent subsumes converges; set only one",
-  })
-  .refine(
-    (expected) =>
-      expected.fixpoint === undefined ||
-      (expected.converges === undefined && expected.apply_idempotent === undefined),
-    { message: "set fixpoint or a legacy converges/apply_idempotent boolean, not both" },
-  )
-  // The two YAML booleans collapse into one armed fixpoint proof, so
-  // consumers branch on a single enum instead of two booleans whose
-  // exclusivity would otherwise live in a comment.
-  .transform(({ converges, apply_idempotent, fixpoint, ...rest }) => ({
-    ...rest,
-    fixpoint:
-      fixpoint ??
-      (apply_idempotent
-        ? ("apply_idempotent" as const)
-        : converges
-          ? ("converges" as const)
-          : undefined),
-  }));
+/** A settings file body: any YAML mapping (validated for real by the action). */
+const SettingsSchema = z.record(z.string(), z.unknown());
 
 /**
- * The mock's starting state. The LiveState shape is owned by
- * ./mock/state.ts (it is the GET-side body space the mock serves); the keys
- * here are its LIVE_STATE_KEYS enum, so a typo'd family name fails scenario
- * load instead of being accepted and silently unseeded, and the parsed
- * record types as LiveState without restating the shape.
+ * The two booleans `fixpoint` replaced. A scenario still carrying one fails naming the rewrite instead
+ * of reading as a bare unknown key: `converges: true` -> `fixpoint: converges`, `apply_idempotent: true`
+ * -> `fixpoint: apply_idempotent`.
+ */
+const fixpointKeyErrors = (["converges", "apply_idempotent"] as const).map((old) =>
+  renamedKeyError("expect", old, "fixpoint", `- write fixpoint: ${old} and rewrite the scenario`),
+);
+const fixpointKeyError = (issue: z.core.$ZodRawIssue): string | undefined =>
+  fixpointKeyErrors.map((toMessage) => toMessage(issue)).find((message) => message !== undefined);
+
+const ExpectSchema = z
+  .strictObject(
+    {
+      /**
+       * A non-empty array lists every ALLOWED code: the fuzz oracle predicts a set of legal exits, since
+       * per-section outcome classes can land on either side of the worst-of fold. Curated scenarios keep the number.
+       */
+      exit_code: z.union([z.number().int(), z.array(z.number().int()).min(1)]),
+      /** The `result` output ("clean", "drift", "applied", "failed", ...). */
+      result: z.string().optional(),
+      /**
+       * The `skipped-sections` output as a set, whatever the comma-joined order. A section skipped under
+       * on-missing-permission: warn must surface here, not only in the summary table.
+       */
+      skipped_sections: z.array(z.string()).optional(),
+      /** Per-section outcome parsed from the step-summary table. */
+      outcomes: z.record(z.string(), z.string()).optional(),
+      /**
+       * Ordered "METHOD /path" prefixes the write log must contain as a subsequence; `{repo}` expands to
+       * the scenario's owner/name. A GraphQL operation is spelled "GRAPHQL <opName>", and a GraphQL READ
+       * never appears in the write log despite its POST.
+       */
+      mutations: z.array(z.string()).optional(),
+      /**
+       * Prefixes of "METHOD /path?query" (or "GRAPHQL <opName>") that must NEVER appear in the request log; a pattern
+       * with a query forbids one lookup on a path that other lookups share.
+       */
+      never: z.array(z.string()).optional(),
+      summary_contains: z.array(z.string()).optional(),
+      /** Substrings the publicly-readable step summary must NOT contain: a redacted target's slug and private live values. */
+      summary_lacks: z.array(z.string()).optional(),
+      stdout_contains: z.array(z.string()).optional(),
+      /**
+       * Substrings stdout must NOT contain, matched AFTER the runner strips the `::add-mask::` lines
+       * core.setSecret emits: those legitimately carry the raw slug so the real runner can mask it.
+       */
+      stdout_lacks: z.array(z.string()).optional(),
+      /**
+       * Substrings that must appear on NO public surface: the step summary, stdout and stderr (mask
+       * lines stripped), and every output value, through the same checkLeaks primitive the fuzzer
+       * applies. Reserve summary_lacks and stdout_lacks for a string allowed on one surface but not another.
+       */
+      leaks_nowhere: z.array(z.string()).optional(),
+      /**
+       * The private-report issue channel's delivery to one target repo, read off the recorded issue writes for
+       * that slug; the only place the private slug and sentinel may legitimately appear. A created issue must
+       * always carry the marker label; that is asserted without a field.
+       *   body_contains   -> the delivered body: the create, or the PATCH on a reuse run
+       *   body_lacks      -> absent from EVERY accepted body, not only the last; resolved secrets need no entry, the runner sweeps them
+       *   lookup_by_label -> the issues list GET used the labels=<marker> filter
+       *   labels          -> the LAST write that set them; a reattached marker must not clobber human labels
+       *   created_count   -> report issues POSTed for the slug; 0 on the denied or reuse path
+       */
+      issue_report: z
+        .object({
+          slug: z.string(),
+          title: z.string().optional(),
+          body_contains: z.array(z.string()).optional(),
+          body_lacks: z.array(z.string()).optional(),
+          state: z.enum(["open", "closed"]).optional(),
+          created_count: z.number().int().optional(),
+          lookup_by_label: z.boolean().optional(),
+          labels: z.array(z.string()).optional(),
+        })
+        .strict()
+        .optional(),
+      /** Requests of any method the log must contain, as substrings of "METHOD path": a `page=2` read proves pagination ran. */
+      requests_contain: z.array(z.string()).optional(),
+      /**
+       * When true, the mock must have received ZERO requests: the failure under test (a settings_raw
+       * parse failure, read from the local filesystem) fires before any API contact.
+       */
+      zero_requests: z.boolean().optional(),
+      /**
+       * The re-run proof against the SAME mutated mock, one enum so the runner branches once:
+       *   converges         -> rerun in check mode, expecting exit 0 and zero writes
+       *   apply_idempotent  -> rerun APPLY and prove it a fixpoint (assertApplyIdempotent), ending in a
+       *                        converging check, so it subsumes `converges`; apply mode without the issue report channel
+       */
+      fixpoint: z.enum(["converges", "apply_idempotent"]).optional(),
+      /** Multi-repo: the per-target rollup from the `repos-result` output, "owner/name" -> result string. */
+      repos_result: z.record(z.string(), z.string()).optional(),
+      /**
+       * mode: merge only: the EXACT document the run must write to merged-file, compared whole after a
+       * YAML parse. A merge never runs the engine, so it cannot combine with a fixpoint re-run proof.
+       */
+      merged: SettingsSchema.optional(),
+      /**
+       * mode: snapshot, file form only: the EXACT document the run must write to
+       * snapshot_file, compared whole after a YAML parse (so the comment header
+       * is ignored). A dir-form target pins its file under `repos.<slug>.expect.snapshot`.
+       */
+      snapshot: SettingsSchema.optional(),
+      /**
+       * mode: snapshot, either form. When true, the runner re-runs the bundle in
+       * CHECK mode against the SAME seeded state (the allowlist and the denial
+       * policy carried over) once per written document: the file form as the
+       * settings file, the dir form's files each as a one-file repos-dir. Every
+       * check must exit 0 with `result: clean` and zero writes: the round trip.
+       */
+      snapshot_converges: z.boolean().optional(),
+    },
+    { error: fixpointKeyError },
+  )
+  .refine((expected) => expected.merged === undefined || expected.fixpoint === undefined, {
+    message: "merged pins a mode: merge run, which has no fixpoint re-run to prove",
+  })
+  // A snapshot applies nothing, so the apply-mode fixpoint proofs have no run to re-run.
+  .refine(
+    (expected) =>
+      (expected.snapshot === undefined && expected.snapshot_converges === undefined) ||
+      expected.fixpoint === undefined,
+    {
+      message:
+        "snapshot and snapshot_converges pin a mode: snapshot run, which has no apply-mode fixpoint",
+    },
+  );
+
+/**
+ * The mock's starting state, keyed by ./mock/state.ts's LIVE_STATE_KEYS so a typo'd family name fails
+ * scenario load instead of being accepted and silently unseeded.
  */
 const LiveStateSchema = z
   .partialRecord(z.enum(LIVE_STATE_KEYS), z.unknown())
   .transform((v) => v as LiveState);
 
-/** A settings file body: any YAML mapping (validated for real by the action). */
-const SettingsSchema = z.record(z.string(), z.unknown());
-
-/** The token permission mask shape, reused for the global and per-repo masks. */
 const TokenPermissionsSchema = z.partialRecord(MaskKeySchema, MaskGradeSchema);
 
 /**
- * One target repo in a multi-repo scenario. `settings` is that repo's
- * settings.yml body, or null when the repo has NO settings file (the
- * contents-404 -> skipped path). `settings_raw` serves that exact string as the
- * settings.yml content instead (for a genuine YAML PARSE failure, which a
- * serialized object cannot produce); exactly one of `settings`/`settings_raw`
- * is set. `live_state` and `permissions` scope the mock's per-slug state and
- * denial mask to this target; `expect.result` pins this repo's individual
- * rollup (also assertable via the top-level repos_result map).
+ * One target repo in a multi-repo scenario. At most one of `settings`/`settings_raw` is set; neither,
+ * or `settings: null`, means NO settings file.
+ *
+ *   no settings file  -> the defaults document applies, or the target is skipped
+ *   settings_raw      -> served verbatim, for a YAML parse failure a serialized object cannot produce
+ *   expect.result     -> this repo's own rollup, also assertable via the top-level repos_result map
  */
 const MultiRepoSchema = z
   .object({
@@ -301,21 +268,22 @@ const MultiRepoSchema = z
     settings_raw: z.string().optional(),
     live_state: LiveStateSchema.optional(),
     permissions: TokenPermissionsSchema.optional(),
-    expect: z.object({ result: z.string().optional() }).strict().optional(),
+    expect: z
+      .object({
+        result: z.string().optional(),
+        /** mode: snapshot, dir form: the EXACT document written to `<snapshot_dir>/<owner>/<name>.yml`. */
+        snapshot: SettingsSchema.optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
-  // settings and settings_raw are mutually exclusive: they both define the
-  // served settings.yml, and setting both would silently favor one. Reject the
-  // ambiguity loudly rather than let a scenario pass with a surprising result.
+  // Both define the served settings.yml; setting both would silently favor one.
   .refine((repo) => !(repo.settings !== undefined && repo.settings_raw !== undefined), {
     message: "set only one of `settings` or `settings_raw`, not both",
   });
 
-/**
- * One discovery-pool repo `/user/repos` enumerates for a repos: "*" scenario.
- * The four attributes are the client-side-filterable fields the discovery
- * engine reads; the mock serves them verbatim and never pre-filters.
- */
+/** One discovery-pool repo `/user/repos` enumerates; the mock pre-filters visibility only, as GitHub does server-side (mock/core-paths.ts). */
 const DiscoveryRepoSchema = z
   .object({
     slug: z.string(),
@@ -327,11 +295,8 @@ const DiscoveryRepoSchema = z
   .strict();
 
 /**
- * The discovery configuration for a repos: "*" scenario: the pool the mock
- * enumerates, and the discovery-filter action inputs the runner forwards as
- * INPUT_* vars. Keys are constrained to the real filter input names
- * (FILTER_INPUTS from the action), so a typoed filter fails at load time rather
- * than being silently forwarded and ignored.
+ * A repos: "*" scenario's pool and the discovery-filter inputs the runner forwards as INPUT_* vars,
+ * keyed by the real filter input names so a typoed filter fails at load instead of being forwarded and ignored.
  */
 const DiscoverySchema = z
   .object({
@@ -341,54 +306,37 @@ const DiscoverySchema = z
   .strict();
 
 /**
- * A transport-level fault the mock injects on the first `times` (default 1;
- * "always" = every match) requests that match `endpoint` - a "section.role"
- * key, or a core-route key
- * from CORE_FAULT_KEYS in mock/chaos.ts (e.g. "core.discoveryList" for the
- * /user/repos discovery listing, "core.contentsGet" for the settings-file
- * fetch, and the "core.issue*" / "core.reportLabelCreate" / "core.userGet"
- * report routes). These model failures the permission/handler layers cannot:
- * `rate_limit_403` answers 403 with "rate limit" in the body (the client's
- * classifier must read it as throttling, NOT a permission denial);
- * `429_then_200` answers the REAL secondary-rate-limit shape (the documented
- * "secondary rate limit" message plus a small positive Retry-After), which
- * octokit's throttling plugin - production's only 429 recovery path -
- * recognizes and retries, so the next request succeeds; under RETRY_BASE_MS
- * the retry plugin absorbs it instead, equally fast; `server_error` answers a
- * 5xx with a JSON message body,
- * rotating 500/502/503 deterministically on the fault's fire count - the
- * client retries 5xx, so times: 1 is a transient the run recovers from and
- * times >= 3 (1 + MAX_RETRIES) exhausts the retries into a hard failure;
- * `connection_drop` destroys the socket before any response (a network failure
- * the client surfaces after its retries are spent).
+ * `endpoint` is a "section.role" key or a core-route key from CORE_FAULT_KEYS in mock/chaos.ts. These model
+ * failures the permission and handler layers cannot:
+ *
+ *   rate_limit_403   -> 403 with "rate limit" in the body; the client must read it as throttling, not a denial
+ *   429_then_200     -> the secondary-rate-limit shape; the throttling plugin honors its Retry-After (in GSAC_RETRY_BASE_MS units under the runner)
+ *   server_error     -> 5xx rotating 500/502/503 per firing; times 1 recovers, times >= 3 (1 + MAX_RETRIES) fails
+ *   connection_drop  -> the socket dies before any response, a network failure surfaced after the retries
+ *   echo_422         -> a validation rejection quoting the request body verbatim; a secret-carrying request must surface none of it
  */
 const FaultSchema = z
   .object({
     endpoint: z.string(),
-    kind: z.enum(["rate_limit_403", "429_then_200", "connection_drop", "server_error"]),
+    kind: z.enum(["rate_limit_403", "429_then_200", "connection_drop", "server_error", "echo_422"]),
     times: z.union([z.number().int().positive(), z.literal("always")]).optional(),
   })
   .strict();
 
 /**
- * Environment variable names a scenario's `env` map may not set: the runner
- * builds the child environment from scratch, and these are its own controls.
- * The prefixes are the SAME reserved set secret references refuse
- * (RESERVED_REF_PREFIXES), plus the exact names the runner assigns itself.
+ * Names a scenario's `env` map may not set: the runner builds the child environment from scratch
+ * and these are its own controls. The prefixes are the SAME set secret references refuse.
  */
-const RESERVED_ENV_NAMES = new Set(["PATH", "HOME", "RETRY_BASE_MS"]);
+const RESERVED_ENV_NAMES = new Set(["PATH", "HOME", "GSAC_RETRY_BASE_MS"]);
 
 function reservedEnvKey(name: string): boolean {
   return RESERVED_ENV_NAMES.has(name) || RESERVED_REF_PREFIXES.some((p) => name.startsWith(p));
 }
 
 /**
- * Extra variables injected into the child process environment, for scenarios
- * that exercise `$NAME` secret references (the step-env wiring a real
- * workflow does with `env:`). Keys colliding with the harness's own controls
- * (INPUT_*, GITHUB_*, RUNNER_*, ACTIONS_*, NODE_*, and the runner-assigned
- * names) are rejected at load time: a scenario must not be able to smuggle an
- * input or runner override past the hermetic childEnv build.
+ * Extra child-process variables for `$NAME` secret references (the step-env wiring a workflow's
+ * `env:` does). A colliding key is rejected at load: a scenario must not smuggle an input or a
+ * runner override past the hermetic childEnv build.
  */
 const EnvSchema = z.record(z.string(), z.string()).superRefine((env, ctx) => {
   for (const name of Object.keys(env)) {
@@ -408,22 +356,18 @@ const ScenarioSchema = z
     tiers: z.array(TierSchema).default(["mock"]),
     settings: SettingsSchema.optional(),
     /**
-     * The EXACT settings.yml text the single-repo run reads, written verbatim
-     * (no YAML round-trip), for inputs a serialized object cannot produce: raw
-     * unparseable YAML (the "cannot read settings ... valid YAML" path) or a
-     * document that parses to a non-mapping (the "must be a YAML mapping"
-     * validator path). The file is read from the LOCAL filesystem before any
-     * API call, so such a scenario must see zero requests (assert with
-     * expect.zero_requests). Exactly one of `settings`/`settings_raw` is set;
-     * a multi-repo target's raw file is `repos.<slug>.settings_raw` instead.
+     * The EXACT settings.yml text the single-repo run reads (a multi-repo target's is
+     * `repos.<slug>.settings_raw`), for inputs a serialized object cannot produce: unparseable YAML, or
+     * a non-mapping document. Read from the LOCAL filesystem before any API call, so assert expect.zero_requests too.
      */
     settings_raw: z.string().optional(),
-    inputs: InputsSchema.optional(),
     /**
-     * Extra child-process environment variables (see EnvSchema): the step-env
-     * half of a `$NAME` secret reference, defined the way a workflow's `env:`
-     * block would define it.
+     * mode: merge only: the documents BELOW `settings`, lowest first; the runner lists them before
+     * settings.yml in INPUT_SETTINGS-FILE, so `settings` is always the top layer.
      */
+    settings_layers: z.array(SettingsSchema).optional(),
+    inputs: InputsSchema.optional(),
+    /** The step-env half of a `$NAME` secret reference, the way a workflow's `env:` block defines it. */
     env: EnvSchema.optional(),
     /** Resource -> granted access; unspecified resources default to "write". */
     token_permissions: TokenPermissionsSchema.optional(),
@@ -431,67 +375,96 @@ const ScenarioSchema = z
     live_state: LiveStateSchema.optional(),
     owner_kind: OwnerKindSchema.default("org"),
     /**
-     * A GHES-style path prefix (e.g. "/api/v3") the mock bakes into its base
-     * URL and requires on every request, to prove the client joins the base
-     * URL correctly without dropping or doubling the prefix.
+     * A GHES-style path prefix (e.g. "/api/v3") the mock bakes into its base URL and requires on every
+     * request, proving the client neither drops nor doubles it.
      */
     base_prefix: z.string().optional(),
     /**
-     * Multi-repo mode: the target repos keyed by "owner/name" slug. Setting
-     * this (or `discovery`) makes the runner drive the action's multi-repo
-     * path (INPUT_REPOS) against the admin repo e2e-owner/e2e-repo.
+     * Multi-repo mode: the targets keyed by "owner/name". Setting this (or `discovery`) drives the
+     * action's multi-repo path (INPUT_REPOS) against the admin repo e2e-owner/e2e-repo.
      */
     repos: z.record(z.string(), MultiRepoSchema).optional(),
-    /** Multi-repo repos: "*" discovery: the pool plus the filter inputs. */
     discovery: DiscoverySchema.optional(),
-    /** The defaults-file body merged under every target (INPUT_DEFAULTS-FILE). */
+    /** The defaults-file body applied to every target without a settings file (INPUT_DEFAULTS-FILE). */
     defaults_file: SettingsSchema.optional(),
-    /** Transport-level faults injected on the first matching requests. */
     faults: z.array(FaultSchema).optional(),
     expect: ExpectSchema,
   })
   .strict()
-  // Both fields define the served settings.yml, and setting both would
-  // silently favor one; setting neither leaves the run without a settings
-  // document at all. Reject each ambiguity loudly, mirroring MultiRepoSchema.
+  // Both define the served settings.yml, and setting both would silently favor one; setting neither
+  // leaves the run without a settings document at all.
   .refine((s) => !(s.settings !== undefined && s.settings_raw !== undefined), {
     message: "set only one of `settings` or `settings_raw`, not both",
   })
   .refine((s) => s.settings !== undefined || s.settings_raw !== undefined, {
     message: "one of `settings` or `settings_raw` is required",
   })
-  // The single-repo settings file is not read at all in multi mode, so a
-  // top-level settings_raw there would be silently dead configuration.
+  // The single-repo settings file is not read at all in multi mode, so a top-level settings_raw
+  // there would be silently dead configuration.
   .refine((s) => s.settings_raw === undefined || (!s.repos && !s.discovery), {
     message:
       "settings_raw is single-repo only; a multi-repo target's raw file is `repos.<slug>.settings_raw`",
+  })
+  // Only a mode: merge run reads the layer files and writes the merged file the pin compares against.
+  .refine((s) => s.settings_layers === undefined || s.inputs?.mode === "merge", {
+    message: "settings_layers only applies with inputs.mode: merge",
+  })
+  .refine((s) => s.expect.merged === undefined || s.inputs?.mode === "merge", {
+    message: "expect.merged only applies with inputs.mode: merge",
+  })
+  // A merge runs no engine: a fixpoint re-run would be a check against nothing.
+  .refine((s) => s.inputs?.mode !== "merge" || s.expect.fixpoint === undefined, {
+    message: "a mode: merge scenario cannot arm a fixpoint proof",
+  })
+  // The snapshot destinations and their pins describe a mode: snapshot run and
+  // nothing else; anywhere else they would be dead configuration.
+  .refine(
+    (s) =>
+      s.inputs?.mode === "snapshot" ||
+      (s.inputs?.snapshot_file === undefined && s.inputs?.snapshot_dir === undefined),
+    { message: "snapshot_file and snapshot_dir only apply with inputs.mode: snapshot" },
+  )
+  .refine(
+    (s) =>
+      s.inputs?.mode !== "snapshot" ||
+      (s.inputs.snapshot_file === undefined) !== (s.inputs.snapshot_dir === undefined),
+    {
+      message:
+        "a mode: snapshot scenario sets exactly one of inputs.snapshot_file or inputs.snapshot_dir",
+    },
+  )
+  .refine((s) => s.expect.snapshot === undefined || s.inputs?.snapshot_file !== undefined, {
+    message: "expect.snapshot only applies with inputs.snapshot_file",
+  })
+  .refine((s) => s.expect.snapshot_converges === undefined || s.inputs?.mode === "snapshot", {
+    message: "expect.snapshot_converges only applies with inputs.mode: snapshot",
+  })
+  .refine(
+    (s) =>
+      s.inputs?.snapshot_dir !== undefined ||
+      Object.values(s.repos ?? {}).every((repo) => repo.expect?.snapshot === undefined),
+    { message: "repos.<slug>.expect.snapshot only applies with inputs.snapshot_dir" },
+  )
+  // A snapshot never runs the engine's apply path, so a fixpoint proof has no run to re-run.
+  .refine((s) => s.inputs?.mode !== "snapshot" || s.expect.fixpoint === undefined, {
+    message: "a mode: snapshot scenario cannot arm a fixpoint proof",
   });
 
 export type MaskKey = z.infer<typeof MaskKeySchema>;
 export type MaskGrade = z.infer<typeof MaskGradeSchema>;
 /**
- * The grade ordering, beside the vocabulary it ranks. Shared DATA for the
- * mock's permission gate and the oracle - unlike their grading predicates,
- * which stay separate on purpose (deliberately independent mirrors).
+ * The grade ordering: shared DATA for the mock's permission gate and the oracle, unlike their grading
+ * predicates, which stay deliberately independent mirrors.
  */
 export const GRADE_RANK: Record<MaskGrade, number> = { none: 0, read: 1, write: 2 };
-/** A token permission mask: MaskKey -> granted MaskGrade, closed vocabulary. */
 export type PermissionMask = z.infer<typeof TokenPermissionsSchema>;
 export type DenialStyle = z.infer<typeof DenialStyleSchema>;
 export type OwnerKind = z.infer<typeof OwnerKindSchema>;
+export type Expect = z.infer<typeof ExpectSchema>;
 /**
- * ExpectSchema's output with `fixpoint` optional: the transform always emits
- * the key, but a hand-built expectation (the fuzz cores) may simply omit it.
- */
-export type Expect = Omit<z.infer<typeof ExpectSchema>, "fixpoint"> & {
-  fixpoint?: "converges" | "apply_idempotent";
-};
-/**
- * Exactly one of `settings`/`settings_raw` defines the settings.yml a target
- * serves (a MultiRepo target may also have NO file: `settings: null` or both
- * absent). The zod refines prove the exclusivity at the parse boundary; the
- * `?: never` halves carry it into the type, so a generator that sets both
- * fails to compile instead of silently favoring `settings_raw`.
+ * The zod refines prove the `settings`/`settings_raw` exclusivity at the parse boundary; the
+ * `?: never` halves carry it into the type, so a generator setting both fails to compile instead of
+ * silently favoring `settings_raw`.
  */
 type SettingsSource =
   | { settings: Record<string, unknown>; settings_raw?: never }
@@ -508,13 +481,8 @@ export type Scenario = Omit<
   SettingsSource & { repos?: Record<string, MultiRepo>; expect: Expect };
 
 /**
- * The raw settings.yml body a settings source produces: `settings_raw`
- * verbatim when set (raw text can be unparseable YAML or a non-mapping
- * document, which a serialized object cannot produce), else the settings
- * object serialized to YAML, else null (a target with NO settings file).
- * The ONE derivation the single-repo runner and the multi-repo contents
- * endpoint share; a Scenario always carries one of the two sources, so its
- * overload never yields null.
+ * The ONE settings.yml derivation the single-repo runner and the multi-repo contents endpoint share.
+ * A Scenario always carries one of the two sources, so its overload never yields null.
  */
 export function settingsYamlFor(source: SettingsSource): string;
 export function settingsYamlFor(source: MultiSettingsSource): string | null;
@@ -532,29 +500,28 @@ export function settingsYamlFor(source: {
 }
 
 /**
- * Where a scenario re-types MARKER_LABEL_CONFIG as fixture data because .yml
- * files cannot import the constant: DECLARED settings (top-level, per-repo,
- * defaults file) and expectation blocks. live_state is deliberately out of
- * scope - seeding a DRIFTED marker label there is how a future scenario
- * would test that the report path repairs a mangled marker, so the pin must
- * not make that inexpressible. Walk each in-scope root and compare any
- * object named MARKER_LABEL against the config; a config change then fails
- * scenario load with the offending values instead of silently drifting the
- * declared fixtures. Returns "field: fixture value != config value" lines.
+ * Scenario .yml files cannot import MARKER_LABEL_CONFIG, so their DECLARED settings and expectations
+ * re-type it; a config change then fails scenario load naming the drifted fixture. live_state is
+ * deliberately out of scope: seeding a DRIFTED marker there is how a scenario would test the report
+ * path repairing a mangled marker, so the pin must not make that inexpressible.
  */
 export function markerLabelFixtureMismatches(scenario: Scenario): string[] {
   const roots: Array<[string, unknown]> = [
     ["settings", scenario.settings],
     ["defaults_file", scenario.defaults_file],
     ["expect", scenario.expect],
+    ...(scenario.settings_layers ?? []).map((layer, i): [string, unknown] => [
+      `settings_layers[${i}]`,
+      layer,
+    ]),
   ];
   for (const [slug, repo] of Object.entries(scenario.repos ?? {})) {
     roots.push([`repos.${slug}.settings`, repo.settings], [`repos.${slug}.expect`, repo.expect]);
   }
+  // Marker-label fixtures inside a pinned snapshot are declared data too.
   return roots.flatMap(([path, root]) => markerMismatchesIn(root, path));
 }
 
-/** The recursive comparison markerLabelFixtureMismatches applies per root. */
 function markerMismatchesIn(value: unknown, path: string): string[] {
   if (Array.isArray(value)) {
     return value.flatMap((item, i) => markerMismatchesIn(item, `${path}[${i}]`));
@@ -579,11 +546,6 @@ function markerMismatchesIn(value: unknown, path: string): string[] {
   return mismatches;
 }
 
-/**
- * Parse and validate one scenario object. On failure, throw an error naming
- * the source file and every offending zod path, so a malformed scenario is
- * diagnosable without reading the schema.
- */
 export function parseScenario(raw: unknown, sourcePath: string): Scenario {
   const result = ScenarioSchema.safeParse(raw);
   if (!result.success) {
@@ -602,14 +564,25 @@ export function parseScenario(raw: unknown, sourcePath: string): Scenario {
   return result.data as Scenario;
 }
 
-/** Recursively collect every .yml file under a directory (empty if absent). */
+/**
+ * Every .yml under a directory. An unreadable corpus must never look empty: run.ts reports an empty
+ * unfiltered corpus and exits 0.
+ *   ENOENT             -> [] (a section may have no scenarios/ yet; test/schema-corpus.test.ts rejects the empty root)
+ *   any other failure  -> propagates naming the directory
+ */
 export function collectYmlFiles(dir: string): string[] {
   const out: string[] = [];
   let entries: Dirent[];
   try {
     entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return out;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return out;
+    }
+    throw new Error(
+      `cannot read the scenario directory ${dir}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
   for (const entry of entries) {
     const full = join(dir, entry.name);
@@ -623,38 +596,22 @@ export function collectYmlFiles(dir: string): string[] {
 }
 
 /**
- * The directories the curated corpus lives in: the cross-cutting root
- * (test/e2e/scenarios/ - multi-repo flows, discovery, report delivery, and
- * other scenarios spanning sections; a scenario exercising ONE section lives
- * in that section's directory) plus every src/sections/<key>/scenarios/
- * directory on disk, enumerated at call time so a new section's first
- * scenario is picked up without touching a list.
- * ONLY scenarios/ directories count - any other .yml under a section
- * directory (a fixture, an example settings file) never loads as a scenario.
- * run.ts and the endpoint-coverage tripwire both call this, so the two can
- * never disagree about what the corpus is.
+ * The curated corpus; run.ts and .github/scripts/check-endpoint-coverage.ts both read it, so they
+ * cannot disagree. The roots are not filtered by existence: an existsSync filter would silently drop
+ * a scenarios/ under a mode-000 <key>/, where collectYmlFiles fails loudly instead.
+ *   test/e2e/scenarios/             -> multi-section flows; a scenario exercising ONE section lives with that section
+ *   <sectionsDir>/<key>/scenarios/  -> every registered section, so a new section's first scenario needs no list edit
  */
-export function scenarioRoots(): string[] {
-  const roots = [join(import.meta.dir, "scenarios")];
-  const sectionsDir = join(import.meta.dir, "..", "..", "src", "sections");
-  for (const entry of readdirSync(sectionsDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    const scenariosDir = join(sectionsDir, entry.name, "scenarios");
-    if (existsSync(scenariosDir)) {
-      roots.push(scenariosDir);
-    }
-  }
-  return roots;
+export function scenarioRoots(sectionsDir: string = join(ROOT, "src", "sections")): string[] {
+  return [
+    join(import.meta.dir, "scenarios"),
+    ...SECTION_KEYS.map((key) => join(sectionsDir, key, "scenarios")),
+  ];
 }
 
 /**
- * Load and validate every scenario under `dirs` (recursively, all .yml files),
- * sorted by path for a stable run order. Each file is parsed as YAML and
- * validated through parseScenario, so a bad file fails loudly naming itself;
- * two files claiming the same scenario name fail loudly naming both, since
- * names key --scenario filtering and failure artifacts.
+ * Every scenario under `dirs`, sorted by path for a stable run order. Two files claiming one scenario
+ * name fail naming both: names key --scenario filtering and the failure artifacts.
  */
 export function loadScenarios(dirs: readonly string[]): Scenario[] {
   const sourceByName = new Map<string, string>();

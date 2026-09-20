@@ -1,26 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_ROLE, roleForPermission } from "../../src/sections/shared/roles.js";
+import { permissionForRole, roleForPermission } from "../../src/sections/shared/roles.js";
 
-describe("roleForPermission", () => {
-  test("maps the PUT vocabulary to the GET role_name vocabulary", () => {
-    expect(roleForPermission("push")).toBe("write");
-    expect(roleForPermission("pull")).toBe("read");
-  });
-
-  test("passes custom and already-GET-vocabulary roles through untouched", () => {
-    expect(roleForPermission("admin")).toBe("admin");
-    expect(roleForPermission("maintain")).toBe("maintain");
-    expect(roleForPermission("triage")).toBe("triage");
-    expect(roleForPermission("security-team")).toBe("security-team");
-  });
-});
-
-describe("DEFAULT_ROLE", () => {
-  test("is push, the write default both collaborators and teams fall back to", () => {
-    // Pins the shared default: collaborators.ts and teams.ts both read this
-    // symbol, so an accidental change here would move both sections at once
-    // (and this test would flag it) rather than letting them silently diverge.
-    expect(DEFAULT_ROLE).toBe("push");
-    expect(roleForPermission(DEFAULT_ROLE)).toBe("write");
+describe("permissionForRole", () => {
+  // One row per branch: the PUT-vocabulary map hit, the custom-role pass-through, the prototype-member guard
+  // (a Map, not a record), and both roles no declaration plans as itself.
+  test.each([
+    ["write", "push"],
+    ["admin", "admin"],
+    ["constructor", "constructor"],
+    // A custom org role passes through as spelled: GitHub matches the name exactly, so lowercasing it would plan a rename.
+    ["Security-Team", "Security-Team"],
+    // "push" and "pull" are the PUT vocabulary GitHub reads back as write and read, so a live role spelled that way maps nowhere.
+    ["push", undefined],
+    ["pull", undefined],
+  ])("%s reads back as the declared permission %s", (role, permission) => {
+    expect(permissionForRole(role)).toBe(permission);
+    if (permission !== undefined) {
+      expect(roleForPermission(permission)).toBe(role);
+    }
   });
 });

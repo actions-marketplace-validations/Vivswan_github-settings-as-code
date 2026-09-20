@@ -1,10 +1,8 @@
-# Repo-owned CI checks, called by the managed ci.yml inside the all-green
-# gate: every job here must pass before all-green goes green. Never
-# overwritten by template sync, so edit freely.
-#
-# Two limits from running inside the `checks` caller: jobs here get no
-# secrets and are capped at the caller's permissions (contents: read), and
-# all-green only sees the aggregate result.
+# Repo-owned, never overwritten by sync; the managed ci.yml calls it inside the all-green gate, so every job here
+# must pass before all-green goes green. Three limits come with running inside the `checks` caller:
+#   secrets      -> none reach these jobs
+#   permissions  -> capped at the caller's contents: read
+#   all-green    -> sees only the aggregate result
 
 name: Checks
 
@@ -14,119 +12,100 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      # bun test includes the OpenAPI validator tests, which load the fetched,
-      # gitignored trimmed spec; restore it from cache or fetch on a miss.
-      - name: Cache the trimmed OpenAPI spec
-        id: openapi-cache
-        uses: actions/cache@v6
-        with:
-          path: test/e2e/openapi/github-openapi.trimmed.json
-          key: openapi-trimmed-${{ hashFiles('.github/scripts/trim-openapi.ts', 'test/e2e/openapi/paths.ts', 'src/report/issue-report.ts', 'src/sections/**', 'src/upstream-gaps/**', 'src/schema.ts', 'src/github/api.ts') }}
-      - name: Fetch the trimmed OpenAPI spec (cache miss)
-        if: steps.openapi-cache.outputs.cache-hit != 'true'
-        run: bun .github/scripts/trim-openapi.ts
-      # bun test also validates every declared GraphQL query against GitHub's
-      # published schema, another fetched, gitignored artifact. The key hashes
-      # only the fetch script: it carries the pinned UPSTREAM_REF, the sole
-      # input that changes the output.
-      - name: Cache the GraphQL schema
-        id: graphql-schema-cache
-        uses: actions/cache@v6
-        with:
-          path: test/e2e/graphql/schema.docs.graphql
-          key: graphql-schema-${{ hashFiles('.github/scripts/fetch-graphql-schema.ts') }}
-      - name: Fetch the GraphQL schema (cache miss)
-        if: steps.graphql-schema-cache.outputs.cache-hit != 'true'
-        run: bun .github/scripts/fetch-graphql-schema.ts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+      # bun test loads the fetched, gitignored OpenAPI spec and GraphQL
+      # schema; the composite restores each from cache or fetches on a miss.
+      - uses: ./.github/actions/fetch-test-artifacts
       - name: Lint (biome)
         run: bun run lint
+      - name: Lint (architecture)
+        run: bun run lint:arch
       - name: Typecheck
         run: bun run typecheck
-      - name: Dead code (knip)
-        run: bun run knip
+      - name: Compat markers
+        run: bun run check:compat
       - name: Test
         run: bun run test
 
-  # The freshness tripwire behind the single-tag scheme's boundary (the
-  # anchor half lives in update-release-pr.yml): last-release-sha in
-  # release-please-config.json must be the newest release merge on main or
-  # its parent - version tags live on packaged children that are NOT on
-  # main, so release-please cannot find the boundary by tag, and a lost
-  # anchor would have every release PR refresh computed from a stale one.
-  # Gating here parks the release job (it needs all-green) BEFORE
-  # release-please can build a garbage release PR, loudly on every push.
-  # The skip lives on the STEPS, per side: the main-side check judges only
-  # main (a dispatch against another branch would judge that branch's
-  # config, and the release PR deliberately carries the anchored NEXT
-  # boundary, which the main-side check would call stale - the PR-side
-  # anchor-check below validates that instead), and all-green treats a
-  # skipped needed job as failure.
+  # The freshness tripwire behind the boundary anchor (update-release-pr.yml): version tags live off main, so a lost
+  # anchor would have every release PR refresh computed from a stale boundary, and gating here parks the release job
+  # before release-please can build a garbage release PR. Each half is its own job, gated on its event: a skipped job
+  # leaves the checks caller, and so all-green, green.
+  #   on main          -> boundary-check: last-release-sha is the newest release merge or its parent
+  #   on a release PR  -> anchor-check: the PR carries the anchored NEXT boundary, which the main-side rule would reject
   boundary-check:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The newest release merge can be arbitrarily far behind HEAD.
           fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      - uses: ./.github/actions/setup
         with:
-          bun-version-file: .bun-version
+          install: "false"
       - name: Confirm last-release-sha matches the newest release merge
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: bun .github/scripts/release-pipeline.ts boundary-check
-      # The PR-side half, on release PRs only: the merge must land the
-      # anchor, and the managed release-freshness gate proves only that the
-      # PR contains main's tip - not that the anchor commit survived the
-      # last release-please force-push. An unanchored release PR must be
-      # unmergeable here, not park the pipeline after its merge.
-      - uses: actions/checkout@v7
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
-      - uses: oven-sh/setup-bun@v2
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
+
+  # An unanchored release PR must be unmergeable here, not park the pipeline after its merge.
+  anchor-check:
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
         with:
-          bun-version-file: .bun-version
+          install: "false"
       - name: Require the release PR to carry this cycle's anchor
-        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')
         run: bun .github/scripts/release-pipeline.ts anchor-check
 
-  # lib/settings.schema.json is the committed settings.yml JSON Schema,
-  # generated from the SettingsFile types in src/; fail if it drifts.
   schema-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
       - name: Regenerate the schema and compare
         run: bun run build:check
 
-  # Self-test: run the action from this checkout in check mode against this
-  # repository. The bundle is not committed, so build it first. Drift or
-  # permission skips are fine (the default token cannot read admin
-  # surfaces); a CRASH is not - assert the action produced a result output,
-  # which an exception never does.
+  # The packed tarball is imported from a fresh consumer project under Node and under tsc with skipLibCheck off, so a
+  # declaration leaking a devDependency type fails here, not on a consumer's machine.
+  # The consumer runs on the engines floor package.json advertises and on current node; tsdown needs a newer node
+  # than the floor, so the PATH node is 24 and the floor's binary is handed to the consumer alone.
+  package-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["22.14", "24"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Hand the consumer its node
+        run: echo "SMOKE_CONSUMER_NODE=$(command -v node)" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Build, pack, install, import, and typecheck the library
+        run: bun .github/scripts/package-smoke.ts
+
+  # Drift and permission skips are fine here (the default token cannot read admin surfaces); a CRASH is not, and an
+  # exception never sets the result output.
   self-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - name: Install dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
       - name: Build the action bundle
         run: bun run build:bundle
       - name: Run settings-as-code (check mode)
@@ -145,39 +124,19 @@ jobs:
             *) echo "::error::action crashed (no result output)"; exit 1 ;;
           esac
 
-  # Diff-aware e2e smoke: on a PR, run only the scenarios and fuzz for the
-  # sections the PR touched (docs-only PRs skip; core or cross-cutting changes
-  # run every section). The action bundle runs under node24, so the smoke job
-  # installs node too. Non-PR events (push, dispatch) have no PR base to diff
-  # against, so they run the full corpus.
+  # The action bundle runs under node24, so node is installed beside bun. A non-PR event (push, dispatch) has no base
+  # to diff against, so it runs the full corpus.
   e2e-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - uses: actions/setup-node@v7
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      # The trimmed OpenAPI spec is a fetched, gitignored artifact. Restore it
-      # from cache or fetch on a miss. The key hashes every input that changes
-      # the output - the trim script (which carries UPSTREAM_REF), USED_PATHS,
-      # and the DEFAULT_API_VERSION source - so any of them changing busts the
-      # cache and re-fetches, never restoring a stale slice.
-      - name: Cache the trimmed OpenAPI spec
-        id: openapi-cache
-        uses: actions/cache@v6
-        with:
-          path: test/e2e/openapi/github-openapi.trimmed.json
-          key: openapi-trimmed-${{ hashFiles('.github/scripts/trim-openapi.ts', 'test/e2e/openapi/paths.ts', 'src/report/issue-report.ts', 'src/sections/**', 'src/upstream-gaps/**', 'src/schema.ts', 'src/github/api.ts') }}
-      - name: Fetch the trimmed OpenAPI spec (cache miss)
-        if: steps.openapi-cache.outputs.cache-hit != 'true'
-        run: bun .github/scripts/trim-openapi.ts
       - name: Select sections from the diff
         id: select
         env:
@@ -190,6 +149,10 @@ jobs:
           fi
           echo "sections=$SECTIONS" >> "$GITHUB_OUTPUT"
           echo "selected sections: $SECTIONS"
+      # The harness validates mock responses against the fetched, gitignored spec; the composite restores or fetches
+      # it, skipped with the run when the selector picks nothing.
+      - uses: ./.github/actions/fetch-test-artifacts
+        if: steps.select.outputs.sections != 'none'
       - name: Run scenarios and fuzz
         if: steps.select.outputs.sections != 'none'
         env:
@@ -203,33 +166,22 @@ jobs:
             bun test/e2e/fuzz.ts --iterations 25 --sections "$SECTIONS"
           fi
 
-  # Endpoint-coverage tripwire: every "section.role" route in allEndpoints()
-  # and allGraphqlOps() must be hit at least once by the curated corpus. The
-  # nightly also runs this, but a PR that adds an endpoint without a scenario
-  # reaching it must fail on that PR, not the next night. The checker runs
-  # the full corpus itself (the diff-aware smoke job may run a subset) - the
-  # ~10 minutes are skipped only when the section selector proves the PR
-  # touched no route-bearing code (docs-only). The action bundle runs under
-  # node24, so node is installed here too.
+  # A PR that adds an endpoint without a scenario reaching it must fail on that PR, not the next night. Coldness is a
+  # whole-corpus property (deleting one scenario can chill any route), so the full corpus runs (~10 minutes) unless
+  # the selector finds nothing settings-related in the diff.
   endpoint-coverage:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version-file: .bun-version
-      - uses: actions/setup-node@v7
+      - uses: ./.github/actions/setup
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-      # The same selector e2e-smoke uses, but only its "none" answer matters
-      # here: coldness is a whole-corpus property (deleting one scenario can
-      # chill any route), so any code change runs the full sweep, and only a
-      # provably docs-only PR skips it. Non-PR events run it always. It runs
-      # BEFORE the spec cache/fetch so a docs-only PR skips the download too.
+      # Only the selector's "none" answer matters here. It runs BEFORE the spec cache/fetch so a PR that selects
+      # nothing skips the download too.
       - name: Check whether the diff can affect route coverage
         id: select
         env:
@@ -242,17 +194,8 @@ jobs:
           fi
           echo "sections=$SECTIONS" >> "$GITHUB_OUTPUT"
           echo "selected sections: $SECTIONS"
-      # Same fetched, gitignored artifact and cache key as e2e-smoke above.
-      - name: Cache the trimmed OpenAPI spec
+      - uses: ./.github/actions/fetch-test-artifacts
         if: steps.select.outputs.sections != 'none'
-        id: openapi-cache
-        uses: actions/cache@v6
-        with:
-          path: test/e2e/openapi/github-openapi.trimmed.json
-          key: openapi-trimmed-${{ hashFiles('.github/scripts/trim-openapi.ts', 'test/e2e/openapi/paths.ts', 'src/report/issue-report.ts', 'src/sections/**', 'src/upstream-gaps/**', 'src/schema.ts', 'src/github/api.ts') }}
-      - name: Fetch the trimmed OpenAPI spec (cache miss)
-        if: steps.select.outputs.sections != 'none' && steps.openapi-cache.outputs.cache-hit != 'true'
-        run: bun .github/scripts/trim-openapi.ts
       - name: Endpoint-coverage tripwire
         if: steps.select.outputs.sections != 'none'
         run: bun .github/scripts/check-endpoint-coverage.ts

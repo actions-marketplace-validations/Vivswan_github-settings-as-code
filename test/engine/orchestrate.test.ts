@@ -1,49 +1,35 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { err } from "neverthrow";
 
 import {
   preflightProbe,
   type RepoRunOptions,
-  readOnlyClient,
   runForRepo,
   skippedSectionKeys,
   type ValidatedSettings,
   validateSettingsDoc,
-  worstOf,
 } from "../../src/engine/orchestrate.js";
-import type { GithubClient } from "../../src/github/api.js";
-import type { Io } from "../../src/io.js";
-import { prefixedIo } from "../../src/io.js";
-import type { SettingsFile } from "../../src/schema.js";
-import type { SECTIONS } from "../../src/sections/registry.js";
+import { SectionSelection } from "../../src/engine/section-selection.js";
+import { silentIo } from "../../src/io.js";
+import { describeProblem, type TopLevelShape } from "../../src/problem.js";
+import { SECTION_KEYS, type SettingsFile } from "../../src/schema.js";
+import type { SectionModule } from "../../src/sections/contract/module.js";
+import type { SectionPlan } from "../../src/sections/contract/plan.js";
+import { interactionLimitsSection } from "../../src/sections/interaction_limits/index.js";
+import { pagesSection } from "../../src/sections/pages/index.js";
+import { rulesetsSection } from "../../src/sections/rulesets/index.js";
+import { workflowsSection } from "../../src/sections/workflows/index.js";
+import { captureIo } from "../io/capture.js";
 import { MockApi } from "../mock-api.js";
 
-function captureIo(): { io: Io; annotations: string[]; logs: string[]; masked: string[] } {
-  const annotations: string[] = [];
-  const logs: string[] = [];
-  const masked: string[] = [];
-  return {
-    io: {
-      annotate: (level, message) => annotations.push(`${level}: ${message}`),
-      log: (line) => logs.push(line),
-      mask: (value) => masked.push(value),
-    },
-    annotations,
-    logs,
-    masked,
-  };
-}
-
-/**
- * Brand test fixtures through the REAL boundary: an invalid fixture fails
- * here instead of riding a cast into runForRepo.
- */
+/** Brand fixtures through the REAL boundary: an invalid fixture fails here instead of riding a cast into runForRepo. */
 function validated(doc: SettingsFile): ValidatedSettings {
-  const silent: Io = { annotate: () => {}, log: () => {}, mask: () => {} };
-  const verdict = validateSettingsDoc(doc, "test fixture", new Set(), silent);
-  if ("error" in verdict) {
-    throw new Error(`test fixture failed validation: ${verdict.error}`);
-  }
-  return verdict.settings;
+  return validateSettingsDoc(doc, "test fixture", SectionSelection.ALL, silentIo()).match(
+    (settings) => settings,
+    (problem) => {
+      throw new Error(`test fixture failed validation: ${describeProblem(problem)}`);
+    },
+  );
 }
 
 function opts(overrides: Partial<RepoRunOptions> = {}): RepoRunOptions {
@@ -52,8 +38,7 @@ function opts(overrides: Partial<RepoRunOptions> = {}): RepoRunOptions {
     settings: validated({ repository: { has_wiki: false } }),
     mode: "apply" as const,
     onMissingPermission: "fail" as const,
-    requiredSections: new Set(),
-    onlySections: new Set(),
+    sections: SectionSelection.ALL,
     ...overrides,
   };
 }
@@ -82,14 +67,124 @@ describe("runForRepo", () => {
     expect(annotations.some((a) => a.startsWith("warning: repository: skipped"))).toBe(true);
   });
 
-  test("check mode reports drift, prefixed through prefixedIo", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r": { data: { has_wiki: true } },
+  const put = "PUT /repos/o/r/branches/main/protection";
+  test.each([
+    [
+      "warn",
+      "Branch not found",
+      "failed",
+      ["branches", "failed"],
+      expect.stringMatching(/^error: branches: .*404 Branch not found\. /),
+    ],
+    [
+      "warn",
+      "Not Found",
+      "partial",
+      ["branches", "skipped"],
+      expect.stringMatching(
+        /^warning: branches: skipped - the token was denied PUT .*404 Not Found /,
+      ),
+    ],
+  ] as const)(
+    "under on-missing-permission %s a 404 answering %p on a write is classified by the endpoint's declaration, not the status",
+    async (policy, message, result, outcome, annotation) => {
+      // The unrouted protection GET and branch probe answer 404 "Not Found", a concealed denial, so the PUT is planned.
+      const api = new MockApi({ [put]: { error: { status: 404, message, body: "" } } });
+      const { io, annotations } = captureIo();
+      const run = await runForRepo(
+        api,
+        opts({
+          onMissingPermission: policy,
+          settings: validated({
+            branches: [{ name: "main", protection: { enforce_admins: true } }],
+          }),
+        }),
+        io,
+      );
+      expect([run.result, run.outcomes.map((o) => [o.key, o.status]), annotations]).toEqual([
+        result,
+        [[...outcome]],
+        [annotation],
+      ]);
+      expect(api.mutations().map((c) => `${c.method} ${c.path}`)).toEqual([put]);
+    },
+  );
+
+  async function receivedBy<S extends { plan: (ctx: never, desired: never) => Promise<unknown> }>(
+    section: S,
+    raw: SettingsFile,
+  ): Promise<unknown[]> {
+    const received: unknown[] = [];
+    const stubbed = spyOn(section, "plan").mockImplementation((async (
+      _ctx: never,
+      desired: unknown,
+    ) => {
+      received.push(desired);
+      return { ops: [], notes: [], drift: [] };
+    }) as never);
+    try {
+      const result = await runForRepo(
+        new MockApi({}),
+        opts({ settings: validated(raw) }),
+        captureIo().io,
+      );
+      expect(result.result).toBe("applied");
+    } finally {
+      stubbed.mockRestore();
+    }
+    expect(received).toHaveLength(2);
+    expect(received[1]).toBe(received[0]);
+    return received;
+  }
+
+  const prototypeClean = (node: object): void => {
+    expect(Object.getPrototypeOf(node)).toBe(Object.prototype);
+    expect(Object.hasOwn(node, "__proto__")).toBe(false);
+  };
+
+  test("a mapping section receives zod's parsed copy: own __proto__ dropped at every schema node, a passthrough subtree by reference (its own __proto__ ships verbatim)", async () => {
+    // JSON.parse creates "__proto__" as an OWN key; the control proves the raw document carries it at every level.
+    const raw = JSON.parse(
+      '{"pages":{"source":{"branch":"main","__proto__":{"planted":1}},"__proto__":{"planted":2},"cname":"docs.example.com","extra":{"__proto__":{"planted":3},"k":1}}}',
+    );
+    for (const node of [raw.pages, raw.pages.source, raw.pages.extra]) {
+      expect(Object.hasOwn(node, "__proto__")).toBe(true);
+    }
+    const [desired] = (await receivedBy(pagesSection, raw)) as [
+      { source: object; cname: string; extra: object },
+    ];
+    expect(desired).not.toBe(raw.pages);
+    expect(desired).toEqual({
+      source: { branch: "main" },
+      cname: "docs.example.com",
+      extra: raw.pages.extra,
     });
-    const { io, logs } = captureIo();
-    const result = await runForRepo(api, opts({ mode: "check" }), prefixedIo(io, "o/r: "));
-    expect(result.result).toBe("drift");
-    expect(logs[0]).toStartWith("o/r: drift: repository.has_wiki");
+    prototypeClean(desired);
+    prototypeClean(desired.source);
+    // The deliberate residual: the shape describes no node under `extra`, so the value rides by reference and reaches GitHub as written.
+    expect(desired.extra).toBe(raw.pages.extra);
+  });
+
+  test("a knobbed list section receives zod's parsed copy in both forms: a fresh list or wrapper, own __proto__ dropped on each entry", async () => {
+    const plain = JSON.parse('{"rulesets":[{"name":"r","__proto__":{"planted":1}}]}');
+    const wrapped = JSON.parse(
+      '{"rulesets":{"_undeclared":"keep","entries":[{"name":"r","__proto__":{"planted":1}}]}}',
+    );
+    expect(Object.hasOwn(plain.rulesets[0], "__proto__")).toBe(true);
+    expect(Object.hasOwn(wrapped.rulesets.entries[0], "__proto__")).toBe(true);
+
+    const [plainDesired] = (await receivedBy(rulesetsSection, plain)) as [object[]];
+    expect(plainDesired).not.toBe(plain.rulesets);
+    expect(plainDesired).toEqual([{ name: "r" }]);
+    prototypeClean(plainDesired[0] as object);
+
+    const [wrappedDesired] = (await receivedBy(rulesetsSection, wrapped)) as [
+      { _undeclared: string; entries: object[] },
+    ];
+    expect(wrappedDesired).not.toBe(wrapped.rulesets);
+    expect(wrappedDesired).toEqual({ _undeclared: "keep", entries: [{ name: "r" }] });
+    prototypeClean(wrappedDesired);
+    prototypeClean(wrappedDesired.entries[0] as object);
   });
 
   test("pages: null is an active section, not an omitted one", async () => {
@@ -116,28 +211,21 @@ describe("runForRepo secret references", () => {
 
   test("apply resolves up front, masks before the first mutation, and hands handlers plaintext", async () => {
     const api = new MockApi({ [HOOKS_LIST]: { data: [] } }).allowMutations("POST /repos/o/r/hooks");
-    const { io, masked } = captureIo();
     const mutationsAtMaskTime: number[] = [];
-    const trackingIo: Io = {
-      ...io,
-      mask: (value) => {
-        mutationsAtMaskTime.push(api.mutations().length);
-        io.mask(value);
-      },
-    };
+    const { io, masks } = captureIo(() => mutationsAtMaskTime.push(api.mutations().length));
     const result = await runForRepo(
       api,
       opts({
         settings: webhookSettings("$WEBHOOK_SECRET"),
+        // Spelled out, the way multi.ts runs the defaults document for a fileless target; the unset-variable test below takes the default.
+        secretSource: "operator",
         secretEnv: { WEBHOOK_SECRET: "s3cret-plaintext" },
       }),
-      trackingIo,
+      io,
     );
     expect(result.result).toBe("applied");
-    // The plaintext was registered with masking BEFORE any write left the client.
-    expect(masked).toEqual(["s3cret-plaintext"]);
+    expect(masks).toEqual(["s3cret-plaintext"]);
     expect(mutationsAtMaskTime).toEqual([0]);
-    // ...and the handler sent the resolved plaintext, not the reference.
     const post = api.mutations()[0]?.payload as { config?: { secret?: string } };
     expect(post?.config?.secret).toBe("s3cret-plaintext");
   });
@@ -183,22 +271,35 @@ describe("runForRepo secret references", () => {
     expect(literalApi.calls).toEqual([]);
   });
 
-  test("a target-sourced reference is refused in both modes", async () => {
-    const api = new MockApi({});
-    const { io, annotations } = captureIo();
-    const result = await runForRepo(
-      api,
-      opts({
-        settings: webhookSettings("$WEBHOOK_SECRET"),
-        secretSource: () => "target",
-        secretEnv: { WEBHOOK_SECRET: "present-but-irrelevant" },
-      }),
-      io,
-    );
-    expect(result.result).toBe("failed");
-    expect(api.calls).toEqual([]);
-    expect(annotations.some((a) => a.includes("target-fetched settings file"))).toBe(true);
-  });
+  test.each(["apply", "check"] as const)(
+    "a target-sourced reference is refused in %s mode, before any API call",
+    async (mode) => {
+      const api = new MockApi({});
+      const { io, annotations } = captureIo();
+      const result = await runForRepo(
+        api,
+        opts({
+          mode,
+          settings: webhookSettings("$WEBHOOK_SECRET"),
+          secretSource: "target",
+          secretEnv: { WEBHOOK_SECRET: "present-but-irrelevant" },
+        }),
+        io,
+      );
+      expect(result.result).toBe("failed");
+      expect(result.outcomes).toEqual([
+        {
+          key: "webhooks",
+          status: "failed",
+          detail: [expect.stringContaining("target-fetched settings file")],
+        },
+      ]);
+      expect(annotations).toEqual([
+        expect.stringMatching(/^error: webhooks: .*target-fetched settings file/),
+      ]);
+      expect(api.calls).toEqual([]);
+    },
+  );
 
   test("a section excluded by `sections` cannot fail the run on its references", async () => {
     const api = new MockApi({ "GET /repos/o/r": { data: { has_wiki: false } } }).allowMutations(
@@ -212,155 +313,442 @@ describe("runForRepo secret references", () => {
           ...webhookSettings("a-literal-that-would-fail"),
           repository: { has_wiki: false },
         }),
-        onlySections: new Set(["repository"]),
+        sections: SectionSelection.of({ only: ["repository"] })._unsafeUnwrap(),
       }),
       io,
     );
+    // The excluded section contributes no values, so its literal is never collected, let alone refused.
     expect(result.result).toBe("applied");
+    expect(result.outcomes.map((o) => [o.key, o.status])).toEqual([
+      ["repository", "applied"],
+      ["webhooks", "excluded"],
+    ]);
   });
 });
 
 describe("validateSettingsDoc", () => {
-  const errorOf = (verdict: ReturnType<typeof validateSettingsDoc>): string =>
-    "error" in verdict ? verdict.error : "";
-
-  test("unknown top-level keys are errors naming the source", () => {
+  test("unknown top-level keys are a problem naming the source and the known sections", () => {
     const { io } = captureIo();
-    const err = errorOf(validateSettingsDoc({ labls: [] }, "repos/x.yml", new Set(), io));
-    expect(err).toContain("repos/x.yml");
-    expect(err).toContain("labls");
+    expect(validateSettingsDoc({ labls: [] }, "repos/x.yml", SectionSelection.ALL, io)).toEqual(
+      err({
+        code: "settings-unknown-sections",
+        source: "repos/x.yml",
+        unknown: ["labls"],
+        known: SECTION_KEYS,
+      }),
+    );
   });
 
-  test("non-mapping documents are rejected", () => {
-    const { io } = captureIo();
-    expect(errorOf(validateSettingsDoc([], "f.yml", new Set(), io))).toContain("a list");
+  test("an unknown underscore key is a problem under every allowlist, and it outranks the unknown sections; the document directive passes", () => {
+    const { io, annotations } = captureIo();
+    const doc = { _notes: "private", _layerin: "replace", labls: [], repository: {} };
+    const refused = err({
+      code: "settings-unknown-directives" as const,
+      source: "f.yml",
+      unknown: ["_notes", "_layerin"],
+    });
+    expect(validateSettingsDoc(doc, "f.yml", SectionSelection.ALL, io)).toEqual(refused);
+    // Outside a `sections` allowlist an unknown SECTION only warns; the underscore rule has no such downgrade.
+    expect(
+      validateSettingsDoc(
+        doc,
+        "f.yml",
+        SectionSelection.of({ only: ["repository"] })._unsafeUnwrap(),
+        io,
+      ),
+    ).toEqual(refused);
+    expect(annotations).toEqual([]);
+    expect(
+      validateSettingsDoc(
+        { _layering: "replace", repository: {} },
+        "f.yml",
+        SectionSelection.ALL,
+        io,
+      ).isOk(),
+    ).toBe(true);
   });
 
-  test("a YAML-tagged top-level value (a Date) is rejected, never branded", () => {
-    // parse("!!timestamp ...") returns a Date - an object with no keys - and
-    // branding it valid would turn the whole document into a silent green
-    // no-op. Only a plain-prototype mapping may pass the boundary.
+  test.each<[what: string, doc: unknown, shape: TopLevelShape]>([
+    ["a list", [], "list"],
+    ["null", null, "null"],
+    ["a string", "labels", "string"],
+    ["a number", 7, "number"],
+  ])("a non-mapping document (%s) is rejected with its shape", (_what, doc, shape) => {
     const { io } = captureIo();
-    const err = errorOf(validateSettingsDoc(new Date(0), "f.yml", new Set(), io));
-    expect(err).toContain("plain YAML mapping");
-    expect(err).toContain("!!timestamp");
-    expect(errorOf(validateSettingsDoc(new Set(["a"]), "f.yml", new Set(), io))).toContain(
-      "plain YAML mapping",
+    expect(validateSettingsDoc(doc, "f.yml", SectionSelection.ALL, io)).toEqual(
+      err({ code: "settings-not-mapping", source: "f.yml", shape }),
+    );
+  });
+
+  test.each<[what: string, doc: unknown]>([
+    ["a Date", new Date(0)],
+    ["a Set", new Set(["a"])],
+  ])("a YAML-tagged top-level value (%s) is rejected, never branded", (_what, doc) => {
+    // parse("!!timestamp ...") returns a Date, an object with no keys; branding it valid would turn the whole document into a silent green no-op.
+    const { io } = captureIo();
+    expect(validateSettingsDoc(doc, "f.yml", SectionSelection.ALL, io)).toEqual(
+      err({ code: "settings-not-plain-mapping" as const, source: "f.yml" }),
     );
   });
 
   test("a valid document comes back branded, ready for runForRepo", () => {
     const { io } = captureIo();
     const doc = { repository: { has_wiki: false } };
-    const verdict = validateSettingsDoc(doc, "s.yml", new Set(), io);
-    if ("error" in verdict) {
-      throw new Error(`expected the document to validate: ${verdict.error}`);
-    }
-    // The brand is compile-time only: the value is the same document.
-    expect(verdict.settings).toBe(doc as unknown as typeof verdict.settings);
+    // The brand is compile-time only; the value is zod's parsed copy.
+    const branded: unknown = validateSettingsDoc(
+      doc,
+      "s.yml",
+      SectionSelection.ALL,
+      io,
+    )._unsafeUnwrap();
+    expect(branded).toEqual(doc);
+    expect(branded).not.toBe(doc);
   });
 });
 
-describe("worstOf", () => {
-  test("failed outranks everything; clean is the floor in check mode", () => {
-    expect(worstOf([{ result: "clean" }, { result: "failed" }, { result: "drift" }], true)).toBe(
-      "failed",
-    );
-    expect(worstOf([{ result: "clean" }, { result: "drift" }], true)).toBe("drift");
-    expect(worstOf([], true)).toBe("clean");
-    expect(worstOf([], false)).toBe("applied");
-  });
-});
-
-describe("readOnlyClient", () => {
-  const READ_OP = {
-    name: "RepoToggles",
-    kind: "read",
-    query: "query RepoToggles { viewer { login } }",
-  } as const;
-  const WRITE_OP = {
-    name: "UpdateToggles",
-    kind: "write",
-    query: "mutation UpdateToggles { x }",
-  } as const;
-
-  test("GETs and GraphQL reads pass through to the wrapped client", async () => {
-    const api = new MockApi({
-      "GET /repos/o/r": { data: { ok: true } },
-      "GRAPHQL RepoToggles": { data: { viewer: { login: "bot" } } },
-    });
-    const probe = readOnlyClient(api);
-    expect(await probe.tryRequest("GET", "/repos/o/r")).toEqual({ data: { ok: true } });
-    expect(await probe.tryGraphql(READ_OP, {}, "o/r")).toEqual({
-      data: { viewer: { login: "bot" } },
-    });
-    expect(api.calls).toHaveLength(2);
-  });
-
-  test("a non-GET REST request throws before reaching the wire", () => {
-    const api = new MockApi({}, { unroutedMutations: "succeed" });
-    const probe = readOnlyClient(api);
-    expect(() => probe.tryRequest("PATCH", "/repos/o/r", {})).toThrow(
-      /PATCH \/repos\/o\/r was attempted in check mode.*read-only in check mode/,
-    );
-    expect(api.calls).toHaveLength(0);
-  });
-
-  test("a GraphQL write throws before reaching the wire", () => {
-    const api = new MockApi({}, { unroutedMutations: "succeed" });
-    const probe = readOnlyClient(api);
-    expect(() => probe.tryGraphql(WRITE_OP, {}, "o/r")).toThrow(
-      /GRAPHQL UpdateToggles \(a write operation\) was attempted in check mode.*read-only/,
-    );
-    expect(api.calls).toHaveLength(0);
-  });
-
-  test("preflight rethrows a probe write attempt instead of swallowing it", async () => {
-    // A section handler that writes during the read-only probe is a bug the
-    // APPLY pass can never resurface (the same write is legitimate there),
-    // so preflightProbe must fail the run loudly - unlike ordinary probe
-    // errors, which it ignores. Driven through a synthetic section via the
-    // injectable `active` list.
-    const api = new MockApi({}, { unroutedMutations: "succeed" });
-    const buggySection = {
-      key: "repository",
-      permission: { repo: ["administration"] },
-      endpoints: {},
-      undeclaredDefault: "untouched",
-      shape: { safeParse: () => ({ success: true }) },
-      async run(ctx: { api: GithubClient }) {
-        await ctx.api.tryRequest("PATCH", "/repos/o/r", { has_wiki: false });
-        return { changes: [], drift: [], notes: [] };
-      },
-    } as unknown as (typeof SECTIONS)[number];
+describe("preflightProbe", () => {
+  test("preflight swallows an ordinary probe error, and the section loop reports it as the section's failure", async () => {
+    // A section cannot write during the probe (its port binds reads only), so the only preflight-specific outcome is a denial.
+    const failure = "some transient probe failure";
+    const planSpy = spyOn(pagesSection, "plan").mockRejectedValue(new Error(failure));
+    const api = new MockApi({});
     const repoRef = { owner: "o", name: "r", slug: "o/r" };
-    await expect(
-      preflightProbe(api, repoRef, [buggySection], { repository: {} } as SettingsFile),
-    ).rejects.toThrow(/preflight: repository: PATCH \/repos\/o\/r was attempted in check mode/);
-    // An ordinary probe error is still swallowed (the apply pass surfaces it).
-    const throwingSection = {
-      ...buggySection,
-      async run() {
-        throw new Error("some transient probe failure");
-      },
-    } as unknown as (typeof SECTIONS)[number];
-    await expect(
-      preflightProbe(api, repoRef, [throwingSection], { repository: {} } as SettingsFile),
-    ).resolves.toEqual([]);
+    const settings = validated({ pages: { build_type: "workflow" } });
+    await expect(preflightProbe(api, repoRef, [pagesSection], settings)).resolves.toEqual([]);
+    const { io, annotations } = captureIo();
+    const result = await runForRepo(api, opts({ settings }), io);
+    expect(result.result).toBe("failed");
+    expect(result.outcomes).toEqual([
+      { key: "pages", status: "failed", detail: [`pages: ${failure}`] },
+    ]);
+    expect(annotations).toContain(`error: pages: ${failure}`);
+    // The explicit probe, then runForRepo's own preflight, then the section loop.
+    expect(planSpy).toHaveBeenCalledTimes(3);
+    planSpy.mockRestore();
+  });
+});
+
+describe("runForRepo plan sections", () => {
+  const WORKFLOWS_LIST = "GET /repos/o/r/actions/workflows?per_page=100&page=1";
+  const live = {
+    total_count: 2,
+    workflows: [
+      { id: 1, name: "CI", path: ".github/workflows/ci.yml", state: "active" },
+      { id: 2, name: "Old", path: ".github/workflows/old.yml", state: "disabled_manually" },
+    ],
+  };
+  const drifting = validated({
+    workflows: [
+      { path: "ci.yml", state: "disabled" },
+      { path: "missing.yml", state: "active" },
+    ],
   });
 
-  test("runForRepo's check-mode context refuses writes end to end", async () => {
-    // The real registry never writes in check mode (check-purity.test.ts),
-    // so the wrap is observable only through a read still passing: the run
-    // completes clean/drift with zero mutations on the wire.
-    const api = new MockApi({ "GET /repos/o/r": { data: { description: "live" } } });
+  test("check mode renders the plan as drift and issues zero writes even with drift", async () => {
+    // The fake would ACCEPT a write (unroutedMutations: succeed), so a write reaching it would be recorded, not thrown: the zero is the proof.
+    const api = new MockApi({ [WORKFLOWS_LIST]: { data: live } }, { unroutedMutations: "succeed" });
+    const { io, logs } = captureIo();
+    const result = await runForRepo(api, opts({ mode: "check", settings: drifting }), io);
+    expect(result.result).toBe("drift");
+    expect(result.outcomes).toEqual([
+      {
+        key: "workflows",
+        status: "drift",
+        detail: [
+          'workflows[ci.yml]: declared "disabled" != live "active"; apply will disable the workflow',
+          expect.stringContaining(
+            "workflows[missing.yml]: declared in the settings file but no workflow",
+          ),
+        ],
+      },
+    ]);
+    expect(logs).toEqual([
+      'drift: workflows[ci.yml]: declared "disabled" != live "active"; apply will disable the workflow',
+      expect.stringMatching(/^drift: workflows\[missing\.yml\]: declared in the settings file/),
+    ]);
+    expect(api.mutations()).toEqual([]);
+  });
+
+  test("apply mode executes the plan and surfaces op-less drift as a note", async () => {
+    const api = new MockApi({ [WORKFLOWS_LIST]: { data: live } }).allowMutations(
+      "PUT /repos/o/r/actions/workflows/*",
+    );
+    const { io, annotations, logs } = captureIo();
+    const result = await runForRepo(api, opts({ settings: drifting }), io);
+    expect(result.result).toBe("applied");
+    expect(api.mutations().map((m) => `${m.method} ${m.path}`)).toEqual([
+      "PUT /repos/o/r/actions/workflows/1/disable",
+    ]);
+    expect(logs).toEqual(['workflows: disabled workflow ".github/workflows/ci.yml"']);
+    expect(result.outcomes).toEqual([
+      {
+        key: "workflows",
+        status: "applied",
+        detail: ['disabled workflow ".github/workflows/ci.yml"'],
+      },
+    ]);
+    expect(annotations).toEqual([
+      expect.stringMatching(
+        /^notice: workflows: workflows\[missing\.yml\]: declared in the settings file/,
+      ),
+    ]);
+  });
+
+  test("a section's read denial arms the preflight barrier, in the concealed 404 style too", async () => {
+    const api = new MockApi({
+      [WORKFLOWS_LIST]: { error: { status: 404, message: "Not Found", body: "" } },
+    });
     const { io } = captureIo();
+    const result = await runForRepo(api, opts({ settings: drifting }), io);
+    expect(result.result).toBe("failed");
+    expect(result.preflightDenied).toEqual([expect.stringMatching(/^workflows: /)]);
+    expect(api.mutations()).toEqual([]);
+  });
+
+  test("a failure mid-plan reports the notes and the operations that already applied", async () => {
+    // The first change is real (no transactions) and, with the op-less note, must show in the log and the failed outcome instead of vanishing behind
+    // the error.
+    const api = new MockApi({
+      [WORKFLOWS_LIST]: { data: live },
+      "PUT /repos/o/r/actions/workflows/1/disable": { data: null },
+      "PUT /repos/o/r/actions/workflows/2/enable": {
+        error: { status: 422, message: "Unprocessable", body: "" },
+      },
+    });
+    const { io, logs, annotations } = captureIo();
     const result = await runForRepo(
       api,
-      opts({ mode: "check", settings: validated({ repository: { description: "live" } }) }),
+      opts({
+        settings: validated({
+          workflows: [
+            { path: "ci.yml", state: "disabled" },
+            { path: "old.yml", state: "active" },
+            { path: "missing.yml", state: "active" },
+          ],
+        }),
+      }),
       io,
     );
-    expect(result.result).toBe("clean");
-    expect(api.mutations()).toEqual([]);
+    expect(result.result).toBe("failed");
+    expect(api.mutations()).toHaveLength(2);
+    expect(logs).toEqual(['workflows: disabled workflow ".github/workflows/ci.yml"']);
+    expect(annotations).toEqual([
+      expect.stringMatching(/^notice: workflows: workflows\[missing\.yml\]/),
+      expect.stringContaining("PUT /repos/o/r/actions/workflows/2/enable: 422"),
+    ]);
+    expect(result.outcomes).toEqual([
+      {
+        key: "workflows",
+        status: "failed",
+        detail: [
+          expect.stringContaining("workflows[missing.yml]"),
+          'disabled workflow ".github/workflows/ci.yml"',
+          expect.stringContaining("PUT /repos/o/r/actions/workflows/2/enable: 422"),
+        ],
+      },
+    ]);
+  });
+
+  describe("a stubbed plan", () => {
+    // A section's plan is stubbed through the erased view so the tests can hand the orchestrator tolerate, facet, and response-rendering ops
+    // directly. Declarations are frozen at registration, so a tolerance rides an endpoint that already declares the status: interaction_limits'
+    // put and remove both declare 409.
+    let stubbed: { mockRestore(): void } | undefined;
+    afterEach(() => {
+      stubbed?.mockRestore();
+    });
+    const stub = (section: SectionModule, ...ops: SectionPlan["ops"]) => {
+      // A restored spy no longer intercepts, so each test arms its own.
+      stubbed = spyOn(section, "plan").mockResolvedValue({
+        ops: ops as never,
+        notes: [],
+        drift: [],
+      });
+    };
+    const disabling = (workflowId: string): SectionPlan["ops"][number] => ({
+      role: "disable",
+      params: { workflow_id: workflowId },
+      drift: [`workflows[${workflowId}]: drifted`],
+      change: `disabled workflow ${workflowId}`,
+    });
+    const tolerating = (
+      role: "put" | "remove",
+      outcome: (error: { status: number }) => { note: string } | { failure: string },
+    ): SectionPlan["ops"][number] => ({
+      role,
+      params: {},
+      drift: ["interaction_limits.limit: drifted"],
+      change: `${role} the interaction limit`,
+      tolerate: { statuses: [409], outcome },
+    });
+    const limited = validated({ interaction_limits: { limit: "collaborators_only" } });
+    const NOTE = "an organization limit overrides this one, so it was not set (409)";
+    const FAILURE = "an organization limit holds (409); clear it first";
+    const busy = () =>
+      new MockApi({
+        "GET /repos/o/r/interaction-limits": { data: {} },
+        "PUT /repos/o/r/interaction-limits": {
+          error: { status: 409, message: "Conflict", body: "" },
+        },
+        "DELETE /repos/o/r/interaction-limits": {
+          error: { status: 409, message: "Conflict", body: "" },
+        },
+      });
+
+    test("an unverifiable facet is a check-mode note beside a clean drift list, and apply renders only the change", async () => {
+      const REASON = "GitHub never echoes the workflow token back, so check cannot verify it";
+      stub(workflowsSection, {
+        role: "disable",
+        params: { workflow_id: "1" },
+        drift: { unverifiable: REASON, lines: [] },
+        change: "re-sent the workflow token",
+      });
+      const checked = captureIo();
+      const check = await runForRepo(
+        new MockApi({ [WORKFLOWS_LIST]: { data: live } }, { unroutedMutations: "succeed" }),
+        opts({ mode: "check", settings: drifting }),
+        checked.io,
+      );
+      expect(check.result).toBe("clean");
+      expect(checked.logs).toEqual([]);
+      expect(checked.annotations).toEqual([`notice: workflows: ${REASON}`]);
+      expect(check.outcomes).toEqual([{ key: "workflows", status: "clean", detail: [REASON] }]);
+      const applied = captureIo();
+      const api = new MockApi({ [WORKFLOWS_LIST]: { data: live } }).allowMutations(
+        "PUT /repos/o/r/actions/workflows/1/disable",
+      );
+      const apply = await runForRepo(api, opts({ settings: drifting }), applied.io);
+      expect(apply.result).toBe("applied");
+      expect(api.mutations().map((m) => m.path)).toEqual([
+        "/repos/o/r/actions/workflows/1/disable",
+      ]);
+      expect(applied.annotations).toEqual([]);
+      expect(applied.logs).toEqual(["workflows: re-sent the workflow token"]);
+    });
+
+    test("a tolerated note reaches the applied outcome's detail and the annotations", async () => {
+      stub(
+        interactionLimitsSection,
+        tolerating("put", (error) => ({
+          note: `an organization limit overrides this one, so it was not set (${error.status})`,
+        })),
+      );
+      const { io, annotations, logs } = captureIo();
+      const result = await runForRepo(busy(), opts({ settings: limited }), io);
+      expect(result.result).toBe("applied");
+      expect(logs).toEqual([]);
+      expect(annotations).toEqual([`notice: interaction_limits: ${NOTE}`]);
+      expect(result.outcomes).toEqual([
+        { key: "interaction_limits", status: "applied", detail: [NOTE] },
+      ]);
+    });
+
+    test("a tolerated note survives a failure, beside the outcome's own failure text", async () => {
+      stub(
+        interactionLimitsSection,
+        tolerating("put", () => ({ note: NOTE })),
+        tolerating("remove", () => ({ failure: FAILURE })),
+      );
+      const { io, annotations } = captureIo();
+      const result = await runForRepo(busy(), opts({ settings: limited }), io);
+      expect(result.result).toBe("failed");
+      // Both requests were refused, so nothing landed and no partial-mutation suffix renders.
+      expect(annotations).toEqual([
+        `notice: interaction_limits: ${NOTE}`,
+        `error: interaction_limits: ${FAILURE}`,
+      ]);
+      expect(result.outcomes).toEqual([
+        {
+          key: "interaction_limits",
+          status: "failed",
+          detail: [NOTE, `interaction_limits: ${FAILURE}`],
+        },
+      ]);
+    });
+
+    test("a change thunk failing after its request landed reports a partial mutation, not a clean failure", async () => {
+      // The PUT landed, then the thunk threw: the repository changed, and the failure must say so instead of reading as "nothing was written".
+      stub(workflowsSection, {
+        ...disabling("1"),
+        change: () => {
+          throw new Error("the echo still reads active");
+        },
+      });
+      const api = new MockApi({ [WORKFLOWS_LIST]: { data: live } }).allowMutations(
+        "PUT /repos/o/r/actions/workflows/1/disable",
+      );
+      const { io, annotations, logs } = captureIo();
+      const result = await runForRepo(api, opts({ settings: drifting }), io);
+      expect(result.result).toBe("failed");
+      expect(api.mutations()).toHaveLength(1);
+      expect(logs).toEqual([]);
+      const partial =
+        "error: workflows: the echo still reads active (1 request landed before this failure, so the repository is partially applied)";
+      expect(annotations).toEqual([partial]);
+      expect(result.outcomes).toEqual([
+        { key: "workflows", status: "failed", detail: [partial.slice("error: ".length)] },
+      ]);
+    });
+  });
+
+  test("a denial after an operation landed fails the run even under the warn policy", async () => {
+    // A skip would claim the repository was left alone; it was not, so the policy cannot soften it.
+    const api = new MockApi({
+      [WORKFLOWS_LIST]: { data: live },
+      "PUT /repos/o/r/actions/workflows/1/disable": { data: null },
+      "PUT /repos/o/r/actions/workflows/2/enable": {
+        error: { status: 403, message: "Resource not accessible", body: "" },
+      },
+    });
+    const { io, annotations, logs } = captureIo();
+    const result = await runForRepo(
+      api,
+      opts({
+        onMissingPermission: "warn",
+        settings: validated({
+          workflows: [
+            { path: "ci.yml", state: "disabled" },
+            { path: "old.yml", state: "active" },
+          ],
+        }),
+      }),
+      io,
+    );
+    expect(result.result).toBe("failed");
+    expect(skippedSectionKeys(result.outcomes)).toEqual([]);
+    expect(logs).toEqual(['workflows: disabled workflow ".github/workflows/ci.yml"']);
+    expect(annotations).toEqual([
+      expect.stringMatching(
+        /^error: workflows: partially applied \(1 request landed before the denial/,
+      ),
+    ]);
+    expect(result.outcomes).toEqual([
+      {
+        key: "workflows",
+        status: "failed",
+        detail: [
+          'disabled workflow ".github/workflows/ci.yml"',
+          expect.stringContaining("PUT /repos/o/r/actions/workflows/2/enable"),
+        ],
+        httpStatus: 403,
+      },
+    ]);
+    // The control: the same denial with NOTHING landed is still a skip.
+    const untouched = new MockApi({
+      [WORKFLOWS_LIST]: { data: live },
+      "PUT /repos/o/r/actions/workflows/1/disable": {
+        error: { status: 403, message: "Resource not accessible", body: "" },
+      },
+    });
+    const skipped = await runForRepo(
+      untouched,
+      opts({
+        onMissingPermission: "warn",
+        settings: validated({ workflows: [{ path: "ci.yml", state: "disabled" }] }),
+      }),
+      captureIo().io,
+    );
+    expect(skipped.result).toBe("partial");
+    expect(skippedSectionKeys(skipped.outcomes)).toEqual(["workflows"]);
   });
 });

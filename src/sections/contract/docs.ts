@@ -1,0 +1,75 @@
+/**
+ * Declared beside each section as src/sections/<key>/<key>.docs.yml and loaded by the docs registry.
+ * Documentation only: nothing bundled from src/main.ts may import this file or the registry (a unit test walks the import graph).
+ */
+
+import { readFileSync } from "node:fs";
+import { parse } from "yaml";
+import { z } from "zod";
+import { renamedKeyError } from "../shared/renamed-key.js";
+
+/** One COVERAGE.md Supported row: the GitHub surface it covers and how the section handles it. */
+const CoverageRow = z
+  .strictObject({
+    /** The Area cell: the GitHub feature, usually a docs link with the fields it spans. */
+    area: z.string().min(1),
+    /** Settings keys this row covers, rendered as "section (keys)"; omitted for a whole-section row. */
+    keys: z.string().min(1).optional(),
+    /** The Notes cell: endpoints, semantics, and caveats. */
+    notes: z.string().min(1),
+  })
+  .readonly();
+
+/**
+ * Keyed as .github/scripts/lib/schema-descriptions.ts spells a site (`LabelConfig.color`,
+ * `SettingsFile.labels`, `UndeclaredPolicyList<*>.entries`).
+ */
+const SchemaDescriptions = z.record(z.string().min(1), z.string().min(1)).readonly();
+
+const sectionDocsKeyError = renamedKeyError(
+  "Sections table cells",
+  "readme",
+  "sections_table",
+  "(the table renders into docs/reference/sections.md)",
+);
+
+export const SectionDocs = z
+  .strictObject(
+    {
+      /** The section's two authored cells in the Sections table on docs/reference/sections.md. */
+      sections_table: z
+        .strictObject({
+          /** The Endpoints cell: the API surface the section calls, in prose. */
+          endpoints: z.string().min(1),
+          /** The Notes cell: semantics, caveats, and the knob in passing. */
+          notes: z.string().min(1),
+        })
+        .readonly(),
+      // At least one: a section with no coverage row does not exist to the inventory, so the shape refuses [].
+      coverage: z.tuple([CoverageRow], CoverageRow).readonly(),
+      /** The section's own property on the document root and every definition its slice declares. */
+      schema: SchemaDescriptions,
+    },
+    { error: sectionDocsKeyError },
+  )
+  .readonly();
+export type SectionDocs = z.infer<typeof SectionDocs>;
+
+/** A docs file carrying schema descriptions only: the shared factories' and the document root's. */
+export const SchemaOnlyDocs = z.strictObject({ schema: SchemaDescriptions }).readonly();
+
+export function readDocsYaml<T>(path: string, schema: z.ZodType<T>): T {
+  let loaded: unknown;
+  try {
+    loaded = parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `${path} is not valid YAML: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const result = schema.safeParse(loaded);
+  if (!result.success) {
+    throw new Error(`${path} is not a valid docs document:\n${z.prettifyError(result.error)}`);
+  }
+  return result.data;
+}

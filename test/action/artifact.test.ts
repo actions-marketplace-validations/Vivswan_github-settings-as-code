@@ -1,0 +1,43 @@
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { DefaultArtifactClient } from "@actions/artifact";
+import { generateX25519Identity, identityToRecipient } from "age-encryption";
+import { actionsArtifactUploader } from "../../src/action/artifact.js";
+import { deliverArtifactReport } from "../../src/report/artifact-report.js";
+
+describe("the action's uploader without a runtime token", () => {
+  const savedToken = process.env.ACTIONS_RUNTIME_TOKEN;
+
+  afterEach(() => {
+    if (savedToken === undefined) {
+      delete process.env.ACTIONS_RUNTIME_TOKEN;
+    } else {
+      process.env.ACTIONS_RUNTIME_TOKEN = savedToken;
+    }
+  });
+
+  test("missing token yields exactly ONE warning and never invokes the artifact client", async () => {
+    delete process.env.ACTIONS_RUNTIME_TOKEN;
+    // Reaching the client would double-warn (it warns before it throws); its @actions/core import is a named binding a namespace spy cannot observe,
+    // so the client's entry point is watched.
+    const uploadSpy = spyOn(DefaultArtifactClient.prototype, "uploadArtifact");
+    try {
+      const recipient = await identityToRecipient(await generateX25519Identity());
+      const result = await deliverArtifactReport(
+        actionsArtifactUploader,
+        "secret document",
+        recipient,
+      );
+
+      // The uploader's reason names the missing token; deliverArtifactReport's frame around it names the channel and the
+      // remedy (test/report/artifact-report.test.ts holds the frame itself).
+      expect(result).toEqual({
+        warning: expect.stringMatching(
+          /^could not upload the private report artifact: .*no ACTIONS_RUNTIME_TOKEN in the environment.*private-report: none/,
+        ),
+      });
+      expect(uploadSpy).toHaveBeenCalledTimes(0);
+    } finally {
+      uploadSpy.mockRestore();
+    }
+  });
+});

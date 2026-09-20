@@ -1,16 +1,21 @@
 /**
- * The teams section's fuzz generator fragment, aggregated by
- * test/e2e/generators.ts. Imports only the test-tree leaf seams
- * (gen-support.ts, prng.ts) - the src -> test inversion is deliberate; the
- * bundle entry is src/main.ts, so this file never reaches lib/index.js.
+ * The teams fuzz generator fragment. It imports test-tree seams on purpose: the bundle entry is
+ * src/main.ts, so this file never reaches lib/index.js.
  */
 
-import type { Json } from "../../../test/e2e/gen-support.js";
+import { generatorFromSlice, type Json, uniqueBy } from "../../../test/e2e/gen-support.js";
 import type { Rng } from "../../../test/e2e/prng.js";
+import { TeamConfig } from "./schema.js";
+
+const genTeam = generatorFromSlice(TeamConfig, {
+  fields: {
+    name: (rng) => rng.pick(["core", "reviewers", "ops"]),
+    permission: (rng) => rng.pick(["pull", "push", "maintain", "admin"]),
+  },
+  present: { permission: 0.8 },
+});
 
 export function genTeams(rng: Rng): Json[] {
-  return Array.from({ length: rng.int(2) + 1 }, (_, i) => ({
-    name: `${rng.pick(["core", "reviewers", "ops"])}-${i}`,
-    permission: rng.pick(["pull", "push", "maintain", "admin"]),
-  }));
+  const teams = Array.from({ length: rng.int(2) + 1 }, () => genTeam(rng));
+  return uniqueBy(teams, ["name"], (slug) => slug.toLowerCase());
 }

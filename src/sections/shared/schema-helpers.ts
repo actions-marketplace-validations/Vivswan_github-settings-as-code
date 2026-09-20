@@ -1,38 +1,69 @@
 /**
- * Leaf schema helpers shared by the root src/schema.ts and the per-section
- * schema modules under src/sections/<key>/schema.ts. This module imports
- * ONLY zod: a section schema importing root schema.ts back would be a cycle
- * whose top-level const evaluation TDZ-crashes at import time, so everything
- * both sides need lives here. Selector fan-out for this file is declared in
- * SHARED_FAN_OUT (.github/scripts/changed-sections.ts).
+ * Imports only zod, renamed-key.ts, and the text leaf: a section schema importing src/schema.ts back would be a cycle
+ * whose top-level consts TDZ-crash at import time, so everything both sides need lives here.
+ * The smoke selector (.github/scripts/changed-sections.ts) derives this file's section fan-out from the import graph.
  */
 
 import { z } from "zod";
+import { agree } from "../../text.js";
+import { renamedKeyError } from "./renamed-key.js";
 
-const UndeclaredPolicySchema = z
-  .enum(["keep", "delete"])
-  .describe("What apply does to live resources the settings file does not declare.")
-  .meta({ id: "UndeclaredPolicy" });
-
-const WRAPPER_DOC =
-  "The wrapped form of a list, overriding what happens to live resources the file does not declare. The plain array form keeps the list's own default policy (for a top-level section that is the section default, and a multi-repo defaults file can set it; a nested list such as environments[].variables has its own fixed default and never inherits one); this wrapper can set it explicitly, and with `undeclared` omitted it behaves exactly like the plain array. The wrapper is this action's own vocabulary (nothing here passes through to GitHub), so its keys are strict: anything besides `undeclared` and `entries` is rejected upfront as a typo.";
+const UndeclaredPolicySchema = z.enum(["keep", "delete"]).meta({ id: "UndeclaredPolicy" });
 
 /**
- * The knobbed form of a list section's value: the plain entry array, or the
- * strict {undeclared, entries} wrapper (published under the definition name
- * "UndeclaredPolicyList<Entry>", matching the UndeclaredPolicyList type).
- * loosen() recognizes this union and rewraps it with the routed check that
- * keeps precise per-entry issue paths. The wrapper's definition name derives
- * from the entry schema's own .meta({id}), so the document composition and a
- * section's runtime derivation can never label the same entry differently -
- * an entry without an id (or a .describe() clone, which sheds it) throws at
- * MODULE LOAD, not typecheck. Each call mints a fresh wrapper registered
- * under the same id; that is fine for z.toJSONSchema(SettingsFile) (it
- * resolves metadata by schema identity), but a generator iterating
- * z.globalRegistry's id map would see only the last-registered wrapper -
- * keep the published schema on the single-schema path.
+ * engine/layers.ts declares the same value set in its own Layering type and acts on the parsed value, so a
+ * new value lands in both. Described in shared.docs.yml and src/schema.docs.yml.
  */
-export function knobbed<T extends z.ZodType>(entry: T) {
+export const LayeringSchema = z.enum(["merge", "replace"]);
+
+const renamedPolicyKeyError = renamedKeyError(
+  "wrapper's policy",
+  "undeclared",
+  "_undeclared",
+  "in v3 (a directive, like _layering) - write _undeclared: keep or _undeclared: delete",
+);
+
+/**
+ * The wrapper's unrecognized keys, one clause per kind, joined: the pre-v3 policy spelling names its rename, and
+ * any other underscore key names the two directives, since a wrapper takes no private notes either (the document
+ * level says the same in src/problem.ts). A misspelled entry field beside them stays on zod's own line, so the
+ * directives clause names the underscore keys it is about whenever the list holds anything else.
+ */
+function wrapperKeyError(issue: z.core.$ZodRawIssue): string | undefined {
+  if (issue.code !== "unrecognized_keys") {
+    return undefined;
+  }
+  const renamed = renamedPolicyKeyError(issue);
+  const directives = issue.keys.filter((key) => key.startsWith("_"));
+  if (directives.length === 0) {
+    return renamed;
+  }
+  const quoted = (keys: readonly string[]) => keys.map((key) => JSON.stringify(key)).join(", ");
+  const clause =
+    `${directives.length < issue.keys.length ? `${quoted(directives)}: ` : ""}the wrapper's directives are ` +
+    '"_undeclared" and, on a top-level section, "_layering", and nothing else - there are no ' +
+    "private-note keys. Remove the key, or keep the note as a YAML comment";
+  return renamed === undefined
+    ? `${agree(issue.keys.length, "Unrecognized key", "Unrecognized keys")}: ${quoted(issue.keys)}; ${clause}`
+    : `${renamed}; ${clause}`;
+}
+
+/**
+ * loosen() (../contract/module.ts) recognizes this union and rewraps it with the routed check that keeps
+ * per-entry issue paths. The wrapper's definition name derives from the entry's own .meta({id}), so the
+ * document composition and a section's runtime derivation can never label one entry differently.
+ *
+ *   entry without an id                        -> throws at MODULE LOAD, not typecheck
+ *   z.toJSONSchema(SettingsFile)               -> fine: it resolves metadata by schema identity
+ *   a generator over z.globalRegistry's ids    -> sees only the last-registered wrapper (each call mints a fresh one under the same id)
+ */
+function knobbedList<T extends z.ZodType, S extends z.core.$ZodShape>(
+  entry: T,
+  shape: (knobs: {
+    _undeclared: z.ZodOptional<typeof UndeclaredPolicySchema>;
+    entries: z.ZodArray<T>;
+  }) => S,
+) {
   const entryName = z.globalRegistry.get(entry)?.id;
   if (entryName === undefined) {
     throw new Error(
@@ -40,32 +71,36 @@ export function knobbed<T extends z.ZodType>(entry: T) {
     );
   }
   const wrapper = z
-    .strictObject({
-      undeclared: UndeclaredPolicySchema.describe(
-        'What apply does to live resources `entries` does not declare: "delete" removes them, "keep" leaves them alone and surfaces each as a note. Omitted, the list\'s own default applies.',
-      ).optional(),
-      entries: z
-        .array(entry)
-        .describe("The declared entries, exactly as the plain array form lists them."),
-    })
-    .describe(WRAPPER_DOC)
+    .strictObject(
+      shape({ _undeclared: UndeclaredPolicySchema.optional(), entries: z.array(entry) }),
+      { error: wrapperKeyError },
+    )
     .meta({ id: `UndeclaredPolicyList<${entryName}>` });
   return z.union([z.array(entry), wrapper]);
 }
 
-export const SEALED_SECRET_VALUE_DOC =
-  "A whole-value `$NAME` reference to an environment variable holding the secret - never a literal (settings files are committed plaintext). Resolved from the action step's env at run time and sealed with a libsodium sealed box before upload; GitHub cannot return the value, so check mode verifies existence only and apply re-seals it on every run.";
+/**
+ * Only a TOP-LEVEL wrapper takes `_layering`: the layered merge combines sections, so only a
+ * section-level wrapper has layers below it to address.
+ */
+export function knobbed<T extends z.ZodType>(entry: T) {
+  return knobbedList(entry, (knobs) => ({ ...knobs, _layering: LayeringSchema.optional() }));
+}
 
-export const SECRET_NAME_DOC =
-  "The secret name, the natural key; compared case-insensitively and written uppercase.";
+/**
+ * A nested list (environments[].variables) is replaced wholesale by a higher layer, so `_layering`
+ * would be accepted and never act; the wrapper rejects it.
+ */
+export function nestedKnobbed<T extends z.ZodType>(entry: T) {
+  return knobbedList(entry, (knobs) => knobs);
+}
 
 /** A repository-scope sealed secret entry (name + `$NAME` reference value). */
-export function sealedSecretConfig(id: string, description: string) {
+export function sealedSecretConfig(id: string) {
   return z
     .object({
-      name: z.string().describe(SECRET_NAME_DOC),
-      value: z.string().describe(SEALED_SECRET_VALUE_DOC),
+      name: z.string(),
+      value: z.string(),
     })
-    .describe(description)
     .meta({ id });
 }

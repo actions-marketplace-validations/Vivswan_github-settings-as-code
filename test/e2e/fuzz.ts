@@ -1,24 +1,22 @@
 /**
- * The fuzz CLI: `bun test/e2e/fuzz.ts`. Each iteration generates a random
- * scenario, predicts its outcome CLASSES with the oracle, runs the real bundle
- * against the mock, and asserts the observed outcome falls in the predicted
- * class. The oracle never predicts drift content, only the class, so a
- * disagreement means a real engine or oracle bug, not a flaky expectation.
+ * The oracle predicts outcome CLASSES, never drift content, so a disagreement with the bundle's observed outcome is
+ * an engine or oracle bug, never a flaky expectation. Every iteration is a pure function of its seed and the
+ * --sections flag; a failure replays with its printed `replay:` line.
  *
- * Every iteration is a pure function of its seed: the per-iteration seed is
- * printed, so any failure replays with `--seed <iterSeed> --iterations 1`.
- *
- * Modes mixed into the stream: standard single-repo (per-section outcome
- * classes, convergence on a fully-granted apply), input fuzz (a mangled doc must
- * fail before any API contact), chaos fuzz (a single corrupt response is retried
- * away so the run converges, OR a persistent corruption outlasts the retries and
- * the run fails loudly), multi-repo fuzz (per-target outcome classes plus the
- * worst-of rollup), and discovery fuzz (a `repos: "*"` pool filtered by the
- * independent predictDiscovery mirror).
+ * standard   -> per-section outcome classes; a fully-granted apply also proves the fixpoint
+ * input      -> a mangled document must fail before any API contact
+ * chaos      -> one corrupt response is absorbed, a persistent one fails loudly
+ * multi      -> per-target outcome classes plus the worst-of rollup
+ * discovery  -> a `repos: "*"` pool filtered by the independent predictDiscovery mirror
+ * merge      -> a layered mode: merge stack whose written document the oracle's fold predicts whole
  */
 
+import { canonicalDocument } from "../../src/engine/canonical.js";
+import { describeOptOut } from "../../src/engine/layers.js";
 import { MAX_RETRIES } from "../../src/github/api.js";
 import { SECTION_KEYS, type SectionKey } from "../../src/schema.js";
+import { endpointPath } from "../../src/sections/contract/endpoints.js";
+import { sectionModule } from "../../src/sections/registry.js";
 import type { LiveWitness, LiveWitnessKind } from "./gen-support.js";
 import {
   canariesOf,
@@ -27,16 +25,21 @@ import {
   genDiscoveryScenario,
   genInvalidSettings,
   genLiveWitness,
+  genMergeScenario,
   genMultiScenario,
   genScenario,
   genSettings,
   INVALID_SETTINGS_CASES,
+  MERGE_REFUSAL_KINDS,
+  type MergeForce,
+  type MergeScenarioMeta,
   type MultiRepoMeta,
   type MultiScenarioMeta,
   NON_MAPPING_YAML,
   presenceLiveState,
   redactionPlaceholder,
   type ScenarioMeta,
+  SECTION_FAULT_FIXTURE,
   SECTION_PRIMARY_READ,
   scenarioSecretEnv,
   UNFAULTABLE_APPLY_SETTINGS,
@@ -54,19 +57,22 @@ import type { LoggedRequest } from "./mock/contract.js";
 import {
   foldRepoResults,
   foldSectionOutcomes,
+  judgePreflightAbort,
   NO_READ_SECTIONS,
   predictDiscovery,
+  predictMerge,
   predictMulti,
   predictOutcomes,
 } from "./oracle.js";
 import { Rng } from "./prng.js";
 import {
   checkLeaks,
-  insertReplay,
+  failureArtifacts,
   markReportTitle,
   parseReposResult,
   parseSummaryOutcomes,
   runScenario,
+  setReplay,
   stripDebugLines,
   stripMaskLines,
 } from "./runner.js";
@@ -74,7 +80,6 @@ import type { Scenario } from "./schema.js";
 
 const FAILURE_CAP = 5;
 
-/** Mix the master seed and an iteration index into a stable per-iteration seed. */
 function iterationSeed(master: number, i: number): number {
   let h = (master ^ (i + 0x9e3779b9)) >>> 0;
   h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
@@ -120,27 +125,18 @@ function parseFlags(argv: string[]): Flags {
   return flags;
 }
 
-/**
- * Log every artifact directory a failing iteration dumped (primary run plus
- * the redaction counterfactual's) and insert the replay block into each
- * report.md, per the fuzz-issue action's failure-report contract.
- */
+/** The runner wrote the curated replay; a fuzz artifact replays by seed, never by name (a fuzz scenario is not a file). */
 function reportArtifacts(result: IterationResult, replay: string): void {
   for (const dir of [result.artifactDir, ...(result.extraArtifactDirs ?? [])]) {
     if (dir === undefined) {
       continue;
     }
     console.log(`    artifact: ${dir}`);
-    insertReplay(dir, replay);
+    setReplay(dir, replay);
   }
 }
 
-/**
- * The master seed and whether it was explicitly pinned: flag, else FUZZ_SEED
- * env, else a crypto-random 32-bit value. `explicit` covers BOTH pinning
- * styles, so replay detection treats `FUZZ_SEED=X --iterations 1` exactly
- * like `--seed X --iterations 1`.
- */
+/** `explicit` covers both pinning styles, so `FUZZ_SEED=X --iterations 1` replays exactly like `--seed X --iterations 1`. */
 function masterSeed(flags: Flags): { seed: number; explicit: boolean } {
   if (flags.seed !== undefined && Number.isFinite(flags.seed)) {
     return { seed: flags.seed >>> 0, explicit: true };
@@ -153,30 +149,20 @@ function masterSeed(flags: Flags): { seed: number; explicit: boolean } {
   return { seed: crypto.getRandomValues(new Uint32Array(1))[0] as number, explicit: false };
 }
 
-/** The facts every iteration reports alongside its pass/fail verdict. */
 interface IterationBase {
   artifactDir?: string;
   /** Artifact dirs beyond the primary run's (the redaction counterfactual). */
   extraArtifactDirs?: string[];
   sections: SectionKey[];
-  /** Mutation classes this run provably reached (witnessed sections only). */
   coverage?: CoverageEvent[];
-  /** The fired fault's endpoint kind/verdict label, for the fault-class histogram. */
   faultClass?: string;
-  /** The fixpoint re-run proof this iteration armed, for the stats counts. */
   proof?: "apply_idempotent" | "converges";
+  mergeFeatures?: string[];
 }
 
-/** An iteration's verdict: a failing one always carries its failure text. */
 type IterationResult = IterationBase &
   ({ ok: true; failure?: never } | { ok: false; failure: string });
 
-/**
- * Fold an iteration's collected problems into its result: ok exactly when the
- * list is empty, else the joined problems behind the caller's failure prefix
- * (e.g. "[persist wrong_shape] "). The one place the ok/failure pair is
- * derived, so the two can never disagree.
- */
 function iterationResult(problems: string[], base: IterationBase, prefix = ""): IterationResult {
   if (problems.length === 0) {
     return { ok: true, ...base };
@@ -185,10 +171,8 @@ function iterationResult(problems: string[], base: IterationBase, prefix = ""): 
 }
 
 /**
- * A mutation class the coverage guard tracks per witnessed section. The write
- * classes come from the mock's request log ("applied" alone does not prove a
- * mutation happened; a successful PATCH in the log does); "clean" is a
- * matching-witness check run that the engine reported clean.
+ * The write classes come from the mock's request log, not the summary: "applied" alone does not prove a
+ * mutation happened, a successful PATCH does.
  */
 type MutationClass = "create" | "update" | "delete" | "clean";
 
@@ -201,19 +185,14 @@ const CLASS_BY_METHOD: Record<string, MutationClass> = {
 };
 
 /**
- * Structural validity of the summary's section table: a header row, a
- * separator row, and data rows that all carry the SAME cell-separator count,
- * with at least `expectedRows` data rows. The engine escapes cells with
- * backslash-then-pipe (markdownCell in src/report/markdown.ts), so a pipe is a real delimiter
- * only after an EVEN run of backslashes - under HOSTILE_NAMES a broken escape
- * changes a row's separator count, the regression class nothing else watches.
+ * A pipe is a delimiter only after an EVEN run of backslashes: the engine escapes cells with
+ * backslash-then-pipe (markdownCell, src/report/markdown.ts); under HOSTILE_NAMES a broken escape changes a row's separator count.
  */
 function summaryTableProblems(summary: string, expectedRows: number): string[] {
   const lines = summary.split("\n").map((line) => line.trim());
   const start = lines.findIndex((line) => line.startsWith("|"));
   if (start === -1) {
-    // A completed run always renders at least the header and separator, even
-    // with zero data rows - absence is an error regardless of expectedRows.
+    // A completed run renders the header and separator even with zero data rows, so absence is an error at any expectedRows.
     return ["summary carries no markdown table"];
   }
   const table: string[] = [];
@@ -241,8 +220,7 @@ function summaryTableProblems(summary: string, expectedRows: number): string[] {
       `summary table has ${table.length} row(s), expected a header + separator + at least ${expectedRows} data row(s)`,
     );
   }
-  // Every separator cell must be a dash run with optional alignment colons -
-  // the loose "any of -:| whitespace" form would accept empty cells.
+  // The loose "any of -:| whitespace" form would accept an empty separator cell.
   const separatorCells = (table[1] ?? "").split("|").slice(1, -1);
   if (separatorCells.length === 0 || !separatorCells.every((cell) => /^\s*:?-+:?\s*$/.test(cell))) {
     problems.push(`summary table separator row is malformed: "${table[1] ?? "(absent)"}"`);
@@ -259,12 +237,17 @@ function summaryTableProblems(summary: string, expectedRows: number): string[] {
   return problems;
 }
 
-/**
- * The mutation classes a run PROVABLY reached: successful (2xx) label and
- * milestone writes from the mock's request log - a denied write mutated
- * nothing and does not count - plus a "clean" event when a matching witness
- * earned a clean check verdict.
- */
+const WITNESS_PATHS: Record<WitnessSection, string> = Object.fromEntries(
+  WITNESS_SECTIONS.map((key) => {
+    const list = sectionModule(key).endpoints.list;
+    if (list === undefined) {
+      throw new Error(`${key} declares no "list" role, so its writes cannot be attributed`);
+    }
+    return [key, endpointPath(list.route).replace("/repos/{owner}/{repo}", "")];
+  }),
+) as Record<WitnessSection, string>;
+
+/** A denied write mutated nothing, so only 2xx writes count as reached mutation classes. */
 function witnessCoverage(
   requests: LoggedRequest[],
   meta: ScenarioMeta,
@@ -276,11 +259,10 @@ function witnessCoverage(
     if (cls === undefined || request.status < 200 || request.status >= 300) {
       continue;
     }
-    const section = request.pathname.includes("/labels")
-      ? "labels"
-      : request.pathname.includes("/milestones")
-        ? "milestones"
-        : undefined;
+    const section = WITNESS_SECTIONS.find((key) => {
+      const path = WITNESS_PATHS[key];
+      return request.pathname.endsWith(path) || request.pathname.includes(`${path}/`);
+    });
     if (section !== undefined) {
       events.push([section, cls]);
     }
@@ -294,14 +276,8 @@ function witnessCoverage(
 }
 
 /**
- * The non-vacuity check every fault-carrying iteration shares: the injected
- * fault must have actually FIRED, or the iteration proved nothing about fault
- * handling. faultsFired snapshots the PRIMARY invocation only - a fault that
- * would first fire during a converges/idempotence re-run deliberately reads
- * as NOT fired - which is exactly right here: the injected budget must be
- * consumed by the run whose exit code and outcomes we asserted. Returns
- * whether the fault fired, so callers record the fault-class histogram only
- * for CONFIRMED firings.
+ * faultsFired covers the PRIMARY invocation only, so a fault that would first fire during a re-run reads
+ * as not fired: the budget must be consumed by the run whose exit code and outcomes were asserted.
  */
 function assertFaultFired(
   faultsFired: Record<string, number>,
@@ -315,39 +291,18 @@ function assertFaultFired(
   return fired;
 }
 
-/**
- * One injected fault as the run cores carry it: the endpoint key it was aimed
- * at and the histogram class label recorded when it provably fired. The two
- * describe the same fault, so they travel as one value - a key without a
- * label (a starved histogram) or a label without a key (dead configuration)
- * cannot be constructed. injectContentsFault returns this exact shape.
- */
+/** The key and its histogram label travel as one value: a key without a label starves the histogram, a label without a key is dead configuration. */
 interface InjectedFault {
   key: string;
   classLabel: string;
 }
 
-/**
- * Run one generated single-repo scenario against its oracle prediction: the
- * shared core of the standard random iteration and the directed witness and
- * fault batteries. A fully-granted apply also asserts convergence (the
- * runner's converges machinery); `opts.fault` adds the fault-fired
- * non-vacuity check.
- */
 async function runPredicted(
   scenario: Scenario,
   meta: ScenarioMeta,
   opts: { fault?: InjectedFault } = {},
 ): Promise<IterationResult> {
   const prediction = predictOutcomes(meta);
-  // The oracle predicts a SET of allowed exit codes; the expectation carries
-  // the whole set, so the runner's own exit-code check asserts membership. A
-  // fully-granted apply is a FIXPOINT: prove it with the runner's
-  // apply-idempotence machinery (second apply exit 0, write-quiet
-  // compare-before-write sections, byte-identical state, then a clean check
-  // run - which subsumes the converges re-run). Fault-carrying iterations
-  // keep the lighter converges proof: the idempotence gate requires no
-  // injected faults.
   const fixpoint = prediction.fullyGranted && meta.mode === "apply";
   const proof: IterationResult["proof"] =
     fixpoint && opts.fault === undefined ? "apply_idempotent" : fixpoint ? "converges" : undefined;
@@ -359,21 +314,24 @@ async function runPredicted(
   const report = await runScenario(scenario);
   const problems: string[] = [];
 
-  // The runner folds the exit-code membership check, mock violations, and
-  // (for converges) the barrier/re-run checks into failures.
   problems.push(...report.failures);
   let faultClass: string | undefined;
   if (opts.fault !== undefined) {
     const fired = assertFaultFired(report.faultsFired, opts.fault.key, problems);
     faultClass = fired ? opts.fault.classLabel : undefined;
   }
-  // Each predicted section must APPEAR in the summary (a predicted section
-  // missing entirely is a silent regression the old `if (got)` guard hid), and
-  // its reported outcome must be in its predicted class. EXCEPTION: when the run
-  // aborts at the preflight barrier (apply + fail policy + a permission-denied
-  // section), the engine renders NO sections, so the summary is empty by design.
+  // A preflight abort reports "failed" over an EMPTY table by design, so the per-section checks and
+  // the result fold (foldSectionOutcomes mirrors orchestrate.ts's rollup) run only on a "ran" verdict.
   const observed = parseSummaryOutcomes(report.summary);
-  if (!prediction.preflightAborts) {
+  const verdict = judgePreflightAbort(prediction.preflightAborts, {
+    summary: report.summary,
+    result: report.outputs.result,
+    stdout: report.stdout,
+  });
+  if (verdict.kind === "contradiction") {
+    problems.push(verdict.problem);
+  }
+  if (verdict.kind === "ran") {
     for (const section of prediction.sections) {
       const got = observed[section.key];
       if (got === undefined) {
@@ -384,32 +342,22 @@ async function runPredicted(
       }
       if (!section.allowed.has(got as never)) {
         problems.push(
-          `${section.key}: observed "${got}" not in predicted {${[...section.allowed].join(",")}} (grade ${section.grade})`,
+          `${section.key}: observed "${got}" not in predicted {${[...section.allowed].join(",")}} (grades ${section.grades.join("|")})`,
         );
       }
     }
-    // SELF-CONSISTENCY: the `result` output must equal the engine's own fold
-    // over the section outcomes it just reported (foldSectionOutcomes mirrors
-    // orchestrate.ts's rollup). Guarded by preflightAborts above: an aborted
-    // run reports "failed" with an EMPTY table by design, which the fold
-    // cannot reproduce.
     const folded = foldSectionOutcomes(Object.values(observed), meta.mode === "check");
     if (report.outputs.result !== folded) {
       problems.push(
         `self-consistency: result output "${report.outputs.result}" != "${folded}" folded from the summary outcomes`,
       );
     }
-    // The summary's section table must be structurally valid markdown: under
-    // HOSTILE_NAMES a broken pipe escape breaks a row's cell count.
     problems.push(...summaryTableProblems(report.summary, prediction.sections.length));
   }
-  // The token-leak and planted-plaintext sweeps run in the RUNNER itself
-  // (primary run and every rerun; see runScenario's centralized leak sweep),
-  // so no fuzz-side sweep exists - a duplicate here would double-report
-  // every failure.
+  // The leak sweeps run in runScenario over the primary run and every rerun; a fuzz-side sweep would double-report.
 
   return iterationResult(problems, {
-    artifactDir: report.artifactDir,
+    artifactDir: failureArtifacts(scenario, report, problems),
     sections: meta.sections,
     coverage: witnessCoverage(report.requests, meta, observed),
     faultClass,
@@ -417,10 +365,6 @@ async function runPredicted(
   });
 }
 
-/**
- * Run one standard (single-repo) iteration: generate, predict, execute, and
- * check the observed outcome against the oracle's allowed classes.
- */
 async function standardIteration(
   seed: number,
   opts: { sections?: SectionKey[] },
@@ -430,12 +374,8 @@ async function standardIteration(
 }
 
 /**
- * A directed witness iteration: one (section, witness kind, mode) with a fully
- * granted token and warn policy, so the witness alone decides the outcome
- * class. The random stream reaches these combinations only probabilistically;
- * this battery makes the mutation-class coverage guard deterministic, so a
- * generator regression that stops producing real witnesses fails the run
- * instead of silently starving the histogram.
+ * Fully granted under warn policy, so the witness alone decides the outcome class. The random stream
+ * reaches these combinations only probabilistically; this battery makes the mutation-class guard deterministic.
  */
 async function witnessIteration(
   seed: number,
@@ -486,16 +426,9 @@ async function witnessIteration(
   return runPredicted(scenario, meta);
 }
 
-/**
- * The specification of one rejection scenario: what the settings file contains
- * (a document or raw text - the structural XOR admits exactly one) and the
- * tokens the action's error must name. Shared by the random input stream and
- * the directed input battery.
- */
 type RejectionSpec = {
   label: string;
   tokens: string[];
-  /** Pinned run mode; absent means a seeded random pick (the fuzz stream). */
   mode?: "apply" | "check";
 } & (
   | { settings: Record<string, unknown>; settingsRaw?: never }
@@ -503,12 +436,8 @@ type RejectionSpec = {
 );
 
 /**
- * Run one settings-rejection scenario: the action must exit 1, its error must
- * contain every expected token, and ZERO requests may reach the mock - a
- * validation or parse error is caught before any API contact, in both apply
- * and check mode. Belt and braces on the zero-request property: the runner's
- * `zero_requests` expectation fails the scenario, and the sampled request log
- * here names the offending calls for the failure report.
+ * The zero-request check is duplicated on purpose: the runner's zero_requests expectation fails the
+ * scenario, the sample here names the offending calls.
  */
 async function rejectionIteration(seed: number, spec: RejectionSpec): Promise<IterationResult> {
   const rng = new Rng(seed);
@@ -536,22 +465,17 @@ async function rejectionIteration(seed: number, spec: RejectionSpec): Promise<It
   }
   return iterationResult(
     problems,
-    { artifactDir: report.artifactDir, sections: [] },
+    { artifactDir: failureArtifacts(scenario, report, problems), sections: [] },
     `[${spec.label}] `,
   );
 }
 
-/** A random validator-rejection spec drawn from the invalid-settings catalog. */
 function invalidDocSpec(rng: Rng): RejectionSpec {
   const { name, doc, offendingToken } = genInvalidSettings(rng);
   return { label: `invalid-${name}`, settings: doc, tokens: [offendingToken] };
 }
 
-/**
- * A raw settings.yml the yaml parser rejects: single-repo this dies in
- * readSettingsFile (local fs + parse, before ANY API call) with the
- * "cannot read settings ... valid YAML" advice.
- */
+/** The tokens are the single-repo flow's advice (src/flows/single.ts): the parse fails on the local file, before any API call. */
 function unparseableRawSpec(rng: Rng): RejectionSpec {
   return {
     label: "raw-unparseable",
@@ -560,10 +484,7 @@ function unparseableRawSpec(rng: Rng): RejectionSpec {
   };
 }
 
-/**
- * A raw settings.yml that parses to a non-mapping: the parse succeeds, so
- * the rejection comes from validateSettingsDoc's top-level check instead.
- */
+/** The parse succeeds, so the token is validateSettingsDoc's top-level check, not the reader's. */
 function nonMappingRawSpec(rng: Rng): RejectionSpec {
   return {
     label: "raw-non-mapping",
@@ -573,11 +494,8 @@ function nonMappingRawSpec(rng: Rng): RejectionSpec {
 }
 
 /**
- * Input fuzz: feed the action a settings file it must reject BEFORE any API
- * contact. Three shapes, weighted toward the rich validator catalog: a
- * catalog case (wrong container/item/enum/nested types, an unknown top-level
- * key), raw unparseable YAML, or raw YAML parsing to a non-mapping. Every
- * shape must exit 1 with the offending token named and zero requests.
+ * The roll gives the validator catalog half the stream: it is the richest shape (wrong
+ * container/item/enum/nested types, an unknown top-level key).
  */
 async function inputFuzzIteration(seed: number): Promise<IterationResult> {
   const rng = new Rng(seed);
@@ -591,37 +509,24 @@ async function inputFuzzIteration(seed: number): Promise<IterationResult> {
   return rejectionIteration(seed, spec);
 }
 
-/** The three chaos corruption modes the mock supports (see CorruptOption). */
+/** Mirrors the mock's CorruptOption modes. */
 const CHAOS_MODES = ["invalid_json", "wrong_shape", "missing_envelope"] as const;
 
 /**
- * Chaos fuzz: corrupt the labels-list response and assert the action reacts
- * correctly. Two deterministic variants, split by the seed:
+ * Chaos fuzz corrupts the labels-list response: labels.list is the labels section's first read, and its
+ * enveloped-or-bare list is mangled by all three modes. A single corrupt body is absorbed
+ * before the apply pass reads (the preflight probe in orchestrate.ts ignores non-permission errors).
  *
- * - Single-shot (retry resilience): one corrupt response. The client's retry
- *   plugin (MAX_RETRIES=2, 3 total attempts) sees a transport-level fault - a
- *   parse failure, a wrong-shaped body, or a stripped envelope, none of them a
- *   4xx - and retries it away, so the apply succeeds AND converges. The
- *   assertion is that a transient glitch does not derail the run.
- *
- * - Persistent (loud failure): the corruption is served on every attempt
- *   (times: "always"), so it outlasts the retries. The action must then fail
- *   LOUDLY: a non-zero exit, an actionable error naming the section, no write
- *   after the corrupted read, and no unhandled stack in stderr.
- *
- * labels.list is the target: every labels-bearing scenario issues it as its
- * first read, and it returns an enveloped-or-bare list all three modes mangle.
+ * one corrupt response      -> the apply succeeds AND converges
+ * corrupt on every attempt  -> exit 1, an error naming labels, no write after the read, no stack
  */
 async function chaosFuzzIteration(seed: number): Promise<IterationResult> {
   const rng = new Rng(seed);
   const mode = rng.pick([...CHAOS_MODES]);
-  // Split the chaos stream deterministically: ~1/3 persistent, the rest single
-  // shot. Both are seeded from the same rng so a chaos seed replays identically.
   const persistent = rng.int(3) === 0;
   return persistent ? persistentChaosIteration(seed, mode) : singleShotChaosIteration(seed, mode);
 }
 
-/** One corrupt response, retried away: the run must still apply and converge. */
 async function singleShotChaosIteration(
   seed: number,
   mode: (typeof CHAOS_MODES)[number],
@@ -629,22 +534,17 @@ async function singleShotChaosIteration(
   const scenario: Scenario = {
     name: `fuzz-chaos-single-${seed}`,
     tiers: ["mock"],
-    // A single declared label with the section fully granted (default mask is
-    // write), so the read reaches the mock and the corruption fires.
+    // Fully granted by default, so the list read reaches the mock and the corruption fires.
     settings: { labels: [{ name: "chaos", color: "d73a4a" }] },
     inputs: { mode: "apply" },
     denial_style: "fine_grained",
     owner_kind: "org",
-    // The corrupt response is retried away, so the apply must both succeed AND
-    // converge: a check-mode re-run against the mutated mock writes nothing.
     expect: { exit_code: 0, fixpoint: "converges" },
   };
   const report = await runScenario(scenario, {
     serverOptions: { corrupt: { key: "labels.list", mode } },
   });
-  // The mock marks a corrupt body offSpec at source, so the OpenAPI validator
-  // skips it; every remaining failure (including a broken convergence re-run) is
-  // a real problem. No filtering needed.
+  // The mock marks a corrupt body offSpec, so the OpenAPI validator skips it and no failure needs filtering here.
   const problems = [...report.failures];
   if (/\n\s+at\s+\S+ \(/.test(report.stderr)) {
     problems.push(`unhandled stack in stderr under ${mode}`);
@@ -658,17 +558,14 @@ async function singleShotChaosIteration(
   return iterationResult(
     problems,
     {
-      artifactDir: report.artifactDir,
+      artifactDir: failureArtifacts(scenario, report, problems),
       sections: ["labels"],
-      // The scenario armed converges above; label it so the fixpoint-proof
-      // stats count this real convergence proof instead of printing "(none)".
       proof: "converges",
     },
     `[single ${mode}] `,
   );
 }
 
-/** Corruption on every attempt: retries are exhausted, so the run fails loudly. */
 async function persistentChaosIteration(
   seed: number,
   mode: (typeof CHAOS_MODES)[number],
@@ -680,18 +577,12 @@ async function persistentChaosIteration(
     inputs: { mode: "apply" },
     denial_style: "fine_grained",
     owner_kind: "org",
-    // The corruption outlasts every retry, so the run must fail (exit 1) with no
-    // write ever leaving the client.
     expect: { exit_code: 1 },
   };
   const report = await runScenario(scenario, {
     serverOptions: { corrupt: { key: "labels.list", mode, times: "always" } },
   });
   const problems = [...report.failures];
-  // The failure must be LOUD and actionable, not a crash: an ::error:: line that
-  // names the labels section, no unhandled stack in stderr, and crucially NO
-  // write (POST/PUT/PATCH/DELETE) after the corrupted read - the action must not
-  // proceed to mutate on an unparseable list.
   if (/\n\s+at\s+\S+ \(/.test(report.stderr)) {
     problems.push(`unhandled stack in stderr under persistent ${mode}`);
   }
@@ -709,62 +600,35 @@ async function persistentChaosIteration(
   }
   return iterationResult(
     problems,
-    { artifactDir: report.artifactDir, sections: ["labels"] },
+    { artifactDir: failureArtifacts(scenario, report, problems), sections: ["labels"] },
     `[persist ${mode}] `,
   );
 }
 
-/**
- * Multi-repo fuzz: generate a 2-5 repo scenario, predict each target's outcome
- * class + the worst-of rollup, run it through the multi-repo path, and assert
- * the per-target results and the run exit code fall in the predicted classes.
- * A missing-settings target, or one whose `contents` read is denied, is
- * settings-gated (skipped, or failed under the 403 style); the oracle carries
- * each target's allowed repo-level result, so this only checks membership.
- */
 async function multiRepoFuzzIteration(seed: number): Promise<IterationResult> {
   const { scenario, meta } = genMultiScenario(new Rng(seed));
   return runMultiPredicted(scenario, meta);
 }
 
-/**
- * Options steering a multi-repo run's assertions when a fault rides along:
- * `fault` adds the fault-fired non-vacuity check (its class label is recorded
- * only when the fault provably fired); `reportFaultDegrades` replaces the
- * report-body positive assertion with the degrade contract (the safe warning
- * fires, no issue is ever written, target results unchanged).
- */
 interface MultiRunOptions {
   fault?: InjectedFault;
   reportFaultDegrades?: boolean;
 }
 
 /**
- * The scenario-shape half of the multi apply-idempotence gate, shared by the
- * random-stream gate (runMultiPredicted) and the fixpoint battery draw
- * (multiIdempotenceBatteryRun) so the two CANNOT diverge - one predicate, not
- * two copies with an equivalence assertion. Conditions: apply mode; a channel
- * the runner accepts (the issue channel is rejected: its delivery embeds
- * fresh timestamps and the marker-label injection ties the labels declaration
- * to the channel); no raw-invalid target (its exit 1 would fail the
- * second-apply-exit-0 property); and every normal target's mask EMPTY.
- * Empty-mask is deliberately NARROWER than true fully-granted (a mask
- * explicitly granting write everywhere would also qualify but is excluded):
- * genMultiScenario's masks are sparse random rolls, so the loss is negligible
- * and the check stays obviously sound. Fully granted is REQUIRED, not merely
- * convenient - secondApplyWriteFailures counts REQUESTS to
- * compare-before-write sections, and a warn-policy denied write would be
- * re-attempted identically in the second apply, failing the write-quiet
- * property even though nothing mutates.
+ * One predicate for the random-stream gate and the fixpoint battery draw, so the two cannot diverge.
+ * Empty per-target masks is deliberately NARROWER than fully granted (a mask granting write everywhere
+ * would also qualify); fully granted is required because secondApplyWriteFailures judges every
+ * second-apply request by declared recurrence, and a denied write recurs.
+ *
+ * issue channel      -> rejected: the delivery embeds fresh timestamps and the marker label ties labels to the channel
+ * raw-invalid target -> rejected: its exit 1 fails the second-apply-exit-0 property
  */
 function multiIdempotenceEligible(meta: MultiScenarioMeta): boolean {
   return (
     meta.mode === "apply" &&
     meta.privateReport !== "issue" &&
-    // A globally denied org gate makes any declared teams section a
-    // denied-path section even under empty per-target masks: its final check
-    // legitimately reads back as drift (declared team, no access), which the
-    // idempotence proof cannot accept.
+    // Under a denied org gate a declared teams section reads back as drift (declared team, no access), which the proof cannot accept.
     meta.globalMask.org_members !== "none" &&
     meta.repos.every((r) => r.target.kind !== "raw-invalid") &&
     meta.repos.every(
@@ -773,31 +637,17 @@ function multiIdempotenceEligible(meta: MultiScenarioMeta): boolean {
   );
 }
 
-/**
- * The shared eligibility for the discovery convergence proof: a non-empty
- * predicted kept set (an empty one is a configuration error that exits 1 by
- * design). One predicate for both the runDiscoveryPredicted gate and the
- * fixpoint battery draw, same non-divergence reasoning as
- * multiIdempotenceEligible.
- */
+/** Shared by the gate and the battery draw so they cannot diverge; an empty kept set exits 1 by design. */
 function discoveryConvergeEligible(meta: ReturnType<typeof genDiscoveryScenario>["meta"]): boolean {
   return predictDiscovery(meta.pool, meta.filters).length > 0;
 }
 
-/** The shared multi-repo run + assertion core (see multiRepoFuzzIteration). */
 async function runMultiPredicted(
   scenario: Scenario,
   meta: MultiScenarioMeta,
   opts: MultiRunOptions = {},
 ): Promise<IterationResult> {
   const prediction = predictMulti(meta);
-  // Apply-idempotence gate: an ELIGIBLE scenario (multiIdempotenceEligible -
-  // the single predicate the fixpoint battery draw shares, so gate and draw
-  // cannot diverge) with no injected fault is a fixpoint the runner can prove
-  // (second apply exit 0, write-quiet compare-before-write sections,
-  // byte-identical state, clean final check). Belt: the oracle must predict
-  // exit 0 exactly - if the belt ever blocks an eligible draw, the battery's
-  // proof tripwire fails loudly instead of passing vacuously.
   const idempotent =
     multiIdempotenceEligible(meta) &&
     opts.fault === undefined &&
@@ -812,25 +662,18 @@ async function runMultiPredicted(
 
   const report = await runScenario(scenario);
   const problems: string[] = [];
-  // Secondary artifact dirs this iteration dumps beyond the primary run's
-  // (the redaction counterfactual re-run) - they need replay blocks too.
   const extraArtifactDirs: string[] = [];
   let faultClass: string | undefined;
   if (opts.fault !== undefined) {
     const fired = assertFaultFired(report.faultsFired, opts.fault.key, problems);
     faultClass = fired ? opts.fault.classLabel : undefined;
   }
-  // Non-vacuity guard: a redact run must always exercise a non-empty forbidden
-  // set (the generator forces one private target), so the leak check below is
-  // never trivially satisfied. A regression that lets a redact run go all-public
-  // fails here instead of passing vacuously.
+  // The generator forces one private target, so an empty forbidden set is a generator regression that would make the leak check vacuous.
   if (meta.privateRepos === "redact" && prediction.forbidden.length === 0) {
     problems.push("redact run produced an empty forbidden set - the leak check would be vacuous");
   }
   problems.push(...report.failures);
-  // Redaction keys a private/probe-denied target by its "private repository #N"
-  // placeholder, so the results and predictions are compared on displayKey, not
-  // the real slug.
+  // Compared on displayKey: a redacted target is keyed "private repository #N", never its slug.
   const results = parseReposResult(report.outputs["repos-result"]);
   for (const repo of prediction.repos) {
     const got = results[repo.displayKey];
@@ -846,23 +689,15 @@ async function runMultiPredicted(
       );
     }
   }
-  // No unexpected keys in the output either: every reported key must be one the
-  // oracle predicted (a stray target - or a leaked real slug where a placeholder
-  // was expected - is as much a bug as a missing one).
+  // A real slug where a placeholder was expected shows up here as an unpredicted key.
   const predictedKeys = new Set(prediction.repos.map((r) => r.displayKey));
   for (const key of Object.keys(results)) {
     if (!predictedKeys.has(key)) {
       problems.push(`${key}: reported in repos-result but not predicted`);
     }
   }
-  // A raw-settings target must fail at ITS promised gate, not just "somehow":
-  // an unrelated pre-validation exception would also read as {failed}. So the
-  // gate wording must appear on a rendered public surface (or, for a redacted
-  // target, must NOT - the rich detail is private, and this scenario's only
-  // source of that wording is this target). And the parse gate must stop the
-  // run before any section call: the target's legitimate request surface is
-  // the repo probe, the contents fetch, and the report channel's labels/issues
-  // routes - which never PATCH or DELETE a label.
+  // {failed} alone would also cover an unrelated pre-validation exception, so a raw target must show ITS
+  // gate wording on a public surface; a redacted one must NOT, and this target is the only source of that wording.
   const renderedPublic = [
     stripDebugLines(stripMaskLines(report.stdout)),
     stripDebugLines(stripMaskLines(report.stderr)),
@@ -885,11 +720,8 @@ async function runMultiPredicted(
         `raw target ${repo.slug}: failure does not carry the promised gate wording "${wording}"`,
       );
     }
-    // The parse gate stops the target before any section call, so the only
-    // legitimate requests are: the repo probe (GET /repos/{slug} exactly),
-    // the settings-file read (GET on contents), and the report channel's
-    // issue delivery (GET/POST/PATCH on issues, POST-only on labels - the
-    // marker-label ensure-create; the channel never lists or edits labels).
+    // The parse gate stops the target before any section call; the report channel's marker-label
+    // ensure-create is POST-only, so a labels list or edit here is a section call leaking through.
     const probePath = `/repos/${repo.slug}`;
     const base = `${probePath}/`;
     const allowedByHead: Record<string, ReadonlySet<string>> = {
@@ -913,44 +745,26 @@ async function runMultiPredicted(
       }
     }
   }
-  // The shared LEAK INVARIANT: with redaction active, no redacted slug and no
-  // planted canary may appear in any public surface (stdout with ::add-mask::
-  // lines stripped, the summary, or any output). Empty forbidden set under show.
   problems.push(...checkLeaks(report, prediction.forbidden));
 
-  // UNREDACTED COUNTERFACTUAL: prove this iteration is a REAL leak test, not a
-  // vacuous one. Re-run the SAME scenario under private-repos: show and require
-  // that at least one canary provably surfaces in a RENDERED public surface -
-  // the summary, an annotation, a plain log line, or an output - NOT merely a
-  // ::debug:: API trace. Detail-suppression regressions affect rendered output,
-  // so a canary that only ever appears in a debug trace would not catch them.
-  // The generator pins the forced-private target fully granted, so its canary
-  // label's name always reaches the rendered detail under show. Only canaries
-  // are checked (not slugs), since it is DETAIL suppression this guards.
+  // The counterfactual proves the leak test is not vacuous: the SAME scenario under private-repos: show
+  // must surface a canary on a RENDERED surface, not merely a ::debug:: trace, because detail-suppression
+  // regressions affect rendered output. Only canaries are checked: it is DETAIL suppression this guards.
   if (meta.privateRepos === "redact") {
     const canaries = meta.repos.flatMap(canariesOf);
     if (canaries.length > 0) {
-      // The counterfactual is fault-free, so the PRIMARY expectation (whose
-      // exit set prices an injected fatal fault in) does not apply to it;
-      // recompute the exit set with the core fault stripped. coreFault (the
-      // contents fetch) is the only fault the oracle prices into exit codes;
-      // the multi path's other injected fault, the report channel's
-      // core.issuesList lookup, never changes the exit set because a report
-      // failure never fails the run.
+      // The counterfactual runs fault-free, so its exit set is priced without the core fault; coreFault
+      // is the only fault the oracle prices in (a report failure never fails the run).
       const shownExits =
         meta.coreFault === undefined
           ? prediction.allowedExitCodes
           : predictMulti({ ...meta, coreFault: undefined }).allowedExitCodes;
       const shown = await runScenario({
         ...scenario,
-        // Drop the whole report config: a delivering channel (`issue` or
-        // `artifact`) + `show` is rejected at config parse (show redacts
-        // nothing), and a leftover report_public_key without private-report:
-        // artifact is rejected too. Either rejection would make the
-        // counterfactual fail to start and falsely read as "no canary surfaced".
-        // Drop injected faults too: the counterfactual proves CANARY FLOW, and
-        // an exhausting fault could kill the very target whose canary must
-        // surface, falsely reading as vacuous.
+        // Anything that stops the counterfactual from starting, or kills the canary's target, would read as "no canary surfaced".
+        //   a delivering channel + show         -> rejected at config parse (show redacts nothing)
+        //   report_public_key without artifact  -> rejected too
+        //   an exhausting fault                 -> could kill the very target whose canary must surface
         faults: undefined,
         expect: { exit_code: [...shownExits] },
         inputs: {
@@ -960,11 +774,7 @@ async function runMultiPredicted(
           report_public_key: undefined,
         },
       });
-      // Propagate the counterfactual's own runner failures (exit-code
-      // membership, mock violations): a rejected counterfactual proves
-      // nothing about canary flow, and swallowing it would strand the
-      // artifact the runner dumped. The failure text carries the artifact
-      // path, and a failing iteration keeps its artifacts by design.
+      // A rejected counterfactual proves nothing about canary flow, and swallowing it would strand the artifact the runner dumped.
       if (!shown.ok) {
         const where = shown.artifactDir === undefined ? "" : ` (artifact: ${shown.artifactDir})`;
         problems.push(`counterfactual run${where}: ${shown.failures.join("; ")}`);
@@ -984,24 +794,12 @@ async function runMultiPredicted(
           "counterfactual: no canary surfaced in a rendered surface under private-repos: show, so the redacted leak check is vacuous",
         );
       }
-      // The counterfactual is a runScenario report of its own, so the
-      // runner's centralized leak sweep (token + planted plaintexts) already
-      // covered it; its failures propagated through shown.ok above.
     }
   }
 
-  // REPORT-BODY POSITIVE ASSERTION (the plan's canary-in-report check): under
-  // private-report: issue, a redacted target whose report DELIVERS (Issues
-  // granted and its settings readable) must carry its canaries in ITS OWN report
-  // issue body - the one private channel where the full detail legitimately
-  // lands. The forced-private target is fully granted, so its report always
-  // delivers; assert its canaries reached the recorded issue body. This proves
-  // suppression did not eat the report. Under an injected report-route fault
-  // (reportFaultDegrades) the contract flips: delivery must DEGRADE to the safe
-  // warning - no issue is ever created or patched, the warning fires at least
-  // once (the forced-private target always attempts delivery), and target
-  // results stay whatever the oracle predicted (a report failure never fails
-  // the run).
+  // A delivering redacted target's OWN report issue is the one private surface where full detail
+  // legitimately lands, so its canaries must reach the recorded body (suppression did not eat the report).
+  // Under a faulted lookup the contract flips to the degrade: no issue created or patched, the safe warning at least once.
   if (meta.privateReport === "issue" && opts.reportFaultDegrades === true) {
     const issueWrites = report.requests.filter(
       (r) => r.method !== "GET" && /\/issues(\/|$|\?)/.test(r.pathname),
@@ -1029,12 +827,8 @@ async function runMultiPredicted(
         problems.push(`report: no issue body delivered for the redacted target ${repo.slug}`);
         continue;
       }
-      // The label-name canary flows into the report's section detail and
-      // transcript in every mode (create/update/drift all name the label), so it
-      // is the one asserted here; the description canaries only surface in check
-      // mode and are already covered by the leak invariant. A delivering target
-      // that carries canaries MUST have a `-name` one - if the naming convention
-      // changes out from under this check, that is a failure, not a silent skip.
+      // Only the -name canary is asserted: the label name reaches the report in every mode, the
+      // description canaries surface in check mode only. A carrier without one is a convention drift, not a skip.
       const nameCanary = canaries.find((c) => c.endsWith("-name"));
       if (nameCanary === undefined) {
         problems.push(
@@ -1046,16 +840,8 @@ async function runMultiPredicted(
     }
   }
 
-  // ARTIFACT CHANNEL ASSERTION: under private-report: artifact, every redacted
-  // target's report is accumulated and uploaded as ONE age-encrypted workflow
-  // artifact. There is no readable delivered body in the harness (the upload
-  // fails safely: ACTIONS_RUNTIME_TOKEN is absent), so there is no positive
-  // canary-in-body check here - the leak invariant above already proves the
-  // report plaintext reached no PUBLIC surface, which is the property that
-  // matters. Two things must hold: the artifact channel never touches the issue
-  // routes (that is the issue channel's job), and when a report was actually
-  // composed (a redacted target delivered), the run emitted the ONE safe warning
-  // naming the artifact service - never a slug or the report plaintext.
+  // Under the artifact channel the harness never sees a delivered body (the upload fails safely:
+  // ACTIONS_RUNTIME_TOKEN is absent), so the leak invariant above is the positive proof.
   if (meta.privateReport === "artifact") {
     const issueWrites = report.requests.filter(
       (r) => r.method !== "GET" && /\/issues(\/|$|\?)/.test(r.pathname),
@@ -1065,10 +851,7 @@ async function runMultiPredicted(
       problems.push(`artifact channel wrote to the issue routes: ${sample}`);
     }
     const composed = meta.repos.some((r) => reportDelivers(r));
-    // The upload is accumulated into ONE artifact after the whole loop, so a
-    // composed report yields EXACTLY ONE safe upload-failure warning - never one
-    // per target. Count the warning lines so a per-target repeated-warning
-    // regression (or a silent zero) fails here.
+    // One artifact is uploaded after the whole loop, so exactly one warning: a per-target repeat or a silent zero fails here.
     const uploadWarnings = report.stdout
       .split("\n")
       .filter((line) => line.includes("could not upload the private report artifact")).length;
@@ -1079,12 +862,8 @@ async function runMultiPredicted(
     }
   }
 
-  // SELF-CONSISTENCY: the `result` output must equal the engine's worst-of
-  // fold over the per-target results it just emitted (foldRepoResults mirrors
-  // orchestrate's REPO_RESULTS order). Folded from repos-result VALUES, not
-  // summary rows - a multi summary repeats section keys per target, which
-  // parseSummaryOutcomes would overwrite. Guarded on a non-empty repos-result:
-  // a config-fatal run emits none by design.
+  // Folded from repos-result, not the summary: a multi summary repeats section keys per target, which
+  // parseSummaryOutcomes would overwrite. A config-fatal run's repos-result is the empty map by design.
   if (Object.keys(report.reposResult).length > 0) {
     const folded = foldRepoResults(Object.values(report.reposResult), meta.mode === "check");
     if (report.outputs.result !== folded) {
@@ -1095,7 +874,7 @@ async function runMultiPredicted(
   }
 
   return iterationResult(problems, {
-    artifactDir: report.artifactDir,
+    artifactDir: failureArtifacts(scenario, report, problems),
     extraArtifactDirs,
     sections: [],
     faultClass,
@@ -1104,14 +883,9 @@ async function runMultiPredicted(
 }
 
 /**
- * Whether a redacted target's private report DEFINITELY composes and delivers.
- * Only true for the fully-granted (empty per-repo mask) forced-private target: it
- * has a settings file, Issues write, and Contents read, so its report is always
- * composed. Under the issue channel that means its canary must appear in the
- * report ISSUE body; under the artifact channel it means a report was composed,
- * so the safe upload-failure warning must fire. Other redacted targets may have
- * Issues denied (a safe warning, no body), so they are not asserted - the leak
- * invariant already covers them.
+ * Only the forced-private target (redacted, normal, empty mask) delivers for certain: it has a settings
+ * file, Issues write, and Contents read. Another redacted target may have Issues denied (a safe warning,
+ * no body), so it is left to the leak invariant.
  */
 function reportDelivers(repo: MultiRepoMeta): boolean {
   return (
@@ -1121,32 +895,19 @@ function reportDelivers(repo: MultiRepoMeta): boolean {
   );
 }
 
-/**
- * Discovery fuzz: generate a `repos: "*"` scenario with a random pool and random
- * filters, predict the kept slug set with the INDEPENDENT predictDiscovery, and
- * assert the action discovered and processed exactly those repos (the
- * repos-result keys equal the predicted kept set). This exercises the discovery
- * filter chain end to end and cross-checks the oracle's glob mirror against the
- * engine's live filtering.
- */
 async function discoveryFuzzIteration(seed: number): Promise<IterationResult> {
   const { scenario, meta } = genDiscoveryScenario(new Rng(seed));
   return runDiscoveryPredicted(scenario, meta);
 }
 
-/** The shared discovery run + assertion core (see discoveryFuzzIteration). */
 async function runDiscoveryPredicted(
   scenario: Scenario,
   meta: ReturnType<typeof genDiscoveryScenario>["meta"],
   opts: { fault?: InjectedFault } = {},
 ): Promise<IterationResult> {
   const kept = predictDiscovery(meta.pool, meta.filters);
-  // Zero surviving repos is a fatal configuration error for the action (there
-  // is nothing to apply against), so the exit prediction follows the kept set.
-  // The runner's own exit-code check enforces it; no failure is filtered here.
-  // A non-empty kept set is an APPLY over fully-granted labels (the discovery
-  // scenario pins issues: write / contents: read), so the check re-run must
-  // converge - unless a fault rides along and may legitimately perturb it.
+  // An empty kept set exits 1 by design. The discovery scenario pins fully-granted labels in apply
+  // mode, so a fault-free non-empty run must converge.
   const proof =
     discoveryConvergeEligible(meta) && opts.fault === undefined
       ? ("converges" as const)
@@ -1168,11 +929,8 @@ async function runDiscoveryPredicted(
 
   const redact = meta.privateRepos === "redact";
   const visibilityOf = new Map(meta.pool.map((r) => [r.slug, r.visibility ?? "public"]));
-  // The display KEY the action emits per kept repo: under redact, a
-  // private/internal kept repo is keyed by "private repository #N" numbered over
-  // the kept repos in kept order (matching planRedaction); a public one keeps its
-  // slug. Discovery has no per-repo probe (visibility comes from /user/repos), so
-  // only the planted visibility matters.
+  // Placeholders are numbered over the kept repos in kept order (matching planRedaction); discovery
+  // has no per-repo probe, so the planted visibility is the only one.
   const expectedKeys = new Set<string>();
   let ordinal = 0;
   for (const slug of kept) {
@@ -1194,16 +952,11 @@ async function runDiscoveryPredicted(
       problems.push(`discovery processed ${key} but it was not an expected key`);
     }
   }
-  // The leak invariant: under redact, EVERY private/internal pool repo - kept
-  // (redacted) or filtered out - must have its slug absent from every public
-  // surface. Public kept slugs render normally and are not forbidden.
   if (redact) {
     const forbidden = meta.pool
       .filter((r) => (r.visibility ?? "public") !== "public")
       .map((r) => r.slug);
-    // Non-vacuity guard, mirroring the multi one: the generator forces one
-    // non-public pool repo, so an empty forbidden set here is a generator
-    // regression that would let the leak check pass without checking anything.
+    // The generator forces one non-public pool repo, so an empty forbidden set is a generator regression.
     if (forbidden.length === 0) {
       problems.push(
         "redact discovery run produced an empty forbidden set - the leak check would be vacuous",
@@ -1211,10 +964,7 @@ async function runDiscoveryPredicted(
     }
     problems.push(...checkLeaks(report, forbidden));
   }
-  // SELF-CONSISTENCY: discovery runs are multi-shaped, so the same worst-of
-  // fold over repos-result applies (discovery is always apply mode). Guarded
-  // on a non-empty repos-result: the kept-empty configuration error and the
-  // discovery-fatal fault path emit none by design.
+  // Discovery is always apply mode; the kept-empty error and the discovery-fatal path leave repos-result the empty map by design.
   if (Object.keys(report.reposResult).length > 0) {
     const folded = foldRepoResults(Object.values(report.reposResult), false);
     if (report.outputs.result !== folded) {
@@ -1226,7 +976,7 @@ async function runDiscoveryPredicted(
   return iterationResult(
     problems,
     {
-      artifactDir: report.artifactDir,
+      artifactDir: failureArtifacts(scenario, report, problems),
       sections: [],
       faultClass,
       proof,
@@ -1235,45 +985,120 @@ async function runDiscoveryPredicted(
   );
 }
 
+// --- Merge-mode fuzz --------------------------------------------------------
+
+/** A merge never touches GitHub, so every iteration also pins zero requests. */
+async function mergeFuzzIteration(
+  seed: number,
+  opts: { sections?: SectionKey[]; force?: MergeForce },
+): Promise<IterationResult> {
+  const { scenario, meta } = genMergeScenario(new Rng(seed), opts);
+  return runMergePredicted(scenario, meta);
+}
+
+/** The valid force guarantees a merged fold, so the whole-document comparison runs every soak per layering. */
+async function mergeValidBatteryRun(
+  seed: number,
+  layering: "merge" | "replace",
+): Promise<IterationResult> {
+  const { scenario, meta } = genMergeScenario(new Rng(seed), {
+    force: { kind: "valid", layering },
+  });
+  const prediction = predictMerge(meta);
+  if (prediction.kind !== "merged") {
+    return {
+      ok: false,
+      failure: `the valid force produced a stack the oracle reads as ${prediction.kind} - the force and predictMerge drifted apart`,
+      sections: [],
+    };
+  }
+  return runMergePredicted(scenario, meta);
+}
+
+async function runMergePredicted(
+  scenario: Scenario,
+  meta: MergeScenarioMeta,
+): Promise<IterationResult> {
+  const prediction = predictMerge(meta);
+  scenario.expect =
+    prediction.kind !== "merged"
+      ? { exit_code: 1, result: "failed", zero_requests: true }
+      : {
+          exit_code: 0,
+          result: "merged",
+          zero_requests: true,
+          // The oracle predicts the fold's content; the file is that fold in the canonical order, whose rules
+          // test/engine/canonical.test.ts pins on its own, so this pin is content, never the layers' order.
+          merged: canonicalDocument(prediction.merged),
+          stdout_contains: prediction.notices.map(describeOptOut),
+          summary_contains: ["Merged document written to "],
+        };
+  const report = await runScenario(scenario);
+  const problems = [...report.failures];
+  if (/\n\s+at\s+\S+ \(/.test(report.stderr)) {
+    problems.push("unhandled stack in stderr from a merge run");
+  }
+  // Matched on ::error:: lines only: an opt-out ::notice:: line also starts with the layer name (describeOptOut).
+  const errorNames = (site: string): boolean =>
+    report.stdout.split("\n").some((line) => line.startsWith("::error::") && line.includes(site));
+  if (prediction.kind === "refused") {
+    if (!errorNames(prediction.layer)) {
+      problems.push(`refused stack: no ::error:: line names the refused layer ${prediction.layer}`);
+    }
+  } else if (prediction.kind === "invalid") {
+    if (!errorNames("the merged settings document")) {
+      problems.push("invalid fold: no ::error:: line names the merged settings document");
+    }
+  } else {
+    // mode: merge emits no other notices, so the count catches a deletion the oracle did not predict.
+    const announced = report.stdout.split("\n").filter((line) => line.startsWith("::notice::"));
+    if (announced.length !== prediction.notices.length) {
+      problems.push(
+        `the run announced ${announced.length} null deletion(s); the oracle predicted ${prediction.notices.length}`,
+      );
+    }
+  }
+  const sections = new Set<SectionKey>();
+  for (const layer of meta.layers) {
+    for (const key of Object.keys(layer.doc)) {
+      if ((SECTION_KEYS as readonly string[]).includes(key)) {
+        sections.add(key as SectionKey);
+      }
+    }
+  }
+  return iterationResult(
+    problems,
+    {
+      artifactDir: failureArtifacts(scenario, report, problems),
+      sections: [...sections],
+      mergeFeatures: meta.features,
+    },
+    `[merge ${prediction.kind}] `,
+  );
+}
+
 // --- Transport-fault fuzz ---------------------------------------------------
 
-/** The four transport fault kinds the mock injects (see FaultOption). */
+/** The mock's transport FaultOption kinds; echo_422, a validation rejection with no transient form, stays with the curated scenarios. */
 const FAULT_KINDS = ["rate_limit_403", "429_then_200", "connection_drop", "server_error"] as const;
 type FaultKind = (typeof FAULT_KINDS)[number];
 
-/**
- * One full round of client attempts: the first request plus MAX_RETRIES
- * retries, derived from the client's own constant (src/github/api.ts). A
- * fault budget of RETRY_BUDGET outlasts the retries and surfaces as a
- * failure; a budget of 1 is a transient the retry plugin absorbs (for the
- * kinds it retries at all - see faultKills).
- */
+/** A budget of RETRY_BUDGET outlasts the client's retries; a budget of 1 is a transient (for the kinds it retries at all, see faultKills). */
 const RETRY_BUDGET = 1 + MAX_RETRIES;
 
-/**
- * The histogram label for one fired fault, keyed by ENDPOINT so per-endpoint
- * starvation is visible, and classed by the VERDICT (fatal vs transient), not
- * the raw budget - a one-shot rate_limit_403 is fatal, so labeling it
- * "transient" would contradict the modeled fact.
- */
+/** Classed by the VERDICT, not the budget: a one-shot rate_limit_403 is fatal, so "transient" would misstate it. */
 function faultClassLabel(key: string, kind: FaultKind, fatal: boolean): string {
   return `${key} ${kind}/${fatal ? "fatal" : "transient"}`;
 }
 
 /**
- * Whether a fault takes the FAILURE path - the modeled VERDICT, distinct from
- * the `exhausting` budget roll. An exhausting budget (RETRY_BUDGET firings)
- * always kills; rate_limit_403 kills on its FIRST firing regardless of
- * budget, because the client deliberately never absorbs a primary rate limit
- * - its reset typically lies far beyond MAX_RETRY_WAIT_S, so throttleCallback
- * (src/github/api.ts) surfaces it immediately with re-run advice instead of
- * stalling the job. The "transient" class does not exist for that kind.
+ * rate_limit_403 kills on its FIRST firing whatever the budget: the mock's 403 carries neither the secondary-rate
+ * phrase nor a zero-quota header, so the throttling plugin declines it, and 403 is on the retry plugin's doNotRetry list.
  */
 function faultKills(kind: FaultKind, exhausting: boolean): boolean {
   return exhausting || kind === "rate_limit_403";
 }
 
-/** The full plan for one section-read fault run (random stream or battery). */
 interface SectionFaultPlan {
   section: FaultableSection;
   key: string;
@@ -1282,7 +1107,6 @@ interface SectionFaultPlan {
   mode: "apply" | "check";
 }
 
-/** Every (kind, budget) combination a section fault run can carry. */
 function allFaultCombos(): Array<[FaultKind, boolean]> {
   const combos: Array<[FaultKind, boolean]> = [];
   for (const kind of FAULT_KINDS) {
@@ -1292,14 +1116,9 @@ function allFaultCombos(): Array<[FaultKind, boolean]> {
 }
 
 /**
- * The directed fault battery's plan: one entry per SECTION_PRIMARY_READ
- * section, so EVERY faultable section runs every soak, each paired with a
- * (kind, budget) combo by rotating index. There are more sections than
- * combos, so every combo also fires every soak; the section-to-combo pairing
- * and the run mode rotate with the master seed, so consecutive soaks walk the
- * full section x kind x budget cross product without one soak paying for all
- * of it. assertFaultBatteryCoverage makes both per-soak guarantees
- * regression-proof.
+ * There are more sections than combos, so every section AND every combo fires every soak; the pairing
+ * and the mode rotate with the master seed, so consecutive soaks walk the full section x kind x budget
+ * cross product without one soak paying for all of it.
  */
 function faultBatteryPlan(master: number): SectionFaultPlan[] {
   const sections = Object.keys(SECTION_PRIMARY_READ) as FaultableSection[];
@@ -1320,16 +1139,9 @@ function faultBatteryPlan(master: number): SectionFaultPlan[] {
 }
 
 /**
- * The coverage tripwire on the fault battery plan: every faultable section
- * AND every kind x budget combo must appear in EVERY soak's battery. While
- * faultBatteryPlan derives its entries from the full SECTION_PRIMARY_READ key
- * list - so the section half cannot fire today and exists to survive a
- * rewrite that plans from some other source - the combo half is live: it
- * fires if the section list ever shrinks below the combo count. Throws
- * (failing the whole fuzz run) rather than returning a failure, because a
- * hole here is a plan-construction bug no seed can route around - exactly the
- * regression class that previously let 10 sections per soak go unexercised
- * while the comments claimed full coverage.
+ * The section half cannot fire today (the plan derives from the full SECTION_PRIMARY_READ list) and
+ * exists to survive a rewrite; the combo half fires if the section list shrinks below the combo count.
+ * Throws rather than returning a failure: a hole here is a plan bug no seed can route around.
  */
 function assertFaultBatteryCoverage(
   plans: readonly SectionFaultPlan[],
@@ -1351,12 +1163,6 @@ function assertFaultBatteryCoverage(
   }
 }
 
-/**
- * Section-read fault fuzz: aim one transport fault at a section's guaranteed
- * primary read (SECTION_PRIMARY_READ). A transient fault (times 1) must be
- * retried away, leaving the run indistinguishable from a healthy one; an
- * exhausting fault (times 3 = 1 + MAX_RETRIES) must fail the section loudly.
- */
 async function sectionFaultIteration(seed: number): Promise<IterationResult> {
   const rng = new Rng(seed);
   const section = rng.pick(Object.keys(SECTION_PRIMARY_READ) as FaultableSection[]);
@@ -1369,42 +1175,31 @@ async function sectionFaultIteration(seed: number): Promise<IterationResult> {
   });
 }
 
-/** Build and run one section-fault scenario per the plan. */
 async function faultedSectionRun(seed: number, plan: SectionFaultPlan): Promise<IterationResult> {
   const rng = new Rng(seed).fork("fault-scenario");
+  // A key-gated section needs its fixture for the primary read to fire at all.
   const settings: Record<string, unknown> = {
-    [plan.section]: genSettings(rng.fork("settings"), plan.section),
+    [plan.section]:
+      SECTION_FAULT_FIXTURE[plan.section] ?? genSettings(rng.fork("settings"), plan.section),
   };
   const liveKinds: NonNullable<ScenarioMeta["liveKinds"]> = {};
-  // Presence live state first (a declared workflow whose file is absent would
-  // permanently drift the converge re-run), witness state merged over it.
+  // Presence live state first: a declared workflow whose file is absent would drift the converge re-run for good.
   const combinedLive: LiveWitness["state"] = { ...(presenceLiveState(settings) ?? {}) };
-  if (plan.section === "labels" || plan.section === "milestones") {
-    // A matching witness pins the no-fault prediction exactly (clean/applied),
-    // so a transient fault must leave the run INDISTINGUISHABLE from a healthy
-    // one - the strongest form of "retried away".
-    const witness = genLiveWitness(
-      rng.fork("witness"),
-      plan.section,
-      settings[plan.section],
-      "matching",
-    );
-    liveKinds[plan.section] = witness.kind;
+  const witnessed = WITNESS_SECTIONS.find((key) => key === plan.section);
+  if (witnessed !== undefined) {
+    // A matching witness pins the prediction exactly, so "retried away" means indistinguishable from healthy.
+    const witness = genLiveWitness(rng.fork("witness"), witnessed, settings[witnessed], "matching");
+    liveKinds[witnessed] = witness.kind;
     Object.assign(combinedLive, witness.state);
   }
   const liveState = Object.keys(combinedLive).length > 0 ? combinedLive : undefined;
-  // A drawn section may declare secret references (webhook secrets,
-  // actions_secrets values); wire the fixed pool's env exactly the way
-  // genScenario does, so an apply-mode fault run never fails on an unset
-  // variable instead of the injected fault.
+  // Without the secret pool's env an apply would fail on an unset variable instead of the injected fault.
   const secretEnv = scenarioSecretEnv(settings);
   const meta: ScenarioMeta = {
     sections: [plan.section],
     mask: {},
     mode: plan.mode,
-    // Policy pinned to warn in the RANDOM stream (oracle generality); the
-    // apply + fail preflight-budget interaction is pinned by the directed
-    // preflight battery cases (preflightFaultRun).
+    // warn keeps the oracle general; the apply + fail preflight interaction lives in preflightFaultRun.
     policy: "warn",
     ownerKind: "org",
     denialStyle: "fine_grained",
@@ -1430,16 +1225,8 @@ async function faultedSectionRun(seed: number, plan: SectionFaultPlan): Promise<
 }
 
 /**
- * The negative leg of the fault battery: an UNFAULTABLE_SECTIONS entry is
- * exempt from fault fuzzing because every read it could make is conditional
- * or check-mode-only. Prove the exemption is still earned - arm a one-shot
- * fault on EVERY GET endpoint the section declares (unfaultableReadKeys, so
- * no hand-picked endpoint can go stale) in a trigger-avoiding apply, and
- * require a healthy run in which NONE of them fires, the inverse of
- * assertFaultFired's non-vacuity check. A firing means the section gained an
- * unconditional read and belongs in SECTION_PRIMARY_READ so the positive
- * battery covers it. A NO_READ_SECTIONS member arms nothing (there is no GET
- * to fault) and its run degrades to the outcome pin alone.
+ * An UNFAULTABLE_SECTIONS entry is exempt because every read it could make is conditional or check-mode-only;
+ * the faults are armed from unfaultableReadKeys so no hand-picked endpoint goes stale.
  */
 async function unfaultableSectionRun(
   seed: number,
@@ -1447,13 +1234,12 @@ async function unfaultableSectionRun(
 ): Promise<IterationResult> {
   const readKeys = unfaultableReadKeys(section);
   const problems: string[] = [];
+  // A NO_READ_SECTIONS member has nothing to arm by construction; the outcome pin still proves its apply healthy.
   if (readKeys.length === 0 && !NO_READ_SECTIONS.has(section)) {
-    // A NO_READ_SECTIONS member (derived from the same ENDPOINTS
-    // declarations) is exempt by construction - there is genuinely nothing to
-    // arm, and the outcome pin below still proves the full-width apply stays
-    // healthy.
     problems.push(
-      `no GET endpoints derived for "${section}" - the unfaultable battery run is vacuous; fix the endpoint keying in unfaultableReadKeys (generators.ts), or if the section genuinely declares no GET it should already appear in NO_READ_SECTIONS (oracle.ts)`,
+      `no GET endpoints derived for "${section}" - the unfaultable battery run is vacuous; fix ` +
+        `the endpoint keying in unfaultableReadKeys (generators.ts), or if the section genuinely ` +
+        `declares no GET it should already appear in NO_READ_SECTIONS (oracle.ts)`,
     );
     return iterationResult(problems, { sections: [section] }, `[unfaultable ${section}] `);
   }
@@ -1465,9 +1251,7 @@ async function unfaultableSectionRun(
     denial_style: "fine_grained",
     owner_kind: "org",
     faults: readKeys.map((key) => ({ endpoint: key, kind: "server_error" as const, times: 1 })),
-    // The outcome pin is the run's non-vacuity guard: under warn policy a
-    // SKIPPED section would also exit 0 with every fault cold, proving
-    // nothing. The section must actually apply.
+    // Under warn a SKIPPED section would also exit 0 with every fault cold, so the outcome pin is the non-vacuity guard.
     expect: { exit_code: 0, outcomes: { [section]: "applied" } },
   };
   const report = await runScenario(scenario);
@@ -1483,16 +1267,11 @@ async function unfaultableSectionRun(
   }
   return iterationResult(
     problems,
-    { artifactDir: report.artifactDir, sections: [section] },
+    { artifactDir: failureArtifacts(scenario, report, problems), sections: [section] },
     `[unfaultable ${section}] `,
   );
 }
 
-/**
- * The exhausting-fault contract for a single declared section: the run fails
- * (exit 1) with the section reported "failed" and an actionable error naming
- * it, no unhandled stack in stderr, and the fault provably fired.
- */
 async function exhaustedSectionRun(
   scenario: Scenario,
   section: FaultableSection,
@@ -1518,7 +1297,7 @@ async function exhaustedSectionRun(
   return iterationResult(
     problems,
     {
-      artifactDir: report.artifactDir,
+      artifactDir: failureArtifacts(scenario, report, problems),
       sections: [section],
       faultClass: fired ? faultClass : undefined,
     },
@@ -1527,15 +1306,10 @@ async function exhaustedSectionRun(
 }
 
 /**
- * Multi core-path fault fuzz: aim a fault at core.contentsGet, the settings
- * fetch every target makes. An exhausting budget is eaten whole by the FIRST
- * target in generation order (fetch + retries), which then fails outright
- * (predictMulti's coreFault override); a transient one is retried away and
- * every prediction stands. Falls back to a plain multi iteration when the
- * first target is the raw-invalid one (its parse-gate wording assertion must
- * stay unconditional) or a redacted canary carrier (its report delivery and
- * counterfactual flow must stay guaranteed) - the same disjointness pattern
- * raw targets already use.
+ * core.contentsGet is the settings fetch every target makes; an exhausting budget is eaten whole by the
+ * FIRST target in generation order, which fails outright (predictMulti's coreFault override).
+ *   first target raw-invalid       -> plain multi iteration; its gate-wording assertion stays unconditional
+ *   first target a canary carrier  -> plain multi iteration; its report delivery and counterfactual stay guaranteed
  */
 async function multiContentsFaultIteration(seed: number): Promise<IterationResult> {
   const { scenario, meta } = genMultiScenario(new Rng(seed));
@@ -1554,15 +1328,9 @@ async function multiContentsFaultIteration(seed: number): Promise<IterationResul
 }
 
 /**
- * Inject the core.contentsGet fault into a multi scenario: the scenario's
- * fault option and the oracle's coreFault verdict are ONE decision, written
- * together here so a caller cannot set one and forget the other. The verdict
- * is faultKills; the budget follows it: rate_limit_403 kills the fetch on its
- * FIRST firing, so a full budget would spill the remaining firings into the
- * NEXT targets' fetches and fail them too - beyond the oracle's single-victim
- * model. One firing is exactly one dead target for that kind; retried kinds
- * need the full RETRY_BUDGET to exhaust. Returns the run options the caller
- * hands to runMultiPredicted.
+ * The scenario's fault and the oracle's coreFault verdict are ONE decision written together, so a caller
+ * cannot set one and forget the other. rate_limit_403 gets one firing whatever the budget: it kills on its
+ * first, and the leftover firings would spill into the NEXT targets' fetches, beyond the single-victim model.
  */
 function injectContentsFault(
   scenario: Scenario,
@@ -1582,13 +1350,7 @@ function injectContentsFault(
   };
 }
 
-/**
- * Discovery core-path fault fuzz: fault the /user/repos listing itself. A
- * transient is absorbed by the retry and the normal discovery assertions
- * hold. An exhausting fault is FATAL: the run exits 1 before any target
- * executes - no pool repo is fetched and no repos-result is emitted (a silent
- * empty pool instead of a loud failure is exactly the bug this hunts).
- */
+/** A fatal listing fault must exit 1 before any target runs: a silent empty pool instead of a loud failure is the bug this hunts. */
 async function discoveryFaultIteration(seed: number): Promise<IterationResult> {
   const { scenario, meta } = genDiscoveryScenario(new Rng(seed));
   const roll = new Rng(seed ^ 0x2545f491);
@@ -1607,12 +1369,7 @@ async function discoveryFaultIteration(seed: number): Promise<IterationResult> {
   return fatalDiscoveryRun(scenario, meta, faultClass);
 }
 
-/**
- * The discovery-fatal contract, shared by the random stream and the battery:
- * the run exits 1 before any target executes - no pool repo is fetched and
- * repos-result is never EMITTED (parseReposResult would map absent,
- * malformed, and {} to the same empty object, hiding a stray emit).
- */
+/** Checked on the raw output, not parseReposResult: it maps absent, malformed, and {} to the same empty object, hiding a stray emit. */
 async function fatalDiscoveryRun(
   scenario: Scenario,
   meta: ReturnType<typeof genDiscoveryScenario>["meta"],
@@ -1630,15 +1387,16 @@ async function fatalDiscoveryRun(
       `discovery-fatal: ${touched.length} target request(s) after the failed listing, e.g. ${touched[0]?.method} ${touched[0]?.pathname}`,
     );
   }
-  if (report.outputs["repos-result"] !== undefined) {
+  // A fatal problem concludes over one failed target, so the fleet map is the empty one: a row here means a target ran.
+  if (report.outputs["repos-result"] !== "{}") {
     problems.push(
-      `discovery-fatal: repos-result was emitted (${report.outputs["repos-result"]}), expected no output at all`,
+      `discovery-fatal: repos-result is ${report.outputs["repos-result"]}, expected the empty map {}`,
     );
   }
   return iterationResult(
     problems,
     {
-      artifactDir: report.artifactDir,
+      artifactDir: failureArtifacts(scenario, report, problems),
       sections: [],
       faultClass: fired ? faultClass : undefined,
     },
@@ -1646,7 +1404,6 @@ async function fatalDiscoveryRun(
   );
 }
 
-/** Battery entry: the discovery-fatal contract with a pinned kind and budget. */
 function discoveryFaultBatteryRun(seed: number): Promise<IterationResult> {
   const { scenario, meta } = genDiscoveryScenario(new Rng(seed));
   scenario.faults = [{ endpoint: "core.discoveryList", kind: "server_error", times: RETRY_BUDGET }];
@@ -1658,15 +1415,10 @@ function discoveryFaultBatteryRun(seed: number): Promise<IterationResult> {
 }
 
 /**
- * Battery entries pinning the apply + fail-policy PREFLIGHT interaction the
- * random stream deliberately avoids (its policy stays warn for oracle
- * generality). The preflight barrier re-runs every section read first and
- * IGNORES non-permission errors (orchestrate.ts), so the probe consumes fault
- * budget:
- * - budget = RETRY_BUDGET: the probe's read burns the whole budget, the
- *   apply-pass read then succeeds - the run must land applied, exit 0.
- * - budget = 2 x RETRY_BUDGET: the budget survives preflight, the apply-pass
- *   read dies too - the section must fail loudly, exit 1.
+ * The fault stream pins policy at warn (faultedSectionRun), so these entries pin apply + fail. The preflight barrier
+ * re-runs every section read first and IGNORES non-permission errors (orchestrate.ts), so the probe consumes fault budget.
+ *   budget = RETRY_BUDGET      -> the probe burns it all, the apply-pass read succeeds: applied, exit 0
+ *   budget = 2 x RETRY_BUDGET  -> the budget survives preflight, the apply-pass read dies too: exit 1
  */
 async function preflightFaultRun(seed: number, surviving: boolean): Promise<IterationResult> {
   const rng = new Rng(seed).fork("preflight");
@@ -1700,7 +1452,7 @@ async function preflightFaultRun(seed: number, surviving: boolean): Promise<Iter
   return iterationResult(
     problems,
     {
-      artifactDir: report.artifactDir,
+      artifactDir: failureArtifacts(scenario, report, problems),
       sections: ["labels"],
       faultClass: fired ? faultClass : undefined,
     },
@@ -1709,17 +1461,8 @@ async function preflightFaultRun(seed: number, surviving: boolean): Promise<Iter
 }
 
 /**
- * Report-route fault fuzz: fault the issue channel's lookup (core.issuesList,
- * which fires for EVERY delivering target - the guaranteed fully-granted
- * forced-private one included) and require the degrade contract: the safe
- * "could not deliver the private report" warning, zero issue writes, and
- * target results exactly as the oracle predicted (a report failure never
- * fails the run). `times: "always"` faults every lookup so no target's
- * delivery half-succeeds; the kind is pinned to server_error because the
- * degrade contract is the HTTP-status warning path - other kinds keep riding
- * the section and core iterations. Draws scenarios from deterministic forks
- * until one uses the issue channel (~1/6 per draw), falling back to a plain
- * multi iteration when none rolls within the attempt budget.
+ * core.issuesList fires for EVERY delivering target, the forced-private one included, so faulting it
+ * `always` leaves no delivery half-done. server_error is pinned because the degrade contract is the HTTP-status warning path.
  */
 async function reportFaultIteration(seed: number): Promise<IterationResult> {
   const drawn = drawIssueChannelScenario(new Rng(seed), 12);
@@ -1729,7 +1472,6 @@ async function reportFaultIteration(seed: number): Promise<IterationResult> {
   return injectedReportFaultRun(drawn);
 }
 
-/** Deterministic forked draws until one scenario uses the issue channel. */
 function drawIssueChannelScenario(
   base: Rng,
   attempts: number,
@@ -1743,7 +1485,6 @@ function drawIssueChannelScenario(
   return null;
 }
 
-/** Inject the issue-lookup fault and run the degrade contract. */
 function injectedReportFaultRun(drawn: {
   scenario: Scenario;
   meta: MultiScenarioMeta;
@@ -1759,21 +1500,11 @@ function injectedReportFaultRun(drawn: {
 }
 
 /**
- * Directed core-fault battery entries. The random stream reaches the
- * core-path fault iterations only ~1/80 per iteration, so a 30-iteration soak
- * exercises each with only ~25% probability - vacuous coverage the batteries
- * exist to prevent. One entry pins the fatal contentsGet victim rule, one the
- * issue-channel degrade contract. Eligibility is CONSTRUCTED via generator
- * forces - never rejection-sampled, since any fork budget has miss seeds and
- * live CI seeds turn each into a spurious failure; the inline asserts are
- * drift tripwires between each force and its consumer.
+ * The random stream reaches the core-path fault iterations only ~1/80 per iteration. Eligibility is
+ * CONSTRUCTED by a generator force, never rejection-sampled: any fork budget has miss seeds, and a live CI seed turns each into a spurious failure.
  */
 async function contentsFaultBatteryRun(seed: number): Promise<IterationResult> {
-  // CONSTRUCTED eligibility (no rejection sampling - a fork budget always has
-  // miss seeds, and live CI seeds turn every miss into a spurious failure):
-  // the "plain-first-target" force keeps the raw target off index 0 and runs
-  // under show (no canaries anywhere), so the disjointness guard holds for
-  // every master seed by generator structure.
+  // "plain-first-target" keeps the raw target off index 0 and runs under show, so the victim guard holds by generator structure.
   const { scenario, meta } = genMultiScenario(new Rng(seed), "plain-first-target");
   const victim = meta.repos[0];
   if (
@@ -1796,10 +1527,7 @@ async function contentsFaultBatteryRun(seed: number): Promise<IterationResult> {
 }
 
 function reportFaultBatteryRun(seed: number): Promise<IterationResult> {
-  // CONSTRUCTED issue channel: the "issue-report" force pins the channel roll
-  // inside generation (seed 8181 proved a 40-fork rejection draw can miss),
-  // keeping the deliverable-target and canary invariants intact by
-  // construction.
+  // The force pins the channel inside generation: seed 8181 proved a 40-fork rejection draw can miss.
   const drawn = genMultiScenario(new Rng(seed), "issue-report");
   if (drawn.meta.privateReport !== "issue") {
     return Promise.resolve({
@@ -1815,19 +1543,11 @@ function reportFaultBatteryRun(seed: number): Promise<IterationResult> {
 // --- Fixpoint battery --------------------------------------------------------
 
 /**
- * Directed multi apply-idempotence entry: the random gate (fully granted +
- * apply + non-issue channel + no raw target) fires on only ~5% of multi
- * iterations, so a 30-iteration soak would exercise it with ~30% probability
- * - the same near-vacuity the other batteries exist to prevent. Eligibility
- * is CONSTRUCTED via the generator's "idempotence-eligible" force, never
- * rejection-sampled, so the entry exists for every master seed.
+ * The random gate fires on only ~5% of multi iterations, so a 30-iteration soak would exercise it with
+ * ~30% probability. The "idempotence-eligible" force constructs eligibility for every master seed; the
+ * predicate assert is the drift tripwire between the force and the gate.
  */
 async function multiIdempotenceBatteryRun(seed: number): Promise<IterationResult> {
-  // CONSTRUCTED eligibility: the "idempotence-eligible" force pins apply
-  // mode, a non-delivering channel, no raw target, and empty masks inside
-  // generation, so the entry exists for EVERY master seed (the previous
-  // 200-fork rejection draw had miss seeds by construction). The predicate
-  // assert below is the drift tripwire between the force and the gate.
   const { scenario, meta } = genMultiScenario(new Rng(seed), "idempotence-eligible");
   if (!multiIdempotenceEligible(meta)) {
     return {
@@ -1849,15 +1569,8 @@ async function multiIdempotenceBatteryRun(seed: number): Promise<IterationResult
   return result;
 }
 
-/**
- * Directed discovery check-convergence entry: a CONSTRUCTED non-empty kept
- * set (the generator's "converges" force), then the apply-then-check
- * convergence proof runDiscoveryPredicted arms for fault-free non-empty runs.
- */
+/** The "converges" force pins pool repo 0 non-archived with no filters, so the kept set holds it for every master seed. */
 async function discoveryConvergesBatteryRun(seed: number): Promise<IterationResult> {
-  // CONSTRUCTED non-empty kept set: the "converges" force pins pool repo 0
-  // non-archived with no filters, so the kept set provably contains it -
-  // no draw budget, no miss seeds.
   const { scenario, meta } = genDiscoveryScenario(new Rng(seed), "converges");
   if (!discoveryConvergeEligible(meta)) {
     return {
@@ -1878,12 +1591,6 @@ async function discoveryConvergesBatteryRun(seed: number): Promise<IterationResu
   }
   return result;
 }
-/**
- * The fault half of the transport-misbehavior slot: section reads get the
- * bulk of the stream (every SECTION_PRIMARY_READ entry x 4 kinds x 2
- * budgets), and the three core paths - the contents fetch, the discovery
- * listing, and the report delivery - share the rest.
- */
 async function faultFuzzIteration(seed: number): Promise<IterationResult> {
   const roll = new Rng(seed ^ 0x7f4a7c15).int(5);
   if (roll === 0) {
@@ -1901,10 +1608,7 @@ async function faultFuzzIteration(seed: number): Promise<IterationResult> {
 async function main(): Promise<number> {
   const flags = parseFlags(process.argv.slice(2));
   const { seed: master, explicit } = masterSeed(flags);
-  // Replay convenience: one iteration under an EXPLICIT seed (--seed flag or
-  // FUZZ_SEED env, treated identically) runs that exact iteration seed, so a
-  // failing iteration reproduces directly from its printed seed. Otherwise
-  // the per-iteration seed is hash(master, i).
+  // One iteration under an explicit seed runs THAT iteration seed, so a printed seed replays directly.
   const replayOne = flags.iterations === 1 && explicit;
   console.log(`fuzz master seed: ${master} (replay: --seed ${master})`);
   console.log(`iterations: ${flags.iterations}`);
@@ -1926,17 +1630,17 @@ async function main(): Promise<number> {
       faultHistogram.set(cls, (faultHistogram.get(cls) ?? 0) + 1);
     }
   };
-  // Random-stream fixpoint-proof counts (mode:proof), so a gate that starves
-  // (e.g. multi idempotence at its measured ~5% eligibility) is VISIBLE in
-  // every run instead of silently vacuous; the fixpoint battery guarantees
-  // each proof once per soak regardless.
+  // Makes a starving gate visible (multi idempotence at ~5% eligibility); the battery guarantees each proof once per soak regardless.
   const proofCounts = new Map<string, number>();
+  const mergeHistogram = new Map<string, number>();
+  const recordMergeFeatures = (features: string[] | undefined): void => {
+    for (const feature of features ?? []) {
+      mergeHistogram.set(feature, (mergeHistogram.get(feature) ?? 0) + 1);
+    }
+  };
 
   for (let i = 0; i < flags.iterations; i++) {
     const seed = replayOne ? master : iterationSeed(master, i);
-    // Mode selection over an 8-way roll: ~1/4 multi-repo, 1/8 input fuzz,
-    // 1/8 transport misbehavior (split 50/50 between response corruption and
-    // injected faults), 1/8 discovery, the rest standard single-repo.
     const roll = new Rng(seed ^ 0x5bd1e995).int(8);
     let result: IterationResult;
     let mode: string;
@@ -1957,6 +1661,9 @@ async function main(): Promise<number> {
     } else if (roll === 4) {
       mode = "discovery";
       result = await discoveryFuzzIteration(seed);
+    } else if (new Rng(seed ^ 0x27d4eb2f).int(4) === 0) {
+      mode = "merge";
+      result = await mergeFuzzIteration(seed, { sections: flags.sections });
     } else {
       mode = "standard";
       result = await standardIteration(seed, { sections: flags.sections });
@@ -1966,6 +1673,7 @@ async function main(): Promise<number> {
     }
     recordCoverage(result.coverage);
     recordFaultClass(result.faultClass);
+    recordMergeFeatures(result.mergeFeatures);
     if (result.proof !== undefined) {
       const key = `${mode}:${result.proof}`;
       proofCounts.set(key, (proofCounts.get(key) ?? 0) + 1);
@@ -1973,11 +1681,11 @@ async function main(): Promise<number> {
     if (!result.ok) {
       failures++;
       failingSeeds.push(seed);
-      // Only the standard mode consumes --sections; when it is set, a faithful
-      // replay must pass the SAME flag, since the seed alone would draw from the
-      // full section pool and produce a different scenario. Echo it per failure.
+      // The seed alone draws from the full section pool, so a replay must carry the same --sections.
       const sectionsFlag =
-        mode === "standard" && flags.sections ? ` --sections ${flags.sections.join(",")}` : "";
+        (mode === "standard" || mode === "merge") && flags.sections
+          ? ` --sections ${flags.sections.join(",")}`
+          : "";
       const replay = `bun test/e2e/fuzz.ts --seed ${seed} --iterations 1${sectionsFlag}`;
       console.log(`  iter ${i} [${mode}] seed ${seed} FAIL: ${result.failure}`);
       console.log(`    replay: ${replay}`);
@@ -1991,23 +1699,10 @@ async function main(): Promise<number> {
     }
   }
 
-  // Directed batteries, each deterministically derived from the master seed:
-  // the random stream reaches their combinations only probabilistically, so
-  // each battery pins its guarantee once per soak. Skipped on a single-seed
-  // replay, which reproduces one random iteration and must not drag the
-  // battery runs along.
   let batteryFailures = 0;
   if (!replayOne) {
-    // `--iterations 0` runs ZERO random iterations and then the batteries, so
-    // this one command reproduces exactly a failing battery (every battery
-    // derives from the master seed alone) without re-running the random
-    // stream.
     const batteryReplay = `bun test/e2e/fuzz.ts --seed ${master} --iterations 0`;
     type BatteryEntry = [string, (seed: number) => Promise<IterationResult>];
-    // The one battery loop: a header line, then each entry at its
-    // deterministic seed (seedBase + index mixed with the master), with the
-    // shared coverage/fault-class recording and failure reporting the six
-    // batteries previously restated.
     const runBattery = async (
       header: string,
       seedBase: number,
@@ -2019,6 +1714,7 @@ async function main(): Promise<number> {
         const result = await run(seed);
         recordCoverage(result.coverage);
         recordFaultClass(result.faultClass);
+        recordMergeFeatures(result.mergeFeatures);
         if (result.ok) {
           console.log(`  ${name} ok`);
           continue;
@@ -2030,8 +1726,6 @@ async function main(): Promise<number> {
       }
     };
 
-    // Witness battery: every (section, witness kind, mode) combination, so
-    // the mutation-class guard below is deterministic instead of flaky.
     const witnessEntries: BatteryEntry[] = [];
     for (const key of WITNESS_SECTIONS) {
       for (const kind of WITNESS_KINDS[key]) {
@@ -2045,15 +1739,8 @@ async function main(): Promise<number> {
     }
     await runBattery("witness battery (directed live-state witnesses)", 0x100000, witnessEntries);
 
-    // Input battery: every catalog case plus every raw pool entry, each run
-    // once per soak. Input mode holds 1/8 of the random stream, so a random
-    // draw covers a sparse subset of the ~15-case catalog per run; this pass
-    // exercises all of it deterministically, and pins that every raw pool
-    // string still fails the way its pool promises (a yaml-library upgrade
-    // changing parse behavior fails here, not in a nightly surprise). The run
-    // mode alternates by index parity - deterministic, so a mode-specific
-    // validation regression (e.g. an early exit only one mode takes) cannot
-    // escape the battery.
+    // The random stream covers a sparse subset of the catalog per run; this pass runs all of it, and pins
+    // that every raw pool string still fails the way its pool promises (a yaml upgrade fails here, not in a nightly).
     const inputSpecs: Array<{ name: string; spec: (rng: Rng) => RejectionSpec }> = [
       ...INVALID_SETTINGS_CASES.map(({ name, build }) => ({
         name,
@@ -2091,14 +1778,6 @@ async function main(): Promise<number> {
       }),
     );
 
-    // Fault battery: every SECTION_PRIMARY_READ section runs once per soak,
-    // paired with a fault kind x budget combo by rotating index so every
-    // combo also fires every soak (there are more sections than combos); the
-    // pairing and the mode rotate with the master seed, so soaks walk the
-    // full cross product over time, and assertFaultBatteryCoverage pins both
-    // per-soak guarantees. Labels/milestones entries get a matching witness
-    // (exact predictions); a transient combo must be indistinguishable from a
-    // healthy run, a fatal one must fail loudly naming its section.
     await runBattery(
       "fault battery (directed transport faults, every faultable section)",
       0x300000,
@@ -2110,11 +1789,6 @@ async function main(): Promise<number> {
       ),
     );
 
-    // Negative fault battery: each UNFAULTABLE_SECTIONS exemption must still
-    // be earned - one-shot faults armed on EVERY GET endpoint the section
-    // declares must all stay cold in a trigger-avoiding apply
-    // (unfaultableSectionRun's doc has the full contract). Once per soak,
-    // like the positive battery above.
     await runBattery(
       "unfaultable battery (declared reads stay cold in apply)",
       0x310000,
@@ -2123,9 +1797,6 @@ async function main(): Promise<number> {
       ),
     );
 
-    // Core-fault battery: the contentsGet victim rule and the issue-channel
-    // degrade contract, once per soak (see the helpers' doc for why the
-    // random stream alone leaves them near-vacuous at 30 iterations).
     await runBattery("core-fault battery (directed core-path faults)", 0x400000, [
       ["core.contentsGet/fatal", contentsFaultBatteryRun],
       ["core.discoveryList/fatal", discoveryFaultBatteryRun],
@@ -2134,13 +1805,26 @@ async function main(): Promise<number> {
       ["preflight/budget-survives", (seed) => preflightFaultRun(seed, true)],
     ]);
 
-    // Fixpoint battery: one multi apply-idempotence proof and one discovery
-    // convergence proof per soak. The standard-mode proof needs no entry -
-    // the witness battery's apply combos arm apply_idempotent
-    // deterministically already.
+    // No standard-mode entry: the witness battery's apply combos already arm apply_idempotent.
     await runBattery("fixpoint battery (directed apply-idempotence / convergence)", 0x500000, [
       ["multi/apply-idempotent", multiIdempotenceBatteryRun],
       ["discovery/converges", discoveryConvergesBatteryRun],
+    ]);
+
+    // Forced by the generator, so every refusal kind fires each soak instead of waiting on the ~1/30 random draw.
+    await runBattery("merge battery (directed layered merges)", 0x600000, [
+      ...(["merge", "replace"] as const).map(
+        (layering): BatteryEntry => [
+          `merge/valid/${layering}`,
+          (seed) => mergeValidBatteryRun(seed, layering),
+        ],
+      ),
+      ...MERGE_REFUSAL_KINDS.map(
+        (refusal): BatteryEntry => [
+          `merge/refused/${refusal}`,
+          (seed) => mergeFuzzIteration(seed, { force: { kind: "refused", refusal } }),
+        ],
+      ),
     ]);
   }
 
@@ -2148,15 +1832,13 @@ async function main(): Promise<number> {
   for (const key of [...coverage.keys()].sort()) {
     console.log(`  ${key}: ${coverage.get(key)}`);
   }
-  // The mutation-class guard: over the whole run (random stream + battery),
-  // labels must provably reach an update write, a delete write, and a clean
-  // verdict; milestones an update write and a clean verdict (delete is
-  // labels-only by design - milestones keep undeclared entries). "create" is
-  // tracked in the histogram but not required: it needs absent live state,
-  // which the battery deliberately never seeds.
+  // A standalone create needs live state the battery never seeds, so create is required only where
+  // delete plus create is the drift write (no update role).
   const REQUIRED_CLASSES: Record<WitnessSection, MutationClass[]> = {
     labels: ["update", "delete", "clean"],
+    autolinks: ["create", "delete", "clean"],
     milestones: ["update", "clean"],
+    deploy_keys: ["create", "delete", "clean"],
   };
   console.log("\nmutation-class coverage (successful writes from the mock's request log):");
   let coverageFailures = 0;
@@ -2180,12 +1862,8 @@ async function main(): Promise<number> {
     }
   }
 
-  // Fault classes fired across the run (random stream + battery). The battery
-  // guarantees every faultable endpoint AND every kind x budget combo each
-  // soak (the full endpoint x kind x verdict cross product accrues across
-  // soaks as the pairing rotates with the master seed), so a missing class
-  // here means a battery failure already counted above; this histogram is the
-  // visibility.
+  // The battery guarantees every faultable section's primary read and every kind x budget combo per soak,
+  // not their cross product, so an absent class here is not by itself a failure; the histogram is the visibility.
   console.log("\nfault-class coverage (endpoint kind/verdict fired):");
   if (faultHistogram.size === 0) {
     console.log("  (none)");
@@ -2197,8 +1875,18 @@ async function main(): Promise<number> {
     }
   }
 
-  // Fixpoint proofs the RANDOM stream armed (the battery adds one multi
-  // idempotence + one discovery convergence on top, printed above).
+  // The generator test pins that every merge axis is drawn; this is the per-soak visibility.
+  console.log("\nmerge-feature coverage (layered merge axes exercised):");
+  if (mergeHistogram.size === 0) {
+    console.log("  (none)");
+  } else {
+    for (const [feature, count] of [...mergeHistogram.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
+      console.log(`  ${feature}: ${count}`);
+    }
+  }
+
   console.log("\nfixpoint-proof coverage (random stream, mode:proof):");
   if (proofCounts.size === 0) {
     console.log("  (none)");
@@ -2211,7 +1899,7 @@ async function main(): Promise<number> {
   console.log(`\n${flags.iterations - failures}/${flags.iterations} iterations ok`);
   if (batteryFailures > 0) {
     console.log(
-      `directed battery failures (witness + input + fault + fixpoint): ${batteryFailures}`,
+      `directed battery failures (witness + input + fault + fixpoint + merge): ${batteryFailures}`,
     );
   }
   if (failingSeeds.length > 0) {

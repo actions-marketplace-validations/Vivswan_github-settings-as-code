@@ -1,0 +1,104 @@
+---
+# This repository's OWN settings. The fleet's central settings-repos heal
+# applies the six-layer merge of this file with the fleet layers; the sync
+# renders the same merge into .github/settings.yml.
+# Rendered once, repo-owned: template sync never rewrites it. Fleet defaults
+# merge UNDER this file - keys here win, null opts out, labels replace by
+# name, rulesets MERGE by name (rules append by type, nested objects merge
+# key by key, other arrays replace wholesale). The fleet invariants (squash-only merging, the main
+# and non-bypassable rulesets) sit ABOVE and cannot be overridden.
+# Undeclared labels are deleted against the MERGED roster; undeclared
+# rulesets are left alone.
+#
+# The fleet layers already carry everything this repository used to declare
+# by hand: the repository policy block, the dependabot labels (dependencies,
+# github_actions, javascript), the triage trio, the release-please labels,
+# the nightly and fuzzer tracking labels (nightly-failure, fuzz-nightly),
+# and the main ruleset with its code_scanning, code_quality, and
+# copilot_code_review rules.
+
+repository:
+  description: "GitHub Action applying declarative repository settings: rulesets, labels, branch protection, and more. A loud, stateless Probot Settings replacement."
+  # Declared even when empty: the apply manages only declared keys, so
+  # this keeps it healing out-of-band edits.
+  topics: github-action, repository-settings, settings-as-code, configuration-as-code, probot-settings, rulesets, branch-protection, labels
+  private: false
+
+rulesets:
+  # NARROWS the release-please module's release-tags ruleset: the fleet
+  # declares it over `v*`, which would also freeze the moving major tag
+  # (v2) that update-release.yml moves with the Actions token on every
+  # release. A same-name ruleset merges key by key and an array replaces
+  # wholesale, so this entry swaps only the include list and inherits
+  # everything else (rules, enforcement, bypass) from the fleet. The
+  # vX.Y.Z tags stay immutable: each points at a packaged commit, the
+  # release's merge commit's child carrying the built bundle and library
+  # (the tags cut before the pipeline packaged commits point at main
+  # commits from when main still committed the bundle). The `latest` and
+  # `build/*` tags match neither pattern; their rulesets are below.
+  - name: release-tags
+    conditions:
+      ref_name:
+        include:
+          - v*.*.*
+
+  # The moving major tags (v1, v2) move on purpose - every release in the
+  # line moves them to its packaged commit, forward only, under a lease -
+  # so no update rule, but they must never vanish: a deleted major bricks
+  # every @v2 consumer at once. fnmatch's * crosses dots, so v* also covers
+  # the vX.Y.Z tags; that overlap is a harmless union with release-tags above.
+  - name: major-release-tags
+    target: tag
+    enforcement: active
+    conditions:
+      ref_name:
+        include:
+          - v*
+        exclude: []
+    rules:
+      - type: deletion
+    bypass_actors:
+      - actor_id: 5
+        actor_type: RepositoryRole
+        bypass_mode: always
+
+  # The moving `latest` tag: post-green.yml and the release hook point it at
+  # the packaged commit of the newest main commit, forward only, under a
+  # lease, so no update or non_fast_forward rule (either would refuse that
+  # move). Deletion is the one thing it must never suffer: a deleted latest
+  # bricks every @latest consumer at once. No bypass, like the build-tags
+  # ruleset, so the apply heals an out-of-band bypass actor.
+  - name: latest-tag
+    target: tag
+    enforcement: active
+    conditions:
+      ref_name:
+        include:
+          - latest
+        exclude: []
+    rules:
+      - type: deletion
+    bypass_actors: []
+
+  # The packaged commits, one per green main commit: post-green.yml mints
+  # `build/<position>.<sha7>` once (its child, plus the built bundle and
+  # library) and prunes every tag beyond the ten newest, so a tag never
+  # moves in place (update, non_fast_forward) but may be deleted by the
+  # prune. Release tags and latest keep their own commits reachable; a
+  # build tag goes once ten newer commits are packaged, so a durable
+  # consumer pins a release.
+  # Declared with NO bypass, like the fleet's non-bypassable ruleset: an
+  # omitted key is invisible to drift detection, so the empty list is what
+  # lets the apply heal an out-of-band bypass actor.
+  - name: build-tags
+    target: tag
+    enforcement: active
+    conditions:
+      ref_name:
+        include:
+          - build/*
+        exclude: []
+    rules:
+      - type: update
+      - type: non_fast_forward
+    bypass_actors: []

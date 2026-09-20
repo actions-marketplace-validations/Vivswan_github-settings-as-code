@@ -1,9 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import { validateSectionShapes } from "../../../src/engine/validate.js";
 import { MockApi } from "../../../test/mock-api.js";
-import { ctx } from "../../../test/sections/context.js";
+import { fragmentFake } from "../../../test/sections/fragment-fake.js";
+import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
+import { REPO } from "../../../test/sections/section-run.js";
+import { describeProblem } from "../../problem.js";
+import {
+  driftOf,
+  type ExecTools,
+  planCheckNotes,
+  planContext,
+  planDrift,
+  type SectionPlan,
+} from "../contract/plan.js";
 import { webhooksSection } from "./index.js";
+import { webhooksMockHandlers } from "./mock.js";
 import type { WebhookConfig } from "./schema.js";
+
+function shapeError(doc: Record<string, unknown>, sourceLabel: string): string | null {
+  return validateSectionShapes(doc, sourceLabel).match(() => null, describeProblem);
+}
 
 const LIST = "GET /repos/o/r/hooks?per_page=100&page=1";
 
@@ -23,11 +39,10 @@ function liveHook(
   };
 }
 
-/** An apply-mode context whose resolver serves one fixed secret. */
-function applyCtx(api: MockApi, resolved: Record<string, string> = {}) {
+/** Execution tools serving fixed plaintexts; any other reference is a bug. */
+function tools(resolved: Record<string, string> = {}): ExecTools {
   return {
-    ...ctx(api),
-    resolveSecret: (reference: string): string => {
+    resolveSecret: (reference) => {
       const plaintext = resolved[reference];
       if (plaintext === undefined) {
         throw new Error(`test resolver has no value for ${reference}`);
@@ -37,10 +52,27 @@ function applyCtx(api: MockApi, resolved: Record<string, string> = {}) {
   };
 }
 
+const plan = (api: MockApi, desired: Parameters<typeof webhooksSection.plan>[1]) =>
+  webhooksSection.plan(planContext(webhooksSection, api, REPO), desired);
+
+/** The requests a plan would issue: role, path params, and the payload sealed with `resolved`. */
+async function requests(result: SectionPlan, resolved: Record<string, string> = {}) {
+  const exec = tools(resolved);
+  return Promise.all(
+    result.ops.map(async (op) => [
+      op.role,
+      op.params,
+      typeof op.payload === "function" ? await op.payload(exec) : op.payload,
+    ]),
+  );
+}
+
+const SECRET_NOTE =
+  "webhooks[https://x.test/h].config.secret: GitHub never reveals a webhook secret, so check mode cannot verify the declared value; apply re-sends it on every run";
+
 describe("webhooks shape", () => {
   test("an entry-level secret is rejected, pointing at config.secret", () => {
-    // The misplacement would otherwise pass the loose shape, ship the raw
-    // reference text verbatim, and create a silently unauthenticated hook.
+    // The misplacement would otherwise pass the loose shape, ship the raw reference text verbatim, and create a silently unauthenticated hook.
     const result = webhooksSection.shape.safeParse([
       { config: { url: "https://t.test/h" }, secret: "$HOOK_SECRET" },
     ]);
@@ -48,32 +80,26 @@ describe("webhooks shape", () => {
     expect(JSON.stringify(result.error?.issues)).toContain("config.secret");
   });
 
-  test("a name other than 'web' is rejected upfront", () => {
-    const error = validateSectionShapes(
+  test.each<[form: string, doc: Record<string, unknown>, error: string | null]>([
+    [
+      "a name other than 'web'",
       { webhooks: [{ name: "email", config: { url: "https://x.test/h" } }] },
-      "settings.yml",
-    );
-    expect(error).toContain("webhooks[0].name");
-  });
-
-  test("name 'web' and an omitted name both parse, in both knob forms", () => {
-    expect(
-      validateSectionShapes(
-        { webhooks: [{ name: "web", config: { url: "https://x.test/h" } }] },
-        "s.yml",
-      ),
-    ).toBeNull();
-    expect(
-      validateSectionShapes(
-        { webhooks: { undeclared: "delete", entries: [{ config: { url: "https://x.test/h" } }] } },
-        "s.yml",
-      ),
-    ).toBeNull();
-  });
-
-  test("a missing config is rejected with its path", () => {
-    const error = validateSectionShapes({ webhooks: [{ events: ["push"] }] }, "s.yml");
-    expect(error).toContain("webhooks[0].config");
+      "webhooks[0].name",
+    ],
+    ["name 'web'", { webhooks: [{ name: "web", config: { url: "https://x.test/h" } }] }, null],
+    [
+      "an omitted name in the wrapped form",
+      { webhooks: { _undeclared: "delete", entries: [{ config: { url: "https://x.test/h" } }] } },
+      null,
+    ],
+    ["a missing config", { webhooks: [{ events: ["push"] }] }, "webhooks[0].config"],
+  ])("%s validates as %j", (_form, doc, error) => {
+    const verdict = shapeError(doc, "settings.yml");
+    if (error === null) {
+      expect(verdict).toBeNull();
+    } else {
+      expect(verdict).toContain(error);
+    }
   });
 });
 
@@ -87,238 +113,300 @@ describe("webhooks secretValues", () => {
     ).toEqual([{ label: 'the webhook "https://a.test" config.secret', value: "$A" }]);
     expect(
       webhooksSection.secretValues?.({
-        undeclared: "keep",
+        _undeclared: "keep",
         entries: [{ config: { url: "https://a.test", secret: "$B" } }],
       }),
     ).toEqual([{ label: 'the webhook "https://a.test" config.secret', value: "$B" }]);
   });
 
   test("malformed containers return [] and leave the error to validation", () => {
-    // The extractor's contract is defensiveness: it can face any merged
-    // value, so a malformed declaration must not throw here - validation is
-    // where the user gets the actionable message.
-    for (const malformed of [null, "hooks", 42, { undeclared: "keep" }, [null, "x"]]) {
-      // The double cast feeds the extractor a PRE-VALIDATION value on purpose.
+    // The extractor faces any merged value, so the double cast feeds it a pre-validation value on purpose; validation is where the user gets the
+    // message.
+    for (const malformed of [null, "hooks", 42, { _undeclared: "keep" }, [null, "x"]]) {
       expect(webhooksSection.secretValues?.(malformed as unknown as WebhookConfig[])).toEqual([]);
     }
   });
 });
 
-describe("webhooks apply", () => {
-  test("creates a missing hook with the resolved secret in the POST config", async () => {
-    const api = new MockApi({ [LIST]: { data: [] } }).allowMutations("POST /repos/o/r/hooks");
-    const result = await webhooksSection.run(applyCtx(api, { $HOOK: "plain-secret" }), [
+describe("webhooks plan", () => {
+  test("a missing hook plans a create whose POST seals the resolved secret; its drift is the missing line plus the cannot-verify facet", async () => {
+    // A fake that would accept any write: the plan must still issue none.
+    const api = new MockApi({ [LIST]: { data: [] } }, { unroutedMutations: "succeed" });
+    const result = await plan(api, [
       {
         config: { url: "https://x.test/h", content_type: "json", secret: "$HOOK" },
         events: ["push"],
         active: true,
       },
     ]);
-    expect(result.changes).toEqual(['created webhook "https://x.test/h"']);
-    const post = api.mutations()[0];
-    expect(post?.path).toBe("/repos/o/r/hooks");
-    expect(post?.payload).toEqual({
-      name: "web",
-      config: { url: "https://x.test/h", content_type: "json", secret: "plain-secret" },
-      events: ["push"],
-      active: true,
-    });
+    expect(result.ops.map((op) => [op.role, op.drift, op.describe, op.change])).toEqual([
+      [
+        "create",
+        {
+          unverifiable: SECRET_NOTE,
+          lines: [
+            "webhooks[https://x.test/h]: missing - declared in the settings file but not on the repo; apply will create it",
+          ],
+        },
+        'creating webhook "https://x.test/h"',
+        'created webhook "https://x.test/h"',
+      ],
+    ]);
+    expect(await requests(result, { $HOOK: "plain-secret" })).toEqual([
+      [
+        "create",
+        undefined,
+        {
+          config: { url: "https://x.test/h", content_type: "json", secret: "plain-secret" },
+          events: ["push"],
+          active: true,
+        },
+      ],
+    ]);
+    expect(planDrift(result)).toEqual([
+      "webhooks[https://x.test/h]: missing - declared in the settings file but not on the repo; apply will create it",
+    ]);
+    expect(planCheckNotes(result)).toEqual([SECRET_NOTE]);
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([LIST]);
   });
 
-  test("a declared secret forces the config PATCH every run, even with zero drift", async () => {
-    const api = new MockApi({
-      [LIST]: {
-        data: [liveHook(7, "https://x.test/h", { config: { url: "https://x.test/h" } })],
-      },
-    }).allowMutations("PATCH /repos/o/r/hooks/7/config");
-    const result = await webhooksSection.run(applyCtx(api, { $HOOK: "rotated" }), [
-      { config: { url: "https://x.test/h", secret: "$HOOK" } },
-    ]);
-    expect(api.mutations()).toHaveLength(1);
-    expect(api.mutations()[0]?.path).toBe("/repos/o/r/hooks/7/config");
-    expect(api.mutations()[0]?.payload).toEqual({ url: "https://x.test/h", secret: "rotated" });
-    expect(result.changes).toEqual([
-      'updated webhook "https://x.test/h" config (the declared secret is re-sent every run)',
-    ]);
-  });
-
-  test("config drift without a secret goes through the config sub-endpoint only", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(3, "https://x.test/h")] }, // live content_type json
-    }).allowMutations("PATCH /repos/o/r/hooks/3/config");
-    const result = await webhooksSection.run(applyCtx(api), [
-      { config: { url: "https://x.test/h", content_type: "form" } },
-    ]);
-    expect(api.mutations().map((m) => m.path)).toEqual(["/repos/o/r/hooks/3/config"]);
-    expect(api.mutations()[0]?.payload).toEqual({ url: "https://x.test/h", content_type: "form" });
-    expect(result.changes).toEqual(['updated webhook "https://x.test/h" config']);
-  });
-
-  test("events/active drift goes through the general PATCH with NO config key", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(4, "https://x.test/h", { active: true, events: ["push"] })] },
-    }).allowMutations("PATCH /repos/o/r/hooks/4");
-    const result = await webhooksSection.run(applyCtx(api), [
-      {
-        config: { url: "https://x.test/h", content_type: "json" },
-        events: ["push", "release"],
-        active: false,
-      },
-    ]);
-    expect(api.mutations().map((m) => m.path)).toEqual(["/repos/o/r/hooks/4"]);
-    const payload = api.mutations()[0]?.payload as Record<string, unknown>;
-    expect(payload).toEqual({ events: ["push", "release"], active: false });
-    expect("config" in payload).toBe(false);
-    expect(result.changes).toEqual(['updated webhook "https://x.test/h"']);
-  });
-
-  test("insecure_ssl number vs string never drifts", async () => {
+  test("a declared secret plans the config PATCH with EMPTY drift under the facet, even with zero config drift", async () => {
     const api = new MockApi({
       [LIST]: {
         data: [
-          liveHook(6, "https://x.test/h", {
-            config: { url: "https://x.test/h", content_type: "json", insecure_ssl: "0" },
+          liveHook(7, "https://x.test/h", {
+            config: { url: "https://x.test/h", secret: "********" },
           }),
         ],
       },
     });
-    const result = await webhooksSection.run(applyCtx(api), [
+    const result = await plan(api, [{ config: { url: "https://x.test/h", secret: "$HOOK" } }]);
+    expect(result.ops.map((op) => [op.role, op.params, op.drift, op.change])).toEqual([
+      [
+        "updateConfig",
+        { hook_id: "7" },
+        { unverifiable: SECRET_NOTE, lines: [] },
+        'updated webhook "https://x.test/h" config (the declared secret is re-sent every run)',
+      ],
+    ]);
+    // "$HOOK" vs "********" would be drift if the secret were compared.
+    expect(planDrift(result)).toEqual([]);
+    expect(planCheckNotes(result)).toEqual([SECRET_NOTE]);
+    expect(await requests(result, { $HOOK: "rotated" })).toEqual([
+      ["updateConfig", { hook_id: "7" }, { url: "https://x.test/h", secret: "rotated" }],
+    ]);
+  });
+
+  test("config drift without a secret is the config sub-endpoint alone; events/active drift the general PATCH with NO config key", async () => {
+    const api = new MockApi({
+      [LIST]: {
+        data: [
+          liveHook(3, "https://x.test/h"),
+          liveHook(4, "https://y.test/h", { config: { url: "https://y.test/h" } }),
+        ],
+      },
+    });
+    const result = await plan(api, [
+      { config: { url: "https://x.test/h", content_type: "form" } },
+      { config: { url: "https://y.test/h" }, events: ["push", "release"], active: false },
+    ]);
+    expect(result.ops.map((op) => [op.role, op.params, driftOf(op), op.change])).toEqual([
+      [
+        "updateConfig",
+        { hook_id: "3" },
+        [
+          'webhooks[https://x.test/h].config.content_type: declared "form" != live "json"; apply will set the declared value',
+        ],
+        'updated webhook "https://x.test/h" config',
+      ],
+      [
+        "update",
+        { hook_id: "4" },
+        [
+          'webhooks[https://y.test/h].events: missing "release"',
+          "webhooks[https://y.test/h].active: declared false != live true; apply will set the declared value",
+        ],
+        'updated webhook "https://y.test/h"',
+      ],
+    ]);
+    expect(await requests(result)).toEqual([
+      ["updateConfig", { hook_id: "3" }, { url: "https://x.test/h", content_type: "form" }],
+      ["update", { hook_id: "4" }, { events: ["push", "release"], active: false }],
+    ]);
+    expect(planCheckNotes(result)).toEqual([]);
+  });
+
+  test.each<[form: string, live: Record<string, unknown>, declared: WebhookConfig]>([
+    [
+      "insecure_ssl as a number against GitHub's stored string",
+      liveHook(6, "https://x.test/h", {
+        config: { url: "https://x.test/h", content_type: "json", insecure_ssl: "0" },
+      }),
       { config: { url: "https://x.test/h", content_type: "json", insecure_ssl: 0 } },
-    ]);
-    expect(api.mutations()).toEqual([]);
-    expect(result.changes).toEqual([]);
-  });
-
-  test("a changed config.url is a new identity: create plus a kept undeclared note", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(8, "https://old.test/h")] },
-    }).allowMutations("POST /repos/o/r/hooks");
-    const result = await webhooksSection.run(applyCtx(api), [
-      { config: { url: "https://new.test/h" } },
-    ]);
-    expect(api.mutations().map((m) => `${m.method} ${m.path}`)).toEqual(["POST /repos/o/r/hooks"]);
-    expect(result.changes).toEqual(['created webhook "https://new.test/h"']);
-    expect(result.notes[0]).toContain('webhook "https://old.test/h" exists on the repo');
-    expect(result.notes[0]).toContain('"undeclared: keep"');
-  });
-
-  test("undeclared: delete removes undeclared hooks", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(9, "https://stray.test/h")] },
-    }).allowMutations("DELETE /repos/o/r/hooks/9");
-    const result = await webhooksSection.run(applyCtx(api), {
-      undeclared: "delete",
-      entries: [],
+    ],
+    [
+      "events in another order",
+      liveHook(21, "https://x.test/h", { events: ["release", "push"] }),
+      { config: { url: "https://x.test/h", content_type: "json" }, events: ["push", "release"] },
+    ],
+  ])("%s plans nothing", async (_form, live, declared) => {
+    expect(await plan(new MockApi({ [LIST]: { data: [live] } }), [declared])).toEqual({
+      ops: [],
+      notes: [],
+      drift: [],
     });
-    expect(api.mutations().map((m) => `${m.method} ${m.path}`)).toEqual([
-      "DELETE /repos/o/r/hooks/9",
+  });
+
+  test("a changed config.url is a new identity: a create plus a kept undeclared note, or a delete under _undeclared:delete", async () => {
+    const api = new MockApi({ [LIST]: { data: [liveHook(8, "https://old.test/h")] } });
+    const kept = await plan(api, [{ config: { url: "https://new.test/h" } }]);
+    expect(kept.ops.map((op) => [op.role, op.params])).toEqual([["create", undefined]]);
+    expect(kept.notes).toEqual([
+      'webhook "https://old.test/h" exists on the repo but is not declared in the settings file; kept under "_undeclared: keep" - add it to the settings file to manage it, or set "_undeclared: delete" to have apply DELETE it',
     ]);
-    expect(result.changes).toEqual(['DELETED undeclared webhook "https://stray.test/h"']);
-  });
-
-  test("a declared url matching several live hooks fails loudly, naming their ids", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(11, "https://x.test/h"), liveHook(12, "https://x.test/h")] },
+    const deleted = await plan(api, {
+      _undeclared: "delete",
+      entries: [{ config: { url: "https://new.test/h" } }],
     });
-    await expect(
-      webhooksSection.run(applyCtx(api), [{ config: { url: "https://x.test/h" } }]),
-    ).rejects.toThrow(/matches 2 live hooks \(ids 11, 12\)/);
-    expect(api.mutations()).toEqual([]);
+    expect(deleted.notes).toEqual([]);
+    expect(deleted.ops.map((op) => [op.role, op.params, driftOf(op), op.change])).toEqual([
+      [
+        "create",
+        undefined,
+        [
+          "webhooks[https://new.test/h]: missing - declared in the settings file but not on the repo; apply will create it",
+        ],
+        'created webhook "https://new.test/h"',
+      ],
+      [
+        "remove",
+        { hook_id: "8" },
+        [
+          'webhooks[https://old.test/h]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
+        ],
+        'DELETED undeclared webhook "https://old.test/h"',
+      ],
+    ]);
   });
 
-  test("ambiguity fails BEFORE any write, even when an earlier entry would create", async () => {
-    // The regression the pre-scan exists for: a missing url declared BEFORE
-    // the ambiguous one would have been POSTed by a mid-loop error. POST is
-    // permitted here so a partial write would show, and zero mutations
-    // proves the scan runs first.
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(11, "https://dup.test/h"), liveHook(12, "https://dup.test/h")] },
-    }).allowMutations("POST /repos/o/r/hooks");
-    await expect(
-      webhooksSection.run(applyCtx(api), [
-        { config: { url: "https://new.test/h" } },
-        { config: { url: "https://dup.test/h" } },
-      ]),
-    ).rejects.toThrow(/matches 2 live hooks/);
-    expect(api.mutations()).toEqual([]);
-  });
-
-  test("check mode reports the same ambiguity error, writing nothing", async () => {
+  test("two live hooks under one url fail BEFORE any operation is planned, declared or not", async () => {
+    // A missing url declared before the ambiguous one must not become a create; the live index is built over the whole list first.
     const api = new MockApi({
       [LIST]: { data: [liveHook(11, "https://dup.test/h"), liveHook(12, "https://dup.test/h")] },
     });
+    const refusal =
+      'webhooks: GitHub holds webhooks that resolve to one identity: "https://dup.test/h (hook id 11)" and "https://dup.test/h (hook id 12)". ' +
+      "This section manages one webhook per identity, so it cannot tell them apart; delete all but one of each on GitHub, then run again";
     await expect(
-      webhooksSection.run(ctx(api, true), [
+      plan(api, [
         { config: { url: "https://new.test/h" } },
         { config: { url: "https://dup.test/h" } },
       ]),
-    ).rejects.toThrow(/matches 2 live hooks/);
-    expect(api.mutations()).toEqual([]);
+    ).rejects.toThrow(refusal);
+    await expect(plan(api, [])).rejects.toThrow(refusal);
   });
 
   test("two declared entries with the same url are rejected before any call", async () => {
     const api = new MockApi({});
     await expect(
-      webhooksSection.run(applyCtx(api), [
-        { config: { url: "https://x.test/h" } },
-        { config: { url: "https://x.test/h" } },
-      ]),
+      plan(api, [{ config: { url: "https://x.test/h" } }, { config: { url: "https://x.test/h" } }]),
     ).rejects.toThrow(/Keep exactly one entry per resource/);
     expect(api.calls).toEqual([]);
   });
-});
 
-describe("webhooks check", () => {
-  test("the secret never enters the diff and yields a cannot-verify note", async () => {
-    const api = new MockApi({
-      [LIST]: {
-        data: [
-          liveHook(20, "https://x.test/h", {
-            config: { url: "https://x.test/h", content_type: "json", secret: "********" },
-          }),
+  test("executing the plan against the mock fragment converges: the re-plan carries only the secret-bearing config PATCHes", async () => {
+    const api = fragmentFake(webhooksSection, webhooksMockHandlers, {
+      hooks: [
+        {
+          id: 601,
+          events: ["push"],
+          config: { url: "https://ci.test/hook", content_type: "form" },
+        },
+        { id: 602, config: { url: "https://stray.test/hook", content_type: "json" } },
+      ],
+    });
+    const { first, second, changes, notes } = await provePlanIdempotent(
+      webhooksSection,
+      api,
+      {
+        _undeclared: "delete",
+        entries: [
+          {
+            config: {
+              url: "https://ci.test/hook",
+              content_type: "json",
+              secret: "$WEBHOOK_SECRET",
+            },
+            events: ["push", "pull_request"],
+            active: true,
+          },
+          {
+            config: {
+              url: "https://deploy.test/hook",
+              content_type: "json",
+              secret: "$WEBHOOK_SECRET",
+            },
+          },
         ],
       },
-    });
-    const result = await webhooksSection.run(ctx(api, true), [
-      { config: { url: "https://x.test/h", content_type: "json", secret: "$HOOK" } },
+      tools({ $WEBHOOK_SECRET: "hook-secret-1" }),
+    );
+    expect(changes).toEqual([
+      'updated webhook "https://ci.test/hook" config (the declared secret is re-sent every run)',
+      'updated webhook "https://ci.test/hook"',
+      'created webhook "https://deploy.test/hook"',
+      'DELETED undeclared webhook "https://stray.test/hook"',
     ]);
-    // "$HOOK" vs "********" would be drift if the secret were compared.
-    expect(result.drift).toEqual([]);
-    expect(result.notes).toEqual([
-      `webhooks["https://x.test/h"].config.secret: GitHub never reveals a webhook secret (reads echo "********"), so the declared value cannot be verified; apply re-sends it on every run so rotations propagate`,
+    expect(notes).toEqual([]);
+    // provePlanIdempotent executes the converged second plan too, so the two secret-bearing config PATCHes land once more.
+    expect(api.writes).toEqual([
+      "PATCH /repos/o/r/hooks/601/config",
+      "PATCH /repos/o/r/hooks/601",
+      "POST /repos/o/r/hooks",
+      "DELETE /repos/o/r/hooks/602",
+      "PATCH /repos/o/r/hooks/601/config",
+      expect.stringMatching(/^PATCH \/repos\/o\/r\/hooks\/\d+\/config$/),
     ]);
-    expect(api.mutations()).toEqual([]);
+    // The created hook now exists, so its secret recurs as a config PATCH: the facet with no lines, which check mode reads as clean plus the note.
+    expect(first.ops.map((op) => op.role)).toEqual(["updateConfig", "update", "create", "remove"]);
+    expect(second.ops.map((op) => [op.role, op.params, op.drift])).toEqual([
+      [
+        "updateConfig",
+        { hook_id: "601" },
+        { unverifiable: expect.stringContaining("webhooks[https://ci.test/hook]"), lines: [] },
+      ],
+      [
+        "updateConfig",
+        { hook_id: expect.any(String) },
+        {
+          unverifiable: expect.stringContaining("webhooks[https://deploy.test/hook]"),
+          lines: [],
+        },
+      ],
+    ]);
+    expect(planDrift(second)).toEqual([]);
+    expect(api.state.hooks.map((hook) => [hook.config, hook.events, hook.active])).toEqual([
+      [
+        { url: "https://ci.test/hook", content_type: "json", secret: "hook-secret-1" },
+        ["push", "pull_request"],
+        true,
+      ],
+      [
+        { url: "https://deploy.test/hook", content_type: "json", secret: "hook-secret-1" },
+        ["push"],
+        true,
+      ],
+    ]);
   });
 
-  test("events order never drifts; a real events difference does", async () => {
-    const api = new MockApi({
-      [LIST]: {
-        data: [liveHook(21, "https://x.test/h", { events: ["release", "push"] })],
-      },
-    });
-    const clean = await webhooksSection.run(ctx(api, true), [
-      { config: { url: "https://x.test/h", content_type: "json" }, events: ["push", "release"] },
-    ]);
-    expect(clean.drift).toEqual([]);
-    const drifted = await webhooksSection.run(ctx(api, true), [
-      { config: { url: "https://x.test/h", content_type: "json" }, events: ["push", "issues"] },
-    ]);
-    expect(drifted.drift).toHaveLength(1);
-    expect(drifted.drift?.[0]).toContain("order-insensitively");
-  });
-
-  test("a missing declared hook is drift; an undeclared live hook under delete is drift", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveHook(22, "https://stray.test/h")] },
-    });
-    const result = await webhooksSection.run(ctx(api, true), {
-      undeclared: "delete",
-      entries: [{ config: { url: "https://x.test/h" } }],
-    });
-    expect(result.drift).toEqual([
-      `webhooks["https://x.test/h"]: missing - declared in the settings file but not on the repo; apply will create it`,
-      `webhooks["https://stray.test/h"]: undeclared - not in the settings file and "undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it`,
-    ]);
-    expect(api.mutations()).toEqual([]);
+  test("the read port exposes exactly the list role in its denied posture", () => {
+    const ctx = planContext(webhooksSection, new MockApi({}), REPO);
+    expect(Object.keys(ctx.read)).toEqual(["list"]);
+    // @ts-expect-error a write role is not a read: the port has no `create`
+    ctx.read.create;
+    // @ts-expect-error nor an `updateConfig`
+    ctx.read.updateConfig;
+    // @ts-expect-error a "denied" primary read offers no 404-tolerant helper
+    ctx.read.list.probeAbsent;
   });
 });

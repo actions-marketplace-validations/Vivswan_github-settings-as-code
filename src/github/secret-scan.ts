@@ -1,20 +1,16 @@
 /**
- * Plain-data normalization and secret-field scanning for outgoing request
- * payloads, dependency-free on purpose (no octokit, no @actions/core): the
- * client calls this before every request, and the guarantees here - nothing
- * payload-supplied ever executes, the scanned tree IS the sent tree, secret
- * fields are masked in traces - must hold independent of any transport.
+ * Plain-data normalization and secret-field scanning for outgoing payloads, dependency-free on purpose: the guarantees
+ * (no payload-supplied method or accessor is ever invoked, the scanned tree IS the sent tree, secret fields are masked
+ * in traces) must hold independent of any transport.
  */
 
 import { nonPlainKind } from "../plain-data.js";
 
-/** The constant written over a secret-bearing request field in the debug trace. */
 const SECRET_FIELD_PLACEHOLDER = "***";
 
 /**
- * Octokit's own body rule: only plain objects and arrays are stringified.
- * Arrays must be genuine base-class arrays - a subclass can override map
- * and iteration, which is foreign code the normalizer must never invoke.
+ * Octokit's own body rule: only plain objects and arrays are stringified. An array subclass can override map and
+ * iteration, which is foreign code the normalizer must never invoke.
  */
 function isPlainJsonContainer(value: unknown): boolean {
   if (typeof value !== "object" || value === null) {
@@ -28,12 +24,8 @@ function isPlainJsonContainer(value: unknown): boolean {
 }
 
 /**
- * The typed rejection normalizePlainData raises, carrying WHERE (the key
- * path, field names only - never a value) and WHAT (the value class) so the
- * abort message can name the offending field. redactSecretPayloadSafe
- * rethrows only THIS class's information through its fail-closed catch;
- * anything else a hostile object throws stays swallowed so no foreign
- * message can leak.
+ * Carries WHERE (the key path: field names only, never a value) and WHAT (the value class). redactSecretPayloadSafe
+ * reports only THIS class's information; anything else a hostile object throws is swallowed so no foreign message leaks.
  */
 class NotPlainDataError extends Error {
   constructor(
@@ -44,7 +36,6 @@ class NotPlainDataError extends Error {
   }
 }
 
-/** Render a normalizePlainData key path ("config.starts_at", "contexts[2]"). */
 function renderKeyPath(path: readonly string[]): string {
   return path
     .map((segment, index) =>
@@ -54,37 +45,24 @@ function renderKeyPath(path: readonly string[]): string {
 }
 
 /**
- * Build the normalized plain-data tree BY HAND, never handing the input to
- * JSON.stringify: stringify honors toJSON, and a toJSON can return a
- * different container that hides a secret under no field name at all
- * ({secret, toJSON: () => [value]} traces the value with no key to match).
- * No payload-supplied code EVER runs: properties are read through their
- * descriptors and an enumerable accessor property is rejected UNREAD (a
- * getter is code, not data - and a getter that ran could sabotage the
- * globals the rest of the pipeline uses), toJSON is never invoked, methods
- * are never dispatched. Non-enumerable and symbol-keyed properties are
- * ignored entirely, never inspected - the set stringify would serialize is
- * exactly the set walked, and only the normalized COPY is ever sent, so
- * ignored code can neither execute nor reach the wire. Anything else that
- * is not JSON plain data - a function, a bigint,
- * a symbol, a class instance, a non-plain prototype, an accessor - THROWS
- * into the caller's fail-closed catch. Cycles exhaust the stack and are
- * caught the same way.
+ * Built BY HAND, never via JSON.stringify: it honors toJSON, and a toJSON can return a container that hides a secret
+ * under no field name ({secret, toJSON: () => [value]}). No payload method, accessor, or toJSON is ever invoked.
  *
- * For plain JSON data the output stringifies byte-identically to the
- * input: undefined-valued object keys are dropped, undefined array items,
- * holes, and non-finite numbers become null - exactly JSON.stringify's own
- * rules.
- * Note YAML can step OUTSIDE plain data through explicit tags
- * (!!timestamp parses to a Date, !!binary to a Uint8Array); those throw
- * here and abort the request with a message naming the offending field's
- * key path and value class, which beats the garbage their old
- * stringification produced.
+ * a property         -> read through its descriptor; an enumerable accessor is rejected UNREAD (a getter could sabotage globals)
+ * an object's keys   -> only Object.keys are copied, so symbol and non-enumerable keys never reach the copy (array indices do)
+ * a container again  -> rejected when it is one of its own ancestors (a YAML alias cycle); a sibling alias is copied twice
+ * the wire           -> only the copy is sent
  */
-function normalizePlainData(value: unknown, path: string[] = []): unknown {
+function normalizePlainData(
+  value: unknown,
+  path: string[] = [],
+  ancestors: Set<object> = new Set(),
+): unknown {
   if (value === null) {
     return null;
   }
+  // For plain JSON data the output stringifies byte-identically to the input: JSON.stringify's own rules for undefined,
+  // holes, and non-finite numbers.
   switch (typeof value) {
     case "string":
     case "boolean":
@@ -96,14 +74,19 @@ function normalizePlainData(value: unknown, path: string[] = []): unknown {
     default:
       throw new NotPlainDataError(path, nonPlainKind(value));
   }
+  // A class instance, a non-plain prototype, a function, a bigint: each THROWS into the caller's fail-closed catch.
+  // YAML reaches this through explicit tags: !!timestamp parses to a Date.
   if (!isPlainJsonContainer(value)) {
     throw new NotPlainDataError(path, nonPlainKind(value));
   }
+  if (ancestors.has(value)) {
+    throw new NotPlainDataError(path, "a reference back to one of its own containers");
+  }
+  // One frame per nesting level: a helper for the container body would halve the depth a valid payload may reach.
+  ancestors.add(value);
   const descriptors = Object.getOwnPropertyDescriptors(value);
   if (Array.isArray(value)) {
-    // Base-class array (isPlainJsonContainer checked the prototype); a
-    // manual index loop over descriptors never dispatches .map or invokes
-    // an index accessor someone defineProperty'd onto the array.
+    // A manual index loop over descriptors never dispatches .map or invokes an index accessor someone defineProperty'd onto the array.
     const items: unknown[] = [];
     for (let index = 0; index < value.length; index++) {
       const descriptor = descriptors[index];
@@ -115,8 +98,11 @@ function normalizePlainData(value: unknown, path: string[] = []): unknown {
         throw new NotPlainDataError([...path, String(index)], "an accessor property");
       }
       const item: unknown = descriptor.value;
-      items.push(item === undefined ? null : normalizePlainData(item, [...path, String(index)]));
+      items.push(
+        item === undefined ? null : normalizePlainData(item, [...path, String(index)], ancestors),
+      );
     }
+    ancestors.delete(value);
     return items;
   }
   const out: Record<string, unknown> = Object.create(null);
@@ -132,29 +118,19 @@ function normalizePlainData(value: unknown, path: string[] = []): unknown {
     if (item === undefined) {
       continue;
     }
-    out[key] = normalizePlainData(item, [...path, key]);
+    out[key] = normalizePlainData(item, [...path, key], ancestors);
   }
+  ancestors.delete(value);
   return out;
 }
 
 /**
- * The scan entry point: normalize, then walk. The hand-rolled
- * normalization (see normalizePlainData) reads the input once into a pure
- * plain-data tree; redactSecretPayload walks that tree, the trace prints
- * it (masked), and the request SENDS it - one read, one truth, and no
- * exotic object can make the scan, the trace, and the wire disagree.
- * YAML-derived payloads are plain data apart from the explicit-tag escape
- * hatch normalizePlainData documents; this is the runtime enforcement of
- * that boundary, and nothing payload-supplied is ever executed on the way.
+ * One read, one truth: normalizePlainData reads the input once into a plain-data tree; the scan walks it, the trace
+ * prints it masked, and the request SENDS it, so no exotic object can make the scan, the trace, and the wire disagree.
  *
- * Primitives pass through untouched - they carry no named fields for the
- * scan, and a bare-value secret is unsupported by design. Any other
- * non-plain payload (a Buffer, a typed array, a stream, anything carrying
- * a function or exotic prototype anywhere in its graph) fails `ok: false`
- * and is never sent: octokit would pass a non-plain body to fetch
- * verbatim, so normalizing it would silently change the wire, and sending
- * it unscanned would be a blind spot. The caller aborts instead of
- * sending what it could not inspect.
+ * undefined (no body), or a JSON primitive  -> passes through: no named fields, and a bare-value secret is unsupported by design
+ * plain objects and arrays throughout       -> normalized, scanned, sent
+ * a non-plain value, at any depth           -> `ok: false`, never sent: normalizing a non-plain container would change what reaches fetch
  */
 export function redactSecretPayloadSafe(
   payload: unknown,
@@ -164,15 +140,11 @@ export function redactSecretPayloadSafe(
   if (payload === undefined) {
     return { ok: true, payload: undefined, traced: undefined, carriesSecret: false };
   }
-  // Everything reflective happens INSIDE the try: even Array.isArray and
-  // Object.getPrototypeOf can throw on a hostile proxy (a throwing or
-  // revoked trap), and an error thrown before the guard could carry a
-  // secret in its message.
+  // Everything reflective happens INSIDE the try: even Array.isArray can throw on a hostile proxy, and an error thrown
+  // before the guard could carry a secret in its message.
   try {
     if (typeof payload !== "object" || payload === null) {
-      // Only JSON primitives pass through - a function, bigint or symbol
-      // cannot be JSON-encoded and fails closed instead of reaching
-      // octokit un-normalized.
+      // A function, bigint, or symbol cannot be JSON-encoded and fails closed instead of reaching octokit un-normalized.
       const jsonPrimitive =
         payload === null ||
         typeof payload === "string" ||
@@ -192,40 +164,27 @@ export function redactSecretPayloadSafe(
     const scanned = redactSecretPayload(normalized);
     return { ok: true, payload: normalized, ...scanned };
   } catch (error) {
-    // Only our own typed rejection may contribute prose: it carries key
-    // PATHS (field names) and a value-class word, never a value - anything
-    // a hostile object threw is discarded wholesale.
+    // Only our own typed rejection may contribute prose: it carries key PATHS and a value-class word, never a value.
     return error instanceof NotPlainDataError
       ? { ok: false, reason: describeNotPlain(error) }
       : { ok: false };
   }
 }
 
-/** The abort-message clause for a non-plain payload, naming field and class. */
 function describeNotPlain(error: NotPlainDataError): string {
   const where = error.path.length > 0 ? `the value at "${renderKeyPath(error.path)}"` : "the value";
   return `${where} is not plain JSON data (${error.kind})`;
 }
 
-/** Request-payload field names whose values are secrets wherever they appear. */
 const SECRET_FIELD_NAMES = new Set(["secret", "encrypted_value"]);
 
 /**
- * Structural redaction of secret-bearing request fields before tracing.
- * The scan is recursive over objects and arrays and keys on the FIELD
- * NAMES alone (`secret`, `encrypted_value`), so a consumer nesting one
- * level deeper - or a new consumer entirely - is covered without declaring
- * anything here; an unenforced "declare your shape here" contract is how a
- * leak happens. Field-name keying cannot cover an UNNAMED value: a bare
- * string body has no key to match, so a future consumer must never send a
- * secret as the whole payload.
- * Copy-on-write: when no secret field is present the input is returned
- * unchanged (the trace is byte-identical); on a hit, `traced`
- * is a structural copy with only the secret fields masked - the request
- * sends the unmasked tree - and `carriesSecret` flags the request for
- * fail-closed error handling.
- * Over-matching an innocent field that happens to be named `secret` costs
- * a masked trace line and a withheld error body, never a wrong request.
+ * Keys on the FIELD NAMES alone, recursing over objects and arrays, so a consumer nesting one level deeper, or a new
+ * consumer entirely, is covered without declaring anything (an unenforced "declare your shape" contract is how a leak
+ * happens).
+ *
+ * an UNNAMED value (a bare string body)  -> uncovered: a secret must never be the whole payload
+ * a hit                                  -> `traced` is a masked copy; the request still sends the unmasked tree
  */
 function redactSecretPayload(payload: unknown): { traced: unknown; carriesSecret: boolean } {
   if (typeof payload !== "object" || payload === null) {
@@ -233,9 +192,6 @@ function redactSecretPayload(payload: unknown): { traced: unknown; carriesSecret
   }
   if (Array.isArray(payload)) {
     let hit = false;
-    // Index loop, not .map: the walker must not dispatch through mutable
-    // prototype methods (the tree it walks is ours, but the habit is the
-    // guarantee).
     const traced: unknown[] = [];
     for (let index = 0; index < payload.length; index++) {
       const scanned = redactSecretPayload(payload[index]);
@@ -246,9 +202,8 @@ function redactSecretPayload(payload: unknown): { traced: unknown; carriesSecret
   }
   const record = payload as Record<string, unknown>;
   let hit = false;
-  // Null prototype: JSON.parse creates own `__proto__` DATA properties, and
-  // assigning that key through a plain `{}` would hit the prototype setter
-  // and silently drop the branch from the trace.
+  // Null prototype: JSON.parse creates own `__proto__` DATA properties, and assigning that key through a plain `{}`
+  // would hit the prototype setter and silently drop the branch from the trace.
   const traced: Record<string, unknown> = Object.create(null);
   for (const [key, value] of Object.entries(record)) {
     if (SECRET_FIELD_NAMES.has(key.toLowerCase())) {

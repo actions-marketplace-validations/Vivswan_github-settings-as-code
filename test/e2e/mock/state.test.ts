@@ -1,12 +1,6 @@
 /**
- * State-layer unit tests: buildState overlay semantics and the write-to-read
- * transformer round trips. These run under the normal `bun test` suite (no
- * server, no subprocess). The transformer tests import the ENGINE's real
- * flatteners (flattenProtection, flattenEnvironment) and assert that flattening
- * a transformer's output reproduces the payload under the same declared-keys-
- * only subsetDiff the engine uses. Importing the real functions (not local
- * copies) is deliberate: it makes the test fail if a transformer and its
- * flattener ever drift, which is the whole point of the round trip.
+ * buildState overlay semantics and the write-to-read round trips. The round trips import the SECTIONS' real
+ * flatteners (src/sections/branches, src/sections/environments), not local copies, so a transformer that drifts from its flattener fails here.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -14,10 +8,14 @@ import { subsetDiff } from "../../../src/engine/diff.js";
 import {
   bypassActorStrings,
   classicViewOfRule,
-  flattenProtection,
-} from "../../../src/sections/branches/index.js";
+  RuleNode,
+} from "../../../src/sections/branches/graphql-rules.js";
+import { flattenProtection } from "../../../src/sections/branches/index.js";
 import { flattenEnvironment } from "../../../src/sections/environments/index.js";
+import { SECTIONS } from "../../../src/sections/registry.js";
 import { roleForPermission } from "../../../src/sections/shared/roles.js";
+import { genScenario } from "../generators.js";
+import { Rng } from "../prng.js";
 import { decodeNodeId, mintAppNodeId, mintNodeId } from "./node-id.js";
 import {
   applyRuleInput,
@@ -30,6 +28,8 @@ import {
   completeRule,
   environmentFromPut,
   invitationFromPut,
+  LIST_MOCKS,
+  type MockState,
   normalizePinnedSeed,
   protectionFromPut,
   ruleFromProtection,
@@ -55,16 +55,8 @@ describe("buildState overlay semantics", () => {
       "org",
     );
     expect(state.repo.description).toBe("overridden");
-    // Deep merge keeps sibling fixture fields under permissions.
     expect(state.repo.permissions).toMatchObject({ admin: false, push: true, pull: true });
-    // Untouched top-level fixture fields survive.
     expect(state.repo.default_branch).toBe("main");
-  });
-
-  test("explicit labels list replaces the (empty) baseline", () => {
-    const state = buildState({ labels: [{ name: "bug", color: "d73a4a" }] }, "org");
-    expect(state.labels).toHaveLength(1);
-    expect(state.labels[0]).toMatchObject({ name: "bug", color: "d73a4a" });
   });
 
   test("labels.generate sugar produces count labels with the prefix and color", () => {
@@ -81,16 +73,82 @@ describe("buildState overlay semantics", () => {
     for (const label of state.labels) {
       expect((label as Record<string, unknown>).color).toBe("abcdef");
     }
-    // Generated ids are unique.
     const ids = new Set(state.labels.map((l) => (l as Record<string, unknown>).id));
     expect(ids.size).toBe(3);
   });
 
-  test("actions retention and cache limits default to GitHub's values, overlay replaces", () => {
-    const state = buildState(undefined, "org");
-    expect(state.actions_retention).toEqual({ days: 90, maximum_allowed_days: 400 });
-    expect(state.cache_retention_limit).toEqual({ max_cache_retention_days: 7 });
-    expect(state.cache_storage_limit).toEqual({ max_cache_size_gb: 10 });
+  test("a sparse list seed is completed with its family's declared defaults; a deploy key loses its comment", () => {
+    // The defaults are the factory mock's own declaration, so the relation is "applied", not their values. The key
+    // comment is stripped the way GitHub stores a created key, so a converging apply over a seeded key proves the
+    // section compares algorithm + blob.
+    const label = { name: "bug", color: "d73a4a" };
+    const autolink = { key_prefix: "JIRA-", url_template: "https://j.example.com/<num>" };
+    const state = buildState(
+      {
+        labels: [label],
+        autolinks: [autolink],
+        deploy_keys: [{ title: "bot", key: "ssh-ed25519 AAAAC3seedseedseed deploy@bot" }],
+      },
+      "org",
+    );
+    expect(state.labels[0]).toMatchObject({ ...LIST_MOCKS.labels.defaults, ...label });
+    expect(state.autolinks[0]).toMatchObject({ ...LIST_MOCKS.autolinks.defaults, ...autolink });
+    expect(state.deploy_keys.map((key) => key.key)).toEqual(["ssh-ed25519 AAAAC3seedseedseed"]);
+  });
+
+  test("a pinned seed id anywhere in the overlay is reserved before any family mints", () => {
+    const state = buildState(
+      {
+        labels: [{ name: "minted" }, { name: "pinned", id: 90_000_001 }],
+        autolinks: [{ key_prefix: "A-", url_template: "u" }],
+        hooks: [{ config: { url: "https://example.test/hook" } }],
+        invitations: [{ invitee: { login: "carol" } }],
+        pull_bypass_list: [{ login: "dave" }],
+        environment_branch_policies: { prod: [{ id: 90_000_000, name: "main", type: "branch" }] },
+      },
+      "org",
+    );
+    const ids = [
+      ...state.labels,
+      ...state.autolinks,
+      ...state.hooks,
+      ...state.invitations,
+      ...state.pull_bypass_list,
+      ...(state.environment_branch_policies.prod ?? []),
+    ].map((item) => item.id as number);
+    expect(ids).toContain(90_000_000);
+    expect(ids).toContain(90_000_001);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(state.nextId).toBeGreaterThan(Math.max(...ids));
+  });
+
+  test("every id in a generated scenario's state is distinct, across every minting family", () => {
+    const mintingFamilies = (state: MockState) => [
+      ...state.labels,
+      ...state.autolinks,
+      ...state.deploy_keys,
+      ...state.hooks,
+      ...state.invitations,
+      ...state.pull_bypass_list,
+    ];
+    for (let seed = 0; seed < 25; seed++) {
+      const { scenario } = genScenario(new Rng(seed));
+      const state = buildState(scenario.live_state, scenario.owner_kind ?? "org");
+      const ids = mintingFamilies(state).map((item) => item.id as number);
+      expect(ids.every((id) => typeof id === "number")).toBe(true);
+      expect(new Set(ids).size, `seed ${seed}`).toBe(ids.length);
+      expect(state.nextId).toBeGreaterThan(Math.max(0, ...ids));
+    }
+  });
+
+  test("every section built on the list factory has a completion spec, and nothing else does", () => {
+    // A factory module carries its declaration; its mock serves seeds through LIST_MOCKS, so a new
+    // factory section without a spec would serve incomplete seeds until it lands here.
+    const factoryKeys = SECTIONS.filter((section) => "decl" in section).map((s) => s.key);
+    expect(Object.keys(LIST_MOCKS).sort()).toEqual([...factoryKeys].sort());
+  });
+
+  test("a seeded actions_retention replaces the default", () => {
     const seeded = buildState(
       { actions_retention: { days: 30, maximum_allowed_days: 400 } },
       "org",
@@ -111,23 +169,16 @@ describe("buildState overlay semantics", () => {
   });
 
   test("reslugging one state's nested owner does not contaminate the fixture singleton", () => {
-    // deepMerge shallow-copied the top level, so before the clone fix state.repo
-    // .owner aliased the imported fixture's nested owner object; reslugRepo then
-    // mutated owner.login on the module singleton, contaminating later builds.
-    // buildStateForSlug re-slugs owner.login; a second, unrelated build must
-    // still see the pristine fixture owner.
+    // deepMerge shallow-copies the top level, so an uncloned fixture would alias state.repo.owner to the
+    // module singleton and reslugRepo would write owner.login into every later build.
     const first = buildStateForSlug("e2e-owner/svc-a", { settingsYaml: null }, "org");
     expect((first.repo.owner as Record<string, unknown>).login).toBe("e2e-owner");
-    // Build a second state with a live_state.repo overlay (the deepMerge path)
-    // and re-slug it to a different owner.
     const second = buildStateForSlug(
       "other-owner/svc-b",
       { settingsYaml: null, liveState: { repo: { description: "x" } } },
       "org",
     );
     expect((second.repo.owner as Record<string, unknown>).login).toBe("other-owner");
-    // A third, plain build must see the untouched fixture owner - proof the
-    // module singleton was never mutated by the re-slugs above.
     const third = buildState(undefined, "org");
     expect((third.repo.owner as Record<string, unknown>).login).toBe("e2e-owner");
     expect(third.repo.full_name).toBe("e2e-owner/e2e-repo");
@@ -136,9 +187,6 @@ describe("buildState overlay semantics", () => {
 
 describe("protectionFromPut round trip", () => {
   test("the engine flattener over protectionFromPut(payload) shows no drift", () => {
-    // A payload exercising every field the branches section reads: the four
-    // required core keys, the boolean toggles, nested review settings, and the
-    // actor string arrays that must expand then collapse back to strings.
     const payload = {
       required_status_checks: { strict: true, contexts: ["all-green"] },
       enforce_admins: true,
@@ -159,8 +207,7 @@ describe("protectionFromPut round trip", () => {
       lock_branch: false,
       allow_fork_syncing: true,
     };
-    // subsetDiff is exactly how the branches section compares declared
-    // protection against the flattened live GET; no drift proves the round trip.
+    // subsetDiff is exactly how the branches section compares declared protection against the flattened live GET.
     const flattened = flattenProtection(protectionFromPut(payload));
     expect(subsetDiff(payload, flattened, "protection")).toEqual([]);
   });
@@ -173,8 +220,7 @@ describe("protectionFromPut round trip", () => {
   });
 
   test("required_signatures is dropped from the PUT shape (its sub-endpoint owns it)", () => {
-    // GitHub's protection PUT silently discards the toggle, so the stored GET
-    // shape must not gain it from a PUT body.
+    // GitHub's PUT silently discards the toggle, so the stored GET shape must not gain it.
     expect(protectionFromPut({ enforce_admins: true, required_signatures: true })).toEqual({
       enforce_admins: { enabled: true },
     });
@@ -183,10 +229,6 @@ describe("protectionFromPut round trip", () => {
 
 describe("branch protection rule projections", () => {
   test("the section's classicViewOfRule over ruleFromProtection shows no drift", () => {
-    // A LITERAL rule with every translated key plus the GraphQL-only extras:
-    // projecting the stored REST GET shape into a rule node and reading it
-    // back through the engine's classic view must reproduce the declaration
-    // under the same declared-keys-only subsetDiff the section uses.
     const payload = {
       enforce_admins: true,
       required_linear_history: true,
@@ -210,7 +252,7 @@ describe("branch protection rule projections", () => {
       requiredDeploymentEnvironments: ["prod"],
     };
     const node = ruleFromProtection("main", protectionFromPut(payload), extras, "o/r");
-    const view = classicViewOfRule(node as Record<string, unknown>);
+    const view = classicViewOfRule(RuleNode.parse(node));
     expect(subsetDiff(payload, view, "protection")).toEqual([]);
     expect(view.force_push_bypassers).toEqual(["app/deploy-gate", "e2e-owner/platform", "octocat"]);
     expect(view.required_deployments).toEqual({ environments: ["prod"] });
@@ -219,19 +261,18 @@ describe("branch protection rule projections", () => {
   });
 
   test("required_signatures projects from the GET sub-resource shape", () => {
-    // The sub-endpoint stores {enabled} on the GET shape; the rule node's
-    // requiresCommitSignatures twin must read it back.
     const node = ruleFromProtection(
       "main",
       { enforce_admins: { enabled: true }, required_signatures: { enabled: true } },
       undefined,
       "o/r",
     );
-    expect(classicViewOfRule(node as Record<string, unknown>).required_signatures).toBe(true);
+    expect(classicViewOfRule(RuleNode.parse(node)).required_signatures).toBe(true);
   });
 
   test("a stored wildcard rule round-trips through ruleWireNode and the classic view", () => {
     const stored = completeRule({
+      id: "RULE:release/*",
       pattern: "release/*",
       isAdminEnforced: true,
       requiresStatusChecks: true,
@@ -239,7 +280,7 @@ describe("branch protection rule projections", () => {
       requiredStatusCheckContexts: ["ci"],
       bypassForcePushActors: ["octocat"],
     });
-    const view = classicViewOfRule(ruleWireNode(stored) as Record<string, unknown>);
+    const view = classicViewOfRule(RuleNode.parse(ruleWireNode(stored)));
     expect(view.enforce_admins).toBe(true);
     expect(view.required_status_checks).toEqual({ strict: true, contexts: ["ci"] });
     expect(view.force_push_bypassers).toEqual(["octocat"]);
@@ -248,7 +289,7 @@ describe("branch protection rule projections", () => {
 
   test("applyRuleInput decodes actor ids and mimics the environment silent drop", () => {
     const state = buildState({ environments: { prod: { name: "prod" } } }, "org");
-    const stored = completeRule({ pattern: "release/*" });
+    const stored = completeRule({ id: "RULE:release/*", pattern: "release/*" });
     const applied = applyRuleInput(
       stored,
       {
@@ -271,10 +312,10 @@ describe("branch protection rule projections", () => {
       "e2e-owner/platform",
       "app/deploy-gate",
     ]);
-    // GitHub keeps only names of EXISTING environments and still succeeds;
-    // "ghost" must vanish so the section's read-back check can catch it.
+    // GitHub keeps only names of EXISTING environments and still succeeds; "ghost" must vanish so the
+    // section's read-back check can catch it.
     expect(stored.requiredDeploymentEnvironments).toEqual(["prod"]);
-    expect(bypassActorStrings(ruleWireNode(stored) as Record<string, unknown>)).toEqual([
+    expect(bypassActorStrings(RuleNode.parse(ruleWireNode(stored)))).toEqual([
       "octocat",
       "e2e-owner/platform",
       "app/deploy-gate",
@@ -283,7 +324,7 @@ describe("branch protection rule projections", () => {
 
   test("applyRuleInput rejects an actor id the codec did not mint", () => {
     const state = buildState(undefined, "org");
-    const stored = completeRule({ pattern: "release/*" });
+    const stored = completeRule({ id: "RULE:release/*", pattern: "release/*" });
     const applied = applyRuleInput(stored, { bypassForcePushActorIds: ["MDQ6VXNlcjE="] }, state);
     expect(applied).toEqual({ bad: "MDQ6VXNlcjE=" });
   });
@@ -304,8 +345,6 @@ describe("branch protection rule projections", () => {
       requiredDeploymentEnvironments: ["prod", "ghost"],
     });
     expect(applied).toEqual({ ok: true });
-    // The translated twin lands back on the REST GET shape (one underlying
-    // rule), while the GraphQL-only fields live in the extras family.
     expect((state.branch_protection.main as Record<string, unknown>).enforce_admins).toEqual({
       enabled: true,
     });
@@ -328,9 +367,8 @@ describe("environmentFromPut round trip", () => {
       ],
       deployment_branch_policy: { protected_branches: true, custom_branch_policies: false },
     };
-    // flattenEnvironment leaves the un-nested protection_rules on the object;
-    // subsetDiff (declared-keys-only, exactly as the environments section
-    // uses it) ignores that undeclared key and confirms the payload survives.
+    // flattenEnvironment leaves the un-nested protection_rules on the object; subsetDiff (declared-keys-only,
+    // exactly as the environments section uses it) ignores that undeclared key.
     const flattened = flattenEnvironment(environmentFromPut(payload));
     expect(subsetDiff(payload, flattened, "environments[production]")).toEqual([]);
   });
@@ -379,16 +417,14 @@ describe("invitationFromPut round-trips the PUT permission into the invitation v
     expect((invitation.invitee as { login: string }).login).toBe("alice");
     expect(invitation.permissions).toBe(roleForPermission("push"));
     expect(invitation.permissions).toBe("write");
-    // The section's converged-pending comparison reads exactly these two
-    // fields plus `expired`, which a fresh invitation must not carry as true.
+    // The section's converged-pending comparison reads exactly these two fields plus `expired`.
     expect(invitation.expired).toBe(false);
     expect(invitation.id).toBe(42);
   });
 
   test("defaults to push when permission is absent; a custom role clamps to its base grant", () => {
     expect(invitationFromPut("bob", {}, 1, repo, "e2e-owner/e2e-repo").permissions).toBe("write");
-    // GitHub never reports a custom role name on an invitation (the
-    // permissions field is a spec enum), so the mock stores the base grant.
+    // GitHub never reports a custom role name on an invitation (the permissions field is a spec enum).
     expect(
       invitationFromPut("carol", { permission: "security-team" }, 2, repo, "e2e-owner/e2e-repo")
         .permissions,
@@ -405,8 +441,7 @@ describe("invitationFromPut round-trips the PUT permission into the invitation v
     );
     expect((invitation.inviter as { login: string }).login).toBe("e2e-owner");
     expect(invitation.url).toBe("https://api.github.com/repos/e2e-owner/e2e-repo/invitations/3");
-    // A clone of the repo, not the live reference: stored invitations must
-    // not mirror later repo mutations (the snapshot layer keys on families).
+    // A clone, not the live reference: stored invitations must not mirror later repo mutations.
     expect(invitation.repository).toEqual(repo);
     expect(invitation.repository).not.toBe(repo);
   });
@@ -448,8 +483,7 @@ describe("completeInvitation", () => {
   });
 
   test("a multi-repo target's seeded invitation derives from the re-slugged repo", () => {
-    // Re-slugging must happen BEFORE family completion (the buildState slug
-    // param), or the invitation scaffold bakes the fixture slug into its urls.
+    // Re-slugging must happen BEFORE family completion, or the scaffold bakes the fixture slug into its urls.
     const state = buildStateForSlug(
       "acme/payments",
       {
@@ -466,16 +500,12 @@ describe("completeInvitation", () => {
 });
 
 describe("bypassUser", () => {
-  test("a sparse seed keeps its own fields and gains the simple-user scaffold", () => {
-    const completed = bypassUser({ login: "dave" }, 42) as Record<string, unknown>;
-    expect(completed.id).toBe(42);
-    expect(completed.login).toBe("dave");
-    expect(completed.type).toBe("User");
-    expect(completed.site_admin).toBe(false);
-    expect(completed.node_id).toBe("MDQ6VXNlcj42");
-    expect(completed.url).toBe("https://api.github.com/users/dave");
-    expect(completed.html_url).toBe("https://github.com/dave");
-    expect(completed.avatar_url).toBe("https://avatars.githubusercontent.com/u/42?v=4");
+  test("a sparse seed keeps its login and takes the caller's id", () => {
+    expect(bypassUser({ login: "dave" }, 42)).toMatchObject({
+      id: 42,
+      login: "dave",
+      html_url: "https://github.com/dave",
+    });
   });
 
   test("a seeded id wins over the caller's and drives the derived fields", () => {
@@ -521,9 +551,8 @@ describe("mock node ids", () => {
   });
 
   test("foreign ids do not decode", () => {
-    // A GitHub-realistic legacy id, an arbitrary string, and an empty string:
-    // none of them are the mock's, so a mutation carrying one is a violation
-    // the pipeline can only raise if the codec refuses to guess.
+    // A GitHub-realistic legacy id, an arbitrary string, and an empty string: a mutation carrying only such
+    // ids is a violation the pipeline can only raise if the codec refuses to guess.
     expect(decodeNodeId("MDU6TGFiZWw5MDAwMDAwMQ==")).toBeNull();
     expect(decodeNodeId("not-base64-at-all")).toBeNull();
     expect(decodeNodeId("")).toBeNull();
@@ -553,9 +582,6 @@ describe("mock node ids", () => {
   });
 
   test("generated labels and completed hooks name the TARGET slug in their urls", () => {
-    // The url is served state like any other field: a multi-repo target's
-    // generated labels and seeded hooks must name the target repository, not
-    // the admin fixture the mock happens to run as.
     const state = buildStateForSlug(
       "acme/private",
       {
@@ -577,10 +603,6 @@ describe("mock node ids", () => {
   });
 
   test("no fixture identity survives anywhere in a re-slugged repo body", () => {
-    // reslugRepo rewrites the explicit identity fields AND every url/template
-    // string (html_url, hooks_url, clone_url, the owner's own urls, ...): a
-    // target's GET /repos/{slug} body must nowhere point at the admin
-    // fixture's repository.
     const state = buildStateForSlug("acme/private", { settingsYaml: null }, "org");
     const body = JSON.stringify(state.repo);
     expect(body).not.toContain("e2e-owner");
@@ -592,10 +614,9 @@ describe("mock node ids", () => {
   });
 
   test("re-slugging is exact for identities overlapping the fixture's", () => {
-    // The substitution is two-phase through placeholder tokens: a sequential
-    // replace would re-match the old owner INSIDE a new identity that
-    // contains it, corrupting the urls (e2e-owner-fork -> e2e-owner-fork-fork,
-    // my-e2e-owner-repo -> my-<owner>-repo).
+    // A sequential replace would re-match the old owner INSIDE a new identity that contains it.
+    //   e2e-owner-fork/service  -> e2e-owner-fork-fork/service
+    //   acme/my-e2e-owner-repo  -> acme/my-<owner>-repo
     const forkOwner = buildStateForSlug("e2e-owner-fork/service", { settingsYaml: null }, "org");
     expect(String(forkOwner.repo.html_url)).toBe("https://github.com/e2e-owner-fork/service");
     const nameCarrier = buildStateForSlug("acme/my-e2e-owner-repo", { settingsYaml: null }, "org");
@@ -603,7 +624,6 @@ describe("mock node ids", () => {
   });
 
   test("re-slugging rewrites only url fields, never seeded content", () => {
-    // A description MENTIONING the fixture owner is content, not identity.
     const state = buildStateForSlug(
       "acme/private",
       {
@@ -622,8 +642,7 @@ describe("normalizePinnedSeed", () => {
       { name: "a", position: 1 },
       { name: "b", position: 2 },
     ]);
-    // Explicit hole-y positions survive verbatim and come back rank-sorted,
-    // so a scenario can seed the layouts live GitHub produces after unpins.
+    // Explicit hole-y positions survive verbatim and come back rank-sorted: the layouts live GitHub produces after unpins.
     expect(
       normalizePinnedSeed([
         { name: "b", position: 5 },
@@ -633,7 +652,6 @@ describe("normalizePinnedSeed", () => {
       { name: "a", position: 2 },
       { name: "b", position: 5 },
     ]);
-    // A string after an explicit entry continues past the largest position.
     expect(normalizePinnedSeed([{ name: "a", position: 3 }, "b"])).toEqual([
       { name: "a", position: 3 },
       { name: "b", position: 4 },
@@ -651,7 +669,6 @@ describe("normalizePinnedSeed", () => {
       "org",
     );
     expect(state._pinned_position_counter).toBe(5);
-    // An empty seed leaves the counter at zero, so the first pin takes 1.
     expect(buildState(undefined, "org")._pinned_position_counter).toBe(0);
   });
 });

@@ -1,7 +1,5 @@
 /**
- * Handler-level tests for the labels mock fragment: identity minting rules
- * the e2e assertions do not read directly (no scenario asserts on a served
- * node_id or url), pinned here against the handler.
+ * No scenario asserts on a served node_id or url, so the labels fragment's identity minting is pinned here against the handler.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -21,10 +19,8 @@ function create(state: MockState, body: Record<string, unknown>): Record<string,
 
 describe("labels.create identity minting", () => {
   test("node_id encodes the label's OWN id, matching the generateLabels pattern", () => {
-    // Seed the state through the generate sugar so the created label's ids
-    // come from the same monotonic pool as the seeded ones: the old
-    // post-increment bug (id used, node_id encoding id+1) collided a created
-    // label's node_id with the NEXT id in that shared pool.
+    // Seeding through the generate sugar puts the created labels in the same monotonic id pool as the seeded ones; the old post-increment bug (id
+    // used, node_id encoding id+1) collided a created label's node_id with the next id in that pool.
     const state = buildStateForSlug(
       "acme/private",
       {
@@ -35,13 +31,16 @@ describe("labels.create identity minting", () => {
     );
     create(state, { name: "bug", color: "d73a4a" });
     create(state, { name: "docs", color: "0075ca" });
-    for (const label of state.labels) {
+    const identity = (label: unknown) => {
       const body = label as Record<string, unknown>;
-      expect(body.node_id).toBe(`MDU6TGFiZWw${body.id}`);
-    }
-    // No two labels (seeded or created) share a node_id.
-    const nodeIds = state.labels.map((label) => (label as Record<string, unknown>).node_id);
-    expect(new Set(nodeIds).size).toBe(nodeIds.length);
+      return [body.name, body.id, body.node_id];
+    };
+    expect(state.labels.map(identity)).toEqual([
+      ["area-1", 90_000_000, "MDU6TGFiZWw90000000"],
+      ["area-2", 90_000_001, "MDU6TGFiZWw90000001"],
+      ["bug", 90_000_002, "MDU6TGFiZWw90000002"],
+      ["docs", 90_000_003, "MDU6TGFiZWw90000003"],
+    ]);
   });
 
   test("the created label's url names the state slug", () => {

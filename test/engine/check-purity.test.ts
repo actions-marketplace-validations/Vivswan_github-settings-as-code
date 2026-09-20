@@ -1,33 +1,26 @@
 /**
- * The check-is-read-only invariant, enforced across the whole registry:
- * every section handler must issue only GETs when ctx.check is true. The
- * preflight barrier in orchestrate.ts re-runs handlers in check mode as a
- * permission probe before applying, so an impure handler would write to
- * the repo during a phase the engine promises is read-only. The fixtures
- * are a total Record over SectionKey: adding a section without a fixture
- * here is a compile error.
+ * A check-mode run issues only GETs and read queries, and the preflight barrier (apply mode under on-missing-permission: fail) plans every section
+ * as its permission probe before applying, so the phase must stay read-only.
  */
 
 import { describe, expect, test } from "bun:test";
 import { runForRepo, validateSettingsDoc } from "../../src/engine/orchestrate.js";
-import type { Io } from "../../src/io.js";
+import { SectionSelection } from "../../src/engine/section-selection.js";
+import { silentIo } from "../../src/io.js";
+import { describeProblem } from "../../src/problem.js";
 import type { SectionKey } from "../../src/schema.js";
 import { SECTION_KEYS } from "../../src/schema.js";
+import { MOCK_SECRETS_KEY_ID, MOCK_SECRETS_PUBLIC_KEY } from "../e2e/mock/secrets.js";
 import { MockApi } from "../mock-api.js";
 
 /**
- * Declared values chosen to MISMATCH the routed live data below, so every
- * handler walks its drift paths (create/update/delete/replace), not just
- * the clean early returns. The two wrapped declarations exercise the
- * undeclared-policy knob's both settings: labels keeps its undeclared live
- * label under `undeclared: keep` (still drifting on the missing declared
- * label), rulesets walks its DELETE path under `undeclared: delete` - in
- * check mode both must stay read-only like everything else.
+ * Declared values chosen to MISMATCH the live data below, so every handler walks its drift paths rather than the clean early returns; the wrapped
+ * declarations exercise both undeclared-policy settings.
  */
 const FIXTURES: Record<SectionKey, unknown> = {
   repository: { description: "declared", enable_vulnerability_alerts: true },
-  labels: { undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] },
-  rulesets: { undeclared: "delete", entries: [{ name: "declared-ruleset", target: "branch" }] },
+  labels: { _undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] },
+  rulesets: { _undeclared: "delete", entries: [{ name: "declared-ruleset", target: "branch" }] },
   branches: [{ name: "main", protection: { enforce_admins: true } }],
   environments: [
     {
@@ -39,8 +32,7 @@ const FIXTURES: Record<SectionKey, unknown> = {
   ],
   autolinks: [{ key_prefix: "NEW-", url_template: "https://x.test/<num>" }],
   actions: { allowed_actions: "all", access_level: "organization" },
-  // A declared-but-missing secret (the empty list below) is existence drift;
-  // check mode must not resolve the reference, so no env entry exists here.
+  // A declared-but-missing secret is existence drift; check mode must not resolve the reference, so no env entry exists here.
   actions_secrets: [{ name: "DEPLOY_TOKEN", value: "$DEPLOY_TOKEN" }],
   dependabot_secrets: [{ name: "REGISTRY_TOKEN", value: "$REGISTRY_TOKEN" }],
   codespaces_secrets: [{ name: "DEVCONTAINER_PAT", value: "$DEVCONTAINER_PAT" }],
@@ -64,19 +56,16 @@ const FIXTURES: Record<SectionKey, unknown> = {
     },
   ],
   custom_properties: [{ property_name: "team", value: "platform" }],
-  // The declared key's material differs from the live one (a replace, which
-  // in check mode must stay a drift line), and `undeclared: delete` walks
-  // the undeclared-deletion drift branch over the stale live key.
+  // The material differs from the live key (a replace) and `_undeclared: delete` walks the undeclared-deletion branch over the stale live key.
   deploy_keys: {
-    undeclared: "delete",
+    _undeclared: "delete",
     entries: [
       { title: "deploy-bot", key: "ssh-ed25519 AAAAC3declared deploy@bot", read_only: true },
     ],
   },
-  // The declared pattern is missing from the live list (create drift) and
-  // the live one is undeclared under `undeclared: delete` (delete drift).
+  // The declared pattern is missing live (create drift) and the live one is undeclared under `_undeclared: delete` (delete drift).
   secret_scanning_custom_patterns: {
-    undeclared: "delete",
+    _undeclared: "delete",
     entries: [{ name: "internal-token", pattern: "int_[a-z0-9]{8}" }],
   },
 };
@@ -93,9 +82,7 @@ const ROUTES = {
   "GET /repos/o/r/autolinks": {
     data: [{ id: 1, key_prefix: "OLD-", url_template: "u", is_alphanumeric: true }],
   },
-  // The environment exists but drifts (wait_timer 1 vs the declared 5), so the
-  // variables comparison path runs too: a divergent value plus an undeclared
-  // live variable exercise the nested drift branches, still read-only.
+  // The environment exists but drifts (wait_timer 1 vs 5), so the nested variables comparison runs too.
   "GET /repos/o/r/environments/prod": {
     data: { name: "prod", protection_rules: [{ id: 1, type: "wait_timer", wait_timer: 1 }] },
   },
@@ -108,25 +95,26 @@ const ROUTES = {
       ],
     },
   },
-  // The declared environment secret is absent from the live list, so the
-  // nested secrets path walks its existence-drift branch, still read-only.
+  // The declared environment secret is absent live, so the nested secrets path walks its existence-drift branch.
   "GET /repos/o/r/environments/prod/secrets?per_page=100&page=1": {
     data: { total_count: 0, secrets: [] },
   },
   "GET /repos/o/r/actions/permissions": { data: { enabled: true, allowed_actions: "selected" } },
   "GET /repos/o/r/actions/permissions/access": { data: { access_level: "none" } },
-  "GET /repos/o/r/actions/secrets?per_page=100&page=1": {
-    data: { total_count: 0, secrets: [] },
-  },
-  "GET /repos/o/r/dependabot/secrets?per_page=100&page=1": {
-    data: { total_count: 0, secrets: [] },
-  },
-  "GET /repos/o/r/codespaces/secrets?per_page=100&page=1": {
-    data: { total_count: 0, secrets: [] },
-  },
-  "GET /repos/o/r/agents/secrets?per_page=100&page=1": {
-    data: { total_count: 0, secrets: [] },
-  },
+  // Each secret family's plan reads its sealing key beside the list (closed over by the planned sealed PUTs, in every mode), so the key routes exist
+  // here too.
+  ...Object.fromEntries(
+    ["actions", "dependabot", "codespaces", "agents"].flatMap((segment) => [
+      [
+        `GET /repos/o/r/${segment}/secrets?per_page=100&page=1`,
+        { data: { total_count: 0, secrets: [] } },
+      ],
+      [
+        `GET /repos/o/r/${segment}/secrets/public-key`,
+        { data: { key_id: MOCK_SECRETS_KEY_ID, key: MOCK_SECRETS_PUBLIC_KEY } },
+      ],
+    ]),
+  ),
   "GET /repos/o/r/actions/workflows?per_page=100&page=1": {
     data: {
       total_count: 1,
@@ -138,19 +126,19 @@ const ROUTES = {
   "GET /repos/o/r/collaborators?affiliation=direct&per_page=100&page=1": {
     data: [{ login: "alice", role_name: "write" }],
   },
-  // An undeclared pending invitation: the invitation sweep's cancel branch
-  // must stay a drift line in check mode, never a DELETE.
+  // An undeclared pending invitation: the invitation sweep's cancel branch must stay a drift line in check mode, never a DELETE.
   "GET /repos/o/r/invitations?per_page=100&page=1": {
     data: [{ id: 7, invitee: { login: "carol" }, permissions: "read", expired: false }],
   },
   "GET /orgs/o": { data: { login: "o" } },
+  // No team holds access, so the declared one is existence drift and the undeclared walk has nothing to note.
+  "GET /repos/o/r/teams?per_page=100&page=1": { data: [] },
   "GET /repos/o/r/milestones?state=all&per_page=100&page=1": {
     data: [{ number: 1, title: "old", description: null, state: "open" }],
   },
   // An empty body means "no live limit", which drifts against the fixture.
   "GET /repos/o/r/interaction-limits": { data: {} },
-  // A live variable the fixture does not declare (delete-default -> drift)
-  // plus the declared one missing (create-path drift).
+  // A stale live variable (delete-default -> drift) plus the declared one missing (create drift).
   "GET /repos/o/r/actions/variables?per_page=30&page=1": {
     data: {
       total_count: 1,
@@ -164,8 +152,7 @@ const ROUTES = {
       ],
     },
   },
-  // The agents variable store mirrors the Actions one: a stale live variable
-  // (delete-default -> drift) and the declared one missing (create drift).
+  // The agents store mirrors the Actions one: a stale live variable and the declared one missing.
   "GET /repos/o/r/agents/variables?per_page=30&page=1": {
     data: {
       total_count: 1,
@@ -195,16 +182,14 @@ const ROUTES = {
   "GET /repos/o/r/properties/values": {
     data: [{ property_name: "team", value: "core" }],
   },
-  // A live key whose material diverges from the declared one, plus a stale
-  // undeclared key the wrapped `undeclared: delete` fixture must flag.
+  // A live key whose material diverges from the declared one, plus a stale undeclared key the wrapped `_undeclared: delete` fixture must flag.
   "GET /repos/o/r/keys?per_page=100&page=1": {
     data: [
       { id: 1, title: "deploy-bot", key: "ssh-ed25519 AAAAC3live", read_only: false },
       { id: 2, title: "stale-key", key: "ssh-rsa AAAAB3stale", read_only: true },
     ],
   },
-  // A live pattern the fixture does not declare (delete drift under the
-  // wrapped `undeclared: delete`), while the declared one is missing.
+  // A live pattern the fixture does not declare (delete drift under the wrapped `_undeclared: delete`), while the declared one is missing.
   "GET /repos/o/r/secret-scanning/custom-patterns?per_page=100&page=1": {
     data: [
       {
@@ -220,37 +205,33 @@ const ROUTES = {
   },
 };
 
-function silentIo(): Io {
-  return { annotate: () => {}, log: () => {}, mask: () => {} };
-}
-
 describe("check-mode purity", () => {
   test("every registered section stays read-only in check mode, even on its drift paths", async () => {
     const api = new MockApi(ROUTES);
-    // Brand the fixture document through the REAL boundary: an invalid
-    // fixture fails loudly here instead of riding a cast into runForRepo.
-    const verdict = validateSettingsDoc(FIXTURES, "purity fixtures", new Set(), silentIo());
-    if ("error" in verdict) {
-      throw new Error(`purity fixtures failed validation: ${verdict.error}`);
+    // Brand the fixture document through the REAL boundary: an invalid fixture fails loudly here instead of riding a cast into runForRepo.
+    const verdict = validateSettingsDoc(
+      FIXTURES,
+      "purity fixtures",
+      SectionSelection.ALL,
+      silentIo(),
+    );
+    if (verdict.isErr()) {
+      throw new Error(`purity fixtures failed validation: ${describeProblem(verdict.error)}`);
     }
     const result = await runForRepo(
       api,
       {
         repo: { owner: "o", name: "r", slug: "o/r" },
-        settings: verdict.settings,
+        settings: verdict.value,
         mode: "check",
         onMissingPermission: "fail",
-        requiredSections: new Set(),
-        onlySections: new Set(),
+        sections: SectionSelection.ALL,
       },
       silentIo(),
     );
-    // Every section ran and every fixture produced drift: a "failed" or
-    // "clean" outcome means a fixture stopped exercising its handler's
-    // drift paths, which would silently shrink coverage. The one exception
-    // is check_suite_preferences, which has NO drift path to exercise:
-    // GitHub exposes no read endpoint, so its check mode is a single
-    // cannot-verify note (clean) and zero requests, by contract.
+    // A "failed" or "clean" outcome means a fixture stopped exercising its handler's drift paths.
+    // check_suite_preferences is the exception: GitHub exposes no read endpoint, so its check mode is one cannot-verify note (clean) and zero
+    // requests.
     expect(result.outcomes.map((o) => o.key)).toEqual([...SECTION_KEYS]);
     for (const outcome of result.outcomes) {
       expect(outcome.status).toBe(outcome.key === "check_suite_preferences" ? "clean" : "drift");

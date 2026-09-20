@@ -1,155 +1,199 @@
-/** REST endpoint declarations: routes, tolerated statuses, and path expansion. */
-
 import type { Endpoints } from "@octokit/types";
 import type { RepoRef } from "../../discovery/targets.js";
 import type { SupplementalRoute } from "../../upstream-gaps/index.js";
 import type { SectionPermission } from "./permissions.js";
 
-/**
- * A GitHub REST route as octokit spells it: "METHOD /path/{param}". Using
- * `keyof Endpoints` means a typo'd path or a wrong method does not compile.
- */
+/** `keyof Endpoints` makes a typo'd path or wrong method a compile error; SupplementalRoute covers routes octokit lags (src/upstream-gaps). */
 export type Route = keyof Endpoints | SupplementalRoute;
 
 /**
- * The statuses a hint may key: the payload-rejection classes throwFor's
- * generic branch renders. 403 and 404 are excluded - the permission branch
- * swallows them before hints are read (and a public "none" endpoint's
- * 403/404 is never about a grant); ambiguity on those statuses belongs in
- * `denialHint`.
+ * The statuses throwFor's permission branch swallows for a granted operation. A `hints` key on one is
+ * dead advice (HintableStatus excludes them); `denialHint` carries an ambiguity, and `rejections` claims
+ * back the one message GitHub reserves for a definite meaning.
  */
+type DenialStatus = 403 | 404;
+
+/** A public ("none") operation's 403/404 is never a payload rejection either, so the exclusion holds for it too. */
 export type HintableStatus = 400 | 412 | 422;
 
 /**
- * One REST endpoint a section may call. `route` is octokit's canonical
- * "METHOD /path/{param}" string. `statuses` maps each HTTP status the handler
- * treats as a normal (non-throwing) outcome to a short plain-prose meaning;
- * the >= 400 keys are the tolerated errors (see toleratedStatuses), and the
- * meanings are consumable by the e2e mock and its violation messages.
- * Handlers pass these declarations to the request helpers, which build the
- * concrete path via expand(), so a section can never call a path it has not
- * declared.
+ * A response whose status a denial shares but whose exact message GitHub reserves for one definite
+ * meaning: the protection PUT's 404 "Branch not found". throwFor classifies a match ahead of its
+ * permission branch as a hard section error, so no on-missing-permission policy can skip it and the
+ * grant advice never renders for it. The message must be one no denial body spells; the registry
+ * test pins every declaration against the e2e mock's denial responses.
  */
-export interface EndpointDecl {
-  readonly route: Route;
+export interface DefinitiveRejection {
+  readonly status: DenialStatus;
+  /** Compared whole, never as a substring: "Not Found" is a fine-grained denial. */
+  readonly message: string;
+  /** What to fix, as a lowercase clause without a trailing period; throwFor starts a sentence with it. */
+  readonly advice: string;
+}
+
+type GetRoute = Extract<Route, `GET ${string}`>;
+
+/**
+ * `statuses` keys are the outcomes the handler treats as normal (the e2e mock reads the keys); its 4xx keys
+ * other than 401 and 429 are the tolerated errors (toleratedStatuses). The request helpers build paths from
+ * these declarations via expand(), so a section can never call a path it has not declared.
+ */
+export type EndpointDecl =
+  | (EndpointDeclFields & {
+      readonly route: GetRoute;
+      readonly permission?: SectionPermission | "none";
+      readonly accessGrade?: never;
+      readonly alwaysRewrite?: never;
+      readonly unverifiable?: never;
+      /**
+       * Omitted, the read is available to plan(), so check mode and preflight may meet it. "execution" gates it
+       * behind the ExecTools token only a thunk receives (ReadPort in ./plan.ts), so check mode never issues it.
+       *
+       *   e2e mock          -> treats an execution read in check mode as a violation
+       *   denialPosture()   -> rejects a primaryRead on it: no denied first read can be classified from it
+       */
+      readonly phase?: "execution";
+    })
+  | (EndpointDeclFields &
+      Recurrence & {
+        readonly route: Exclude<Route, GetRoute>;
+        /** Overrides the section's permission; "none" means public. Resolved by endpointPermission(). */
+        readonly permission?: SectionPermission | "none";
+        readonly accessGrade?: never;
+        readonly phase?: never;
+      })
+  | GatedReadDecl;
+
+/**
+ * A WRITE's behaviour on a converged second apply, at most one flag: `alwaysRewrite` recurs by
+ * contract (sealed secret PUTs, the interaction-limits re-arm, the Git LFS toggle, the check suite
+ * PATCH); `unverifiable` may recur, carrying a value GitHub never echoes back. The e2e idempotence proof reads both.
+ */
+type Recurrence =
+  | { readonly alwaysRewrite?: never; readonly unverifiable?: never }
+  | { readonly alwaysRewrite: true; readonly unverifiable?: never }
+  | { readonly alwaysRewrite?: never; readonly unverifiable: true };
+
+/**
+ * A GET GitHub gates at WRITE (the Codespaces secrets GETs), read by endpointKind().
+ * A public endpoint has no grant to gate, so `permission: "none"` is not representable.
+ */
+export interface GatedReadDecl extends EndpointDeclFields {
+  readonly route: GetRoute;
+  readonly permission?: SectionPermission;
+  readonly accessGrade: "write";
+  readonly alwaysRewrite?: never;
+  readonly unverifiable?: never;
+  /** As on a plain GET: "execution" gates the read behind a thunk's token (the Codespaces sealing key). */
+  readonly phase?: "execution";
+}
+
+interface EndpointDeclFields {
   readonly statuses: Readonly<Record<number, string>>;
   /**
-   * Overrides the section's permission for this one endpoint. "none" means
-   * the endpoint is public (no token permission needed). Omit it when the
-   * endpoint requires the section's own permission (the common case) - an
-   * override equal to the section permission is redundant. Downstream
-   * consumers resolve the effective permission via endpointPermission().
-   */
-  readonly permission?: SectionPermission | "none";
-  /**
-   * True for an advisory READ whose non-404 failures are tolerated (the section
-   * proceeds without it rather than failing). The e2e mock derives its
-   * advisory-read exemption from this flag via allEndpoints(), so the exemption
-   * stays in one place - the declaration - instead of a hard-coded list.
+   * By default an advisory READ's failures come back as { error } instead of aborting the section; a rate
+   * limit still throws, and an explicit `tolerate` narrows the set (declaredTolerance). The e2e mock
+   * derives its advisory-read exemption from this flag via allEndpoints().
    */
   readonly advisory?: boolean;
   /**
-   * Advice for known 4xx failure classes, appended by throwFor to that
-   * status's generic rejection message. Payloads pass through verbatim
-   * (GitHub stays the authority on valid values), so a hint names the
-   * failure CLASS and points at the endpoint documentation; it never lists
-   * valid values that could go stale. One or two sentences, no trailing
-   * period.
+   * Payloads pass through verbatim, so a hint names the failure CLASS and points at the docs, never valid
+   * values that could go stale; throwFor appends it to the status's rejection message. Style: one or two sentences, no trailing period.
    */
   readonly hints?: Readonly<Partial<Record<HintableStatus, string>>>;
   /**
-   * Appended to the PermissionDenied message (which never reads `hints`) for
-   * an endpoint whose 403/404 is ambiguous - it can mean something other
-   * than a missing token grant (e.g. Git LFS disabled account-wide). One
-   * sentence, no trailing period.
+   * Appended to the PermissionDenied message (which never reads `hints`) when a 403/404 can mean
+   * something other than a missing grant (Git LFS disabled account-wide) and the body does not tell
+   * the readings apart; a body that does is a `rejections` entry. One sentence, no trailing period.
    */
   readonly denialHint?: string;
+  /** The endpoint's definitive rejections (see DefinitiveRejection); the e2e mock serves the same declarations. */
+  readonly rejections?: readonly DefinitiveRejection[];
   /**
-   * True for a WRITE the section issues for every declared entry on EVERY
-   * apply by contract - the sealed secret PUTs, whose values cannot be read
-   * back, so the unconditional re-write is what propagates a rotated source
-   * value. This is a property of the ENDPOINT, not its section: environments
-   * carries a passthrough PUT and always-rewrite secret PUTs side by side.
-   * The e2e apply-idempotence proof derives its required-rewrite set from
-   * this flag, so the contract lives on the declaration it describes.
-   */
-  readonly alwaysRewrite?: true;
-  /**
-   * The access grade GitHub gates this endpoint at, when it differs from the
-   * method-derived one (GET = read). Codespaces repository secrets are the
-   * known case: the fine-grained permission gates even the list and
-   * public-key READS at write. endpointKind() consults this, so the e2e
-   * mock's permission gate and the fuzz oracle model the real gating - a
-   * read-only grant then denies those reads exactly as production does.
-   */
-  readonly accessGrade?: "write";
-  /**
-   * The largest per_page this LIST endpoint accepts, when it is smaller than
-   * the standard 100 (the Actions variables list caps at 30). The page loop
-   * requests exactly this many per page and treats a shorter page as the
-   * last one, so a larger request that GitHub would silently clamp cannot
-   * truncate the walk after page one. Omit on endpoints that take the
-   * standard 100.
+   * When GitHub caps per_page below the standard 100 (the Actions variables list: 30). The page loop
+   * requests exactly this many and treats a shorter page as the last, so a request GitHub would silently
+   * clamp cannot truncate the walk after page one.
    */
   readonly pageSize?: number;
+  /**
+   * The section's PRIMARY READ and what a fine-grained 404 on it means: "denied" classifies as
+   * PermissionDenied and stops the section (an advisory read only exposes tryCall, which returns it as
+   * { error }), "absent" reads as a missing resource and proceeds. At most one per section; the read port
+   * (ReadPort in ./plan.ts) and denialPosture() read it.
+   */
+  readonly primaryRead?: { readonly notFound: "denied" | "absent" };
 }
 
-/** The method half of a route ("PATCH /repos/..." -> "PATCH"). */
+export function matchesRejection(
+  rejection: DefinitiveRejection,
+  error: { status: number; message: string },
+): boolean {
+  return error.status === rejection.status && error.message === rejection.message;
+}
+
+/** The declaration an error matches, if the endpoint declares one; a withheld message matches nothing. */
+export function definitiveRejection(
+  endpoint: EndpointDecl,
+  error: { status: number; message: string },
+): DefinitiveRejection | undefined {
+  return endpoint.rejections?.find((rejection) => matchesRejection(rejection, error));
+}
+
 export function endpointMethod(route: Route): string {
   return route.slice(0, route.indexOf(" "));
 }
 
-/** The path-template half of a route ("PATCH /repos/{owner}/..." -> "/repos/{owner}/..."). */
 export function endpointPath(route: Route): string {
   return route.slice(route.indexOf(" ") + 1);
 }
 
-/**
- * read for GET, write for every mutating method - unless the declaration
- * carries an accessGrade override (GitHub gates some reads at write).
- */
+/** An accessGrade override wins: GitHub gates some reads at write. */
 export function endpointKind(endpoint: EndpointDecl): "read" | "write" {
   return endpoint.accessGrade ?? (endpointMethod(endpoint.route) === "GET" ? "read" : "write");
 }
 
-/**
- * The path-parameter names a route declares, minus `owner` and `repo` (which
- * expand() fills from the SectionContext). A call site must supply exactly
- * these; the helpers use it to make `params` compiler-required and typo-proof.
- */
+/** Minus `owner` and `repo`, which expand() fills from the context; the helpers make `params` compiler-required and typo-proof from it. */
 export type PathParams<R extends string> = R extends `${string}{${infer T}}${infer Rest}`
   ? (T extends "owner" | "repo" ? never : T) | PathParams<Rest>
   : never;
 
 /**
- * The declared statuses that are error responses (>= 400). These ARE the
- * tolerated errors by definition: a status the endpoint declares as a normal
- * outcome must not throw. tryCall and probeAbsent default their tolerated set
- * to this, so the declaration is the single source and no call site restates
- * it.
+ * Excluded from every declared tolerance (they describe the credential or the transport, not the resource);
+ * an advisory read still absorbs a 401, and a rate limit is caught per request.
+ */
+type TransportStatus = 401 | 429;
+
+type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+
+/** toleratedStatuses() is the runtime twin. */
+export type DeclaredErrorStatus<E extends EndpointDecl> = {
+  [S in keyof E["statuses"] & number]: S extends TransportStatus
+    ? never
+    : `${S}` extends `4${Digit}${Digit}`
+      ? S
+      : never;
+}[keyof E["statuses"] & number];
+
+/**
+ * A status the endpoint declares as a normal outcome must not throw, so the tolerant helpers default to
+ * this set and no call site restates the declaration.
  */
 export function toleratedStatuses(endpoint: EndpointDecl): number[] {
   return Object.keys(endpoint.statuses)
+    .filter((key) => /^4\d\d$/.test(key))
     .map(Number)
-    .filter((status) => status >= 400);
+    .filter((status) => status !== 401 && status !== 429);
 }
 
-/**
- * Split a path into segments, dropping any query string and the leading
- * slash. Shared by the template matcher and its callers (the e2e mock's
- * dispatcher included) so every consumer strips the query the same way.
- */
+/** Shared with the e2e mock's dispatcher so every consumer strips the query the same way. */
 export function pathSegments(path: string): string[] {
   const withoutQuery = path.split("?")[0] ?? "";
   return withoutQuery.split("/").filter((segment) => segment.length > 0);
 }
 
 /**
- * True when a concrete path (query already irrelevant) matches a route's
- * path template. Every `{token}` consumes exactly one segment (octokit
- * routes spell owner and repo as separate one-segment params); literal
- * segments must match exactly. Exported for the e2e mock server and
- * USED_PATHS derivation, which route by template.
+ * Every `{token}` consumes exactly one segment (octokit spells owner and repo as separate params).
+ * The e2e mock, its OpenAPI validator, and .github/scripts/check-endpoint-coverage.ts route by template through it.
  */
 export function matchesTemplate(template: string, concretePath: string): boolean {
   const templateSegs = pathSegments(template);
@@ -168,13 +212,8 @@ export function matchesTemplate(template: string, concretePath: string): boolean
 }
 
 /**
- * Build the concrete request path from an endpoint's route: `{owner}` and
- * `{repo}` fill from the context's parsed RepoRef (both one segment); every
- * other `{token}` fills from params. All are URL-encoded in
- * this single place. A missing param or an unused (extra) param is a handler
- * bug, so throw loudly. `query`, when given, is appended as an encoded query
- * string. Only the RepoRef half of the context is read, so non-section
- * callers (the private-report module) can pass a bare `{ repo }` pair.
+ * The one place a SECTION's path values are URL-encoded (github/repo-file.ts encodes its own). Only the
+ * RepoRef half of the context is read, so non-section callers (the private-report module) can pass a bare `{ repo }`.
  */
 export function expand(
   endpoint: EndpointDecl,
@@ -212,11 +251,7 @@ export function expand(
   return path;
 }
 
-/**
- * The $owner/$repo variables every repo-addressed GraphQL READ takes, read
- * off the context's parsed RepoRef in the one place expand() reads the REST
- * path halves - so no GraphQL section ever re-derives them.
- */
+/** Read off the parsed RepoRef where expand() reads the REST halves, so no GraphQL section re-derives them. */
 export function repoVariables(ctx: { repo: RepoRef }): {
   owner: string;
   repo: string;

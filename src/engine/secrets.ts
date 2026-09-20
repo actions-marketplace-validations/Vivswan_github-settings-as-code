@@ -1,40 +1,28 @@
 /**
- * Engine-side collection of declared secret-field values. Sections declare
- * WHICH of their fields are secrets (SectionModule.secretValues); this module
- * walks the active sections of one merged settings document and pairs each
- * raw value with its provenance, so orchestrate.ts can validate and resolve
- * every reference in one place - before any section runs.
+ * Pairs each declared secret-field value (SectionModule.secretValues) with the document's provenance, so orchestrate.ts
+ * validates every reference before any section runs and, in apply, resolves them all before the first write.
+ * Provenance is one value per DOCUMENT: flows/multi.ts decides it where the document is chosen, and the single-repo
+ * flow takes the "operator" default.
  *
- * Provenance is a property of the source DOCUMENT, not of the merged result,
- * and it survives the merge structurally: applyDefaults replaces arrays
- * wholesale (a wrapped section's entries array included), so every secret
- * value in a merged section came verbatim from exactly one document - the
- * target's when the target document declares that section, the operator's
- * defaults otherwise. targetSecretSource() turns one target-fetched document
- * into that per-section lookup at read time (multi.ts, before applyDefaults
- * folds it into the operator layers); by default every value is
- * operator-owned (single-repo settings, central files, and the defaults file
- * are all authored by the operator).
+ * a target repository's own settings.yml                       -> target
+ * the single-repo file, a central file, the defaults document  -> operator
+ *
+ * The snapshot direction lives here too: snapshotSecretReference mints the reference a snapshot
+ * writes for a live secret whose value GitHub never reveals.
  */
 
-import type { SettingsSource, SourcedSecretValue } from "../action/secret-refs.js";
 import type { SectionKey, SettingsFile } from "../schema.js";
 import type { SectionModule } from "../sections/contract/module.js";
+import { type SettingsSource, type SourcedSecretValue, validateSecretRef } from "./secret-refs.js";
 
-/** One declared secret value, tagged with the section that declared it. */
 export interface SectionSecretValue extends SourcedSecretValue {
   section: SectionKey;
 }
 
-/**
- * Every declared secret-field value across the given sections, each tagged
- * with its owning section and the provenance `sourceOf` assigns that
- * section. Sections without a secretValues declaration contribute nothing.
- */
 export function collectSecretValues(
   settings: SettingsFile,
   sections: readonly SectionModule[],
-  sourceOf: (section: SectionKey) => SettingsSource,
+  source: SettingsSource,
 ): SectionSecretValue[] {
   const out: SectionSecretValue[] = [];
   for (const section of sections) {
@@ -42,7 +30,6 @@ export function collectSecretValues(
     if (declared === undefined || section.secretValues === undefined) {
       continue;
     }
-    const source = sourceOf(section.key);
     for (const { label, value } of section.secretValues(declared)) {
       out.push({ section: section.key, label, value, source });
     }
@@ -50,35 +37,35 @@ export function collectSecretValues(
   return out;
 }
 
+/** An environment variable a snapshot asks the operator to export, and its whole-value reference. */
+export interface MintedSecretReference {
+  readonly variable: string;
+  readonly reference: string;
+}
+
 /**
- * The per-section provenance lookup for a document merged over the
- * operator's defaults, derived from the target-fetched SOURCE document's
- * structure. applyDefaults replaces arrays wholesale (a wrapped section's
- * entries array included, and a malformed target wrapper evicts the
- * defaults' section entirely), so a merged section's secret values are the
- * target's exactly when the target document declares that section; every
- * other section survives from the operator's defaults. A target's
- * `section: null` opt-out is stripped by the merge before values are
- * collected, so its attribution is never consulted.
- *
- * The two halves of the invariant carry different weight. CONFIDENTIALITY
- * (a target reference never resolves) holds UNCONDITIONALLY: attribution
- * keys off the target document's own key set, and the merge never moves
- * data across section keys, so a target-contributed value can only surface
- * in a section attributed "target" - under any merge semantics. Wholesale
- * replacement protects only AVAILABILITY: it is what stops an operator
- * value from surviving into a target-declared section and being
- * over-refused. The merge-invariant test in test/engine/secrets.test.ts
- * pins that half for every secretValues-declaring section.
+ * The one mint behind every reference a snapshot writes: the variable's `$NAME` form, proved by
+ * the same grammar and reserved-prefix rule the settings file enforces, so a snapshot can never
+ * emit a reference an apply would refuse. `label` names the secret for the BUG prose.
  */
-export function targetSecretSource(targetDoc: unknown): (section: SectionKey) => SettingsSource {
-  const declared = new Set<string>();
-  if (typeof targetDoc === "object" && targetDoc !== null && !Array.isArray(targetDoc)) {
-    for (const [key, value] of Object.entries(targetDoc)) {
-      if (value !== undefined) {
-        declared.add(key);
-      }
-    }
+function mintSecretReference(variable: string, label: string): MintedSecretReference {
+  const reference = `$${variable}`;
+  const checked = validateSecretRef(reference, "operator", label);
+  if (!checked.ok) {
+    throw new Error(
+      `BUG: the snapshot minted a reference the settings file refuses: ${checked.error}`,
+    );
   }
-  return (section) => (declared.has(section) ? "target" : "operator");
+  return { variable, reference };
+}
+
+/**
+ * `SECRET_` leads so a store named like a runner namespace (`ACTIONS_*`) still mints a legal
+ * reference; the store follows so two stores holding one secret name never share a variable.
+ */
+export function snapshotSecretReference(store: string, secretName: string): MintedSecretReference {
+  return mintSecretReference(
+    `SECRET_${store.toUpperCase()}_${secretName}`,
+    `the ${store} secret ${secretName}`,
+  );
 }

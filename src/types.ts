@@ -1,40 +1,30 @@
 /**
- * Leaf type vocabulary shared by the settings schema and its consumers.
- * Deliberately zod-free: these are the hand-written generic types the zod
- * schemas cannot express (a generic wrapper interface, a compile-time
- * exhaustiveness helper); importers import them from here.
+ * Leaf type vocabulary shared by the settings schema and its consumers; zod-free, since these are the generic types
+ * the zod schemas cannot express.
  */
 
 /** What apply does to live resources the settings file does not declare. */
 export type UndeclaredPolicy = "keep" | "delete";
 
 /**
- * The wrapped form of a list, overriding what happens to live resources the
- * file does not declare. The plain array form keeps the list's own default
- * policy (for a top-level section that is the section default, and a
- * multi-repo defaults file can set it; a nested list such as
- * environments[].variables has its own fixed default and never inherits
- * one); this wrapper can set it explicitly, and with
- * `undeclared` omitted it behaves exactly like the plain array. The wrapper is
- * this action's own vocabulary (nothing here passes through to GitHub), so
- * its keys are strict: anything besides `undeclared` and `entries` is
- * rejected upfront as a typo.
+ * The wrapper knobbed() and nestedKnobbed() build. The underscored keys are this action's DIRECTIVES, never GitHub
+ * settings; each key's meaning is published from src/sections/shared/shared.docs.yml, the one source the JSON Schema and the docs render from.
  */
 export interface UndeclaredPolicyList<E> {
-  /**
-   * What apply does to live resources `entries` does not declare: "delete"
-   * removes them, "keep" leaves them alone and surfaces each as a note.
-   * Omitted, the list's own default applies.
-   */
-  undeclared?: UndeclaredPolicy;
-  /** The declared entries, exactly as the plain array form lists them. */
+  _undeclared?: UndeclaredPolicy;
   entries: E[];
+  /** Only a TOP-LEVEL section's wrapper takes it (see nestedKnobbed()). */
+  _layering?: "merge" | "replace";
 }
 
-/**
- * Compile-time exhaustiveness helper: `MustBeNever<Exclude<Union, Covered>>`
- * fails to compile when the Union has a member the Covered set omits. The one
- * definition every exhaustiveness check in this codebase uses (schema.ts,
- * orchestrate.ts, inputs.ts), so the idiom cannot drift between them.
- */
 export type MustBeNever<T extends never> = T;
+
+/** `Omit<A | B, K>` collapses to the common keys, losing each member's own fields; this keeps one member per arm. */
+export type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+
+/** Readonly through every nested object and array; functions pass untouched. The type twin of a deep Object.freeze. */
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends object
+    ? { readonly [P in keyof T]: DeepReadonly<T[P]> }
+    : T;

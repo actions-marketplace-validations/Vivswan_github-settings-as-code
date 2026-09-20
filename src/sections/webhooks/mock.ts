@@ -1,14 +1,11 @@
 /**
- * The webhooks section's e2e mock fragment, registered in
- * test/e2e/mock/sections.ts. Imports the test-tree seams (mock/support.ts and
- * mock/state.ts) on purpose - the bundle entry is src/main.ts, so this
- * fragment never reaches lib/index.js - and never routes.ts or sections.ts.
- *
- * The stored hook keeps its REAL config.secret (so state comparisons see
- * what was written), but every response echoes it as "********" - GitHub
- * never reveals a webhook secret on any read or write echo.
+ * This fragment imports test-tree seams on purpose: the bundle entry is src/main.ts, so it never
+ * reaches lib/index.js. The stored hook keeps its REAL config.secret so state comparisons see what
+ * was written; GitHub never reveals a webhook secret, so every echo masks it.
+ *   config.secret on any read or write echo -> "********"
  */
 
+import type { ListMockSpec } from "../../../test/e2e/mock/list-fragment.js";
 import { completeHook } from "../../../test/e2e/mock/state.js";
 import {
   asObject,
@@ -21,6 +18,18 @@ import {
   slicePage,
   storedHookConfig,
 } from "../../../test/e2e/mock/support.js";
+
+/**
+ * The seed completion buildState applies (test/e2e/mock/state.ts LIST_MOCKS). A hook's server
+ * fields are minted by completeHook, which buildState runs over every seed and the create handler
+ * below runs over every body, so this spec adds only the id it is handed.
+ */
+export const WEBHOOKS_MOCK: ListMockSpec = {
+  collection: (state) => state.hooks,
+  defaults: {},
+  owned: (id) => ({ id }),
+  unique: "identity",
+};
 
 export const webhooksMockHandlers: SectionRestHandlers<"webhooks"> = {
   "webhooks.list": ({ state, query }) => ok(slicePage(state.hooks.map(maskHookSecret), query)),
@@ -41,11 +50,9 @@ export const webhooksMockHandlers: SectionRestHandlers<"webhooks"> = {
       return { status: 404, body: { message: "Not Found" } };
     }
     const payload = asObject(body);
-    // GitHub's general PATCH REPLACES the whole config when the body carries
-    // one (removing undeclared keys, the secret included) - the exact
-    // semantics the section avoids by routing config drift through the
-    // config sub-endpoint. Modeled faithfully so a regression that sends
-    // config through this route shows up as lost state.
+    // GitHub's general PATCH REPLACES the whole config when the body carries one, secret included:
+    // the exact semantics the section avoids by routing config drift through the sub-endpoint.
+    // Modeled faithfully so a regression that sends config through this route shows up as lost state.
     if (payload.config !== undefined) {
       hook.config = storedHookConfig(asObject(payload.config));
     }
@@ -57,7 +64,7 @@ export const webhooksMockHandlers: SectionRestHandlers<"webhooks"> = {
     }
     for (const [key, value] of Object.entries(payload)) {
       if (!HOOK_CANONICAL_KEYS.has(key)) {
-        hook[key] = value; // passthrough fields read back verbatim
+        hook[key] = value;
       }
     }
     return ok(maskHookSecret(hook));
@@ -68,8 +75,8 @@ export const webhooksMockHandlers: SectionRestHandlers<"webhooks"> = {
     if (!hook) {
       return { status: 404, body: { message: "Not Found" } };
     }
-    // The config sub-endpoint UPDATES the named fields and leaves the rest
-    // alone - it never removes an existing secret the payload omits.
+    // The config sub-endpoint UPDATES the named fields and leaves the rest alone: it never removes
+    // an existing secret the payload omits.
     hook.config = storedHookConfig({ ...asObject(hook.config), ...asObject(body) });
     return ok(maskedConfig(asObject(hook.config)));
   },

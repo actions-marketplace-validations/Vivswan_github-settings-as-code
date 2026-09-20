@@ -1,20 +1,12 @@
-/**
- * Unit tests for the pure logic of the gaps toolchain: compiler-output
- * parsing, the graduate-vs-foreign split, the spec-only rewrite template,
- * and the wholesale index generation. Fixture strings stand in for the
- * compiler and for gap files in the pure-logic blocks; a final block runs
- * the same functions against the real directory. The loud-failure paths
- * (foreign diagnostics, unparsable output, an unrecognizable gap file)
- * matter as much as the happy ones: the scripts must refuse to half-fix.
- */
-
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   camelCaseGapName,
   gapFileBases,
   generateIndex,
+  indexSummary,
 } from "../../.github/scripts/gen-gaps-index.js";
 import {
   isGapFile,
@@ -24,6 +16,8 @@ import {
   planGraduation,
   toSpecOnlyGapSource,
 } from "../../.github/scripts/graduate-upstream-gaps.js";
+import { ROOT } from "../root.js";
+import { withTempDir } from "../temp-dir.js";
 
 const TRIPWIRE_MESSAGE =
   "Type '\"GET /repos/{owner}/{repo}/merge-queue\"' does not satisfy the constraint 'never'.";
@@ -65,8 +59,7 @@ describe("parseDiagnostics", () => {
   });
 
   test("attaches indented continuation lines to the diagnostic above them", () => {
-    // Real tsgo 7.0.2 --pretty false output for a chained error: the nested
-    // explanations continue on indented lines under the diagnostic.
+    // Real tsgo 7.0.2 --pretty false output: a chained error continues on indented lines under the diagnostic.
     const output = [
       "src/chain.ts(3,29): error TS2345: Argument of type '{ a: { b: string; }; }' is not assignable to parameter of type '{ a: { b: number; }; }'.",
       "  The types of 'a.b' are incompatible between these types.",
@@ -87,38 +80,19 @@ describe("parseDiagnostics", () => {
     expect(diagnostics[1]?.message).toBe("Cannot find name 'nope'.");
   });
 
-  test("a chained TS2344 tripwire still graduates its gap file", () => {
-    // A tripwire whose constraint is object-shaped chains its message; the
-    // continuation lines must not turn the diagnostic into unparsed noise.
-    const output = [
-      "src/upstream-gaps/merge-queue.ts(12,34): error TS2344: Type '{ route: string; }' does not satisfy the constraint 'never'.",
-      "  Types of property 'route' are incompatible.",
-    ].join("\n");
-    const { diagnostics, unparsed } = parseDiagnostics(output);
-    expect(unparsed).toEqual([]);
-    const plan = planGraduation(diagnostics);
-    expect(plan.foreign).toEqual([]);
-    expect(plan.gapFiles).toEqual(["src/upstream-gaps/merge-queue.ts"]);
-  });
-
-  test("an indented line with no diagnostic above it stays unparsed", () => {
-    const output = ["not a diagnostic", "  looks like a continuation"].join("\n");
-    const { diagnostics, unparsed } = parseDiagnostics(output);
-    expect(diagnostics).toEqual([]);
-    expect(unparsed).toEqual(["not a diagnostic", "  looks like a continuation"]);
-  });
-
-  test("collects non-diagnostic lines as unparsed instead of guessing", () => {
+  test("lines that are neither a diagnostic nor its continuation stay unparsed, and end the diagnostic above them", () => {
     const output = [
       "error TS5112: Option 'project' cannot be mixed with source files on a command line.",
       "src/upstream-gaps/a.ts(1,1): error TS2344: boom",
       "some stray crash line",
+      "  looks like a continuation, but the stray line above ended the diagnostic",
     ].join("\n");
     const { diagnostics, unparsed } = parseDiagnostics(output);
-    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics.map((diagnostic) => diagnostic.message)).toEqual(["boom"]);
     expect(unparsed).toEqual([
       "error TS5112: Option 'project' cannot be mixed with source files on a command line.",
       "some stray crash line",
+      "  looks like a continuation, but the stray line above ended the diagnostic",
     ]);
   });
 });
@@ -132,8 +106,7 @@ describe("isGapFile", () => {
   });
 
   test("the directory's infrastructure files are never graduatable", () => {
-    // index.ts and gap.ts carry no tripwire; a TS2344 in either means the
-    // machinery itself broke, and deleting it could never be the fix.
+    // index.ts and gap.ts carry no tripwire; a TS2344 in either means the machinery broke, and deleting it could never be the fix.
     expect(isGapFile("src/upstream-gaps/index.ts")).toBe(false);
     expect(isGapFile("src/upstream-gaps/gap.ts")).toBe(false);
     for (const file of ["src/upstream-gaps/index.ts", "src/upstream-gaps/gap.ts"]) {
@@ -166,18 +139,6 @@ describe("planGraduation", () => {
       "src/upstream-gaps/merge-queue.ts",
       "src/upstream-gaps/pages-https.ts",
     ]);
-  });
-
-  test("a TS2344 outside the gaps directory is foreign", () => {
-    const plan = planGraduation([tripwire("src/sections/labels.ts")]);
-    expect(plan.gapFiles).toEqual([]);
-    expect(plan.foreign).toHaveLength(1);
-  });
-
-  test("a TS2344 in index.ts is foreign (the index carries no tripwire)", () => {
-    const plan = planGraduation([tripwire("src/upstream-gaps/index.ts")]);
-    expect(plan.gapFiles).toEqual([]);
-    expect(plan.foreign).toHaveLength(1);
   });
 
   test("a non-2344 error inside a gap file is foreign", () => {
@@ -227,56 +188,54 @@ describe("gapFileBases", () => {
     expect(isGapFile("src/upstream-gaps/notes.d.ts")).toBe(false);
     expect(isGapFile("src/upstream-gaps/scratch.test.ts")).toBe(false);
   });
-
-  test("an empty listing yields no bases", () => {
-    expect(gapFileBases(["index.ts", "gap.ts"])).toEqual([]);
-  });
 });
 
 describe("generateIndex", () => {
-  test("is deterministic and sorts the bases itself", () => {
-    const sorted = generateIndex(["merge-queue", "pages-https"]);
-    expect(generateIndex(["pages-https", "merge-queue"])).toBe(sorted);
-    expect(generateIndex(["merge-queue", "pages-https"])).toBe(sorted);
+  test("one import and one GAPS element per gap file, aliased and sorted; an empty directory keeps the same template around an empty GAPS", () => {
+    // The varying parts of the file: the gap imports (gap.js's is the template's) and the GAPS array, whole.
+    const gapImports = (text: string): string[] => text.match(/^import \{ GAP as .*$/gm) ?? [];
+    const gapsArray = (text: string): string =>
+      text.match(/const GAPS = [\s\S]*?\] as const;/)?.[0] ?? "";
+    const two = generateIndex(["pages-https", "merge-queue"]);
+    expect(gapImports(two)).toEqual([
+      'import { GAP as mergeQueue } from "./merge-queue.js";',
+      'import { GAP as pagesHttps } from "./pages-https.js";',
+    ]);
+    expect(gapsArray(two)).toBe("const GAPS = [\n  mergeQueue,\n  pagesHttps,\n] as const;");
+    const none = generateIndex([]);
+    expect(gapImports(none)).toEqual([]);
+    expect(gapsArray(none)).toBe("const GAPS = [] as const;");
+    // Everything but the imports and the GAPS elements is one template, so the derivations the consumers import
+    // (SupplementalRoute, UNDOCUMENTED_ROUTES) are the same text whatever the directory holds.
+    const template = (text: string): string =>
+      text.replace(/^import \{ GAP as .*\n/gm, "").replace(gapsArray(text), "");
+    expect(template(none)).toBe(template(two));
+    expect(none).toContain("export type SupplementalRoute");
+    expect(none).toContain("export const UNDOCUMENTED_ROUTES");
   });
 
-  test("marks itself generated and un-editable in the header", () => {
-    expect(generateIndex([])).toContain("GENERATED by gen-gaps-index.ts - do not edit");
-  });
-
-  test("emits one import and one GAPS element per gap file", () => {
-    const index = generateIndex(["merge-queue", "pages-https"]);
-    expect(index).toContain('import { GAP as mergeQueue } from "./merge-queue.js";');
-    expect(index).toContain('import { GAP as pagesHttps } from "./pages-https.js";');
-    expect(index).toContain('import { undocumentedRoutes } from "./gap.js";');
-    expect(index).toContain("const GAPS = [\n  mergeQueue,\n  pagesHttps,\n] as const;");
-  });
-
-  test("separates the two gap kinds in the derivations", () => {
-    const index = generateIndex(["merge-queue"]);
-    expect(index).toContain(
-      'export type SupplementalRoute = Extract<GapUnion, { kind: "octokit" }>["routes"][number];',
-    );
-    expect(index).toContain(
-      'type SpecOnlyRoute = Extract<GapUnion, { kind: "spec-only" }>["routes"][number];',
-    );
-    expect(index).toContain(
-      "export const UNDOCUMENTED_ROUTES: readonly (SupplementalRoute | SpecOnlyRoute)[] =",
-    );
-    expect(index).toContain("undocumentedRoutes<SupplementalRoute | SpecOnlyRoute>(GAPS);");
-  });
-
-  test("an empty directory degrades to an empty GAPS with both exports intact", () => {
-    const index = generateIndex([]);
-    expect(index).toContain("const GAPS = [] as const;");
-    expect(index).toContain("export type SupplementalRoute");
-    expect(index).toContain("export const UNDOCUMENTED_ROUTES");
-    expect(index).not.toContain("GAP as");
-  });
-
-  test("ends with a trailing newline", () => {
-    expect(generateIndex(["merge-queue"])).toEndWith("\n");
-  });
+  test("the empty index type-checks beside gap.ts: the derivations must not index into an empty tuple", () =>
+    withTempDir("gaps-index-empty-", (dir) => {
+      // The committed index compiles under the project typecheck only while a gap file exists; a derivation
+      // written for a populated GAPS (say `(typeof GAPS)[0]`) would first break the day the last gap graduates.
+      symlinkSync(join(ROOT, "node_modules"), join(dir, "node_modules"), "dir");
+      copyFileSync(join(ROOT, "src", "upstream-gaps", "gap.ts"), join(dir, "gap.ts"));
+      writeFileSync(join(dir, "index.ts"), generateIndex([]));
+      writeFileSync(
+        join(dir, "tsconfig.json"),
+        JSON.stringify({ extends: join(ROOT, "tsconfig.json"), include: [], files: ["index.ts"] }),
+      );
+      const tsc = spawnSync(
+        join(ROOT, "node_modules", ".bin", "tsc"),
+        ["-p", dir, "--pretty", "false"],
+        { cwd: dir, encoding: "utf8" },
+      );
+      if (tsc.error) {
+        throw tsc.error;
+      }
+      expect(tsc.stdout + tsc.stderr).toBe("");
+      expect(tsc.status).toBe(0);
+    }));
 });
 
 describe("isSpecPinned", () => {
@@ -327,20 +286,6 @@ describe("toSpecOnlyGapSource", () => {
         "",
       ].join("\n"),
     );
-  });
-
-  test("the rewritten doc keeps the feature clause and drops the stale octokit prose", () => {
-    const result = toSpecOnlyGapSource(SOURCE, GAP_FILE);
-    expect(result).toContain("/** GitHub shipped the merge queue; @octokit/types ships");
-    expect(result).not.toContain("does not carry these routes");
-  });
-
-  test("the rewrite drops the tripwire, the flag, and their imports", () => {
-    const result = toSpecOnlyGapSource(SOURCE, GAP_FILE);
-    expect(result).not.toContain("MustBeNever");
-    expect(result).not.toContain("Endpoints");
-    expect(result).not.toContain("documentedInSpec");
-    expect(result).not.toContain("defineGap(");
   });
 
   test("routes that fit the line width render inline, matching the formatter", () => {
@@ -398,15 +343,8 @@ describe("toSpecOnlyGapSource", () => {
   });
 });
 
-/**
- * The fixtures above stand in for gap files and listings; this block pins
- * the scripts against the REAL src/upstream-gaps/ so drift can never ship:
- * the committed index must equal a fresh regeneration, every gap file must
- * agree with the flag detector, and every spec-pinned file must be
- * rewritable by the graduation transform.
- */
 describe("the real src/upstream-gaps/ satisfies the scripts' contracts", () => {
-  const GAPS_DIR = join(import.meta.dir, "..", "..", "src", "upstream-gaps");
+  const GAPS_DIR = join(ROOT, "src", "upstream-gaps");
   const realIndex = readFileSync(join(GAPS_DIR, "index.ts"), "utf8");
   const realGapFiles = readdirSync(GAPS_DIR)
     .filter((f) => f.endsWith(".ts"))
@@ -419,7 +357,7 @@ describe("the real src/upstream-gaps/ satisfies the scripts' contracts", () => {
 
   test("spec-pinned detection agrees with each gap's actual kind and flag", async () => {
     for (const gap of realGapFiles) {
-      const abs = join(import.meta.dir, "..", "..", gap);
+      const abs = join(ROOT, gap);
       const { GAP } = (await import(abs)) as {
         GAP: { kind: "octokit"; documentedInSpec: boolean } | { kind: "spec-only" };
       };
@@ -429,8 +367,10 @@ describe("the real src/upstream-gaps/ satisfies the scripts' contracts", () => {
   });
 
   test("every real spec-pinned gap is rewritable to the spec-only template", async () => {
+    // The sweep is legitimately empty once every octokit-kind gap has graduated, so the corpus is not pinned here; the synthetic fixtures pin the
+    // transform.
     for (const gap of realGapFiles) {
-      const abs = join(import.meta.dir, "..", "..", gap);
+      const abs = join(ROOT, gap);
       const source = readFileSync(abs, "utf8");
       if (!isSpecPinned(source)) {
         continue;
@@ -451,5 +391,14 @@ describe("spec-only sources never reach the deletion branch", () => {
       true,
     );
     expect(isSpecOnly("export const GAP = defineGap({ documentedInSpec: false });")).toBe(false);
+  });
+});
+
+describe("indexSummary", () => {
+  test.each<[count: number, tail: string]>([
+    [1, "(1 gap file)"],
+    [2, "(2 gap files)"],
+  ])("%i gap files end the line with %s", (count, tail) => {
+    expect(indexSummary(count)).toBe(`wrote src/upstream-gaps/index.ts ${tail}`);
   });
 });

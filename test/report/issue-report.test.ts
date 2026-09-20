@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { validateSettingsDoc } from "../../src/engine/orchestrate.js";
-import type { Io } from "../../src/io.js";
+import { SectionSelection } from "../../src/engine/section-selection.js";
+import { silentIo } from "../../src/io.js";
+import { describeProblem } from "../../src/problem.js";
+import { REPORT_HEADING } from "../../src/report/composer.js";
 import {
   deliverIssueReport,
   ISSUE_TITLE,
@@ -15,29 +18,75 @@ import { MockApi, type Route } from "../mock-api.js";
 const SLUG = { owner: "o", name: "private-repo", slug: "o/private-repo" };
 const LABEL_CREATE = "POST /repos/o/private-repo/labels";
 const LABEL_LOOKUP =
-  "GET /repos/o/private-repo/issues?state=all&labels=settings-as-code-report&per_page=100";
+  "GET /repos/o/private-repo/issues?state=all&labels=settings-as-code-report&per_page=100&page=1";
+const LABEL_LOOKUP_PAGE_2 =
+  "GET /repos/o/private-repo/issues?state=all&labels=settings-as-code-report&per_page=100&page=2";
 const ISSUE_CREATE = "POST /repos/o/private-repo/issues";
-const CREATOR_SCAN =
-  "GET /repos/o/private-repo/issues?state=all&creator=bot&sort=created&direction=asc&per_page=100&page=1";
+const TITLE_SCAN =
+  "GET /repos/o/private-repo/issues?state=all&sort=created&direction=desc&per_page=100&page=1";
+/** No write reached the target: what a failure before its first write carries. */
+const NOTHING_LANDED = { labelCreated: false, createdIssue: null };
 
-const reportIssue = (number: number) => ({
+/** An issue the action itself wrote: the exact title over a body opening with the report heading. */
+const reportIssue = (number: number, state: "open" | "closed" = "open") => ({
   number,
   title: ISSUE_TITLE,
-  state: "open",
+  body: `${REPORT_HEADING} o/private-repo\n\nan earlier report`,
+  state,
   html_url: `https://github.com/o/private-repo/issues/${number}`,
 });
 
+/** A same-titled issue a human opened by hand: no report heading anywhere in the body. */
+const humanIssue = (number: number, state: "open" | "closed") => ({
+  ...reportIssue(number, state),
+  body: "Opened by hand to discuss the private report; please do not overwrite.",
+  user: { login: "a-human" },
+});
+
 describe("deliverIssueReport", () => {
-  test("found by marker label: one lookup request, then PATCH body + open", async () => {
+  test("found by marker label: one lookup request, then PATCH body + open, leaving the issue's labels alone", async () => {
+    // Human-added labels must never be clobbered; the marker is already attached (that is how the lookup found it).
     const api = new MockApi({
       [LABEL_CREATE]: { error: { status: 422, message: "already_exists", body: "" } },
-      [LABEL_LOOKUP]: { data: [reportIssue(7)] },
+      [LABEL_LOOKUP]: {
+        data: [{ ...reportIssue(7), labels: [{ name: "human-added" }, { name: MARKER_LABEL }] }],
+      },
       "PATCH /repos/o/private-repo/issues/7": { data: reportIssue(7) },
     });
     const result = await deliverIssueReport(api, SLUG, "the report body", true, "always");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/7" });
-    const lookups = api.calls.filter((c) => c.method === "GET");
-    expect(lookups).toHaveLength(1);
+    expect(result).toEqual({ delivered: "updated", number: 7, labelCreated: false });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      "PATCH /repos/o/private-repo/issues/7",
+    ]);
+    const patch = api.calls.find((c) => c.method === "PATCH");
+    expect(patch?.payload).toEqual({ body: "the report body", state: "open" });
+  });
+
+  test("a marker issue on page 2 of the label lookup is found, not duplicated", async () => {
+    // 100 marker-labelled pull requests fill page 1; a single-page lookup would miss the issue and create a second one.
+    const labelled = Array.from({ length: 100 }, (_, i) => ({
+      ...reportIssue(100 + i),
+      pull_request: { url: `pr-${i}` },
+      labels: [MARKER_LABEL],
+    }));
+    const api = new MockApi({
+      [LABEL_CREATE]: { error: { status: 422, message: "already_exists", body: "" } },
+      [LABEL_LOOKUP]: { data: labelled },
+      [LABEL_LOOKUP_PAGE_2]: { data: [reportIssue(7)] },
+      "PATCH /repos/o/private-repo/issues/7": { data: reportIssue(7) },
+      [TITLE_SCAN]: { data: [] },
+      [ISSUE_CREATE]: { data: reportIssue(8) },
+    });
+    const result = await deliverIssueReport(api, SLUG, "the report body", true, "always");
+    expect(result).toEqual({ delivered: "updated", number: 7, labelCreated: false });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      LABEL_LOOKUP_PAGE_2,
+      "PATCH /repos/o/private-repo/issues/7",
+    ]);
     const patch = api.calls.find((c) => c.method === "PATCH");
     expect(patch?.payload).toEqual({ body: "the report body", state: "open" });
   });
@@ -53,68 +102,68 @@ describe("deliverIssueReport", () => {
     expect(patch?.payload).toEqual({ body: "body", state: "closed" });
   });
 
-  test("pull requests and other titles never match, even with the marker label", async () => {
+  test("pull requests, other titles, and human-written bodies never match, even with the marker label", async () => {
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: {
         data: [
           { ...reportIssue(1), pull_request: { url: "pr" } },
           { ...reportIssue(2), title: `${ISSUE_TITLE} (fork)` },
+          { ...humanIssue(3, "open"), labels: [MARKER_LABEL] },
         ],
       },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: [] },
+      [TITLE_SCAN]: { data: [] },
       [ISSUE_CREATE]: { data: reportIssue(9) },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/9" });
+    expect(result).toEqual({ delivered: "created", number: 9, labelCreated: true });
     const create = api.calls.find((c) => `${c.method} ${c.path}` === ISSUE_CREATE);
     expect(create?.payload).toEqual({ title: ISSUE_TITLE, body: "body", labels: [MARKER_LABEL] });
   });
 
-  test("label-lookup miss runs the creator scan BEFORE any create, avoiding duplicates", async () => {
+  test("label-lookup miss runs the title scan BEFORE any create, avoiding duplicates", async () => {
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
       // The label was stripped by a human; the scan still finds the issue.
-      [CREATOR_SCAN]: { data: [reportIssue(3)] },
+      [TITLE_SCAN]: { data: [reportIssue(3)] },
       "PATCH /repos/o/private-repo/issues/3": { data: reportIssue(3) },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/3" });
-    expect(api.calls.some((c) => `${c.method} ${c.path}` === ISSUE_CREATE)).toBe(false);
+    expect(result).toEqual({ delivered: "updated", number: 3, labelCreated: true });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      TITLE_SCAN,
+      "PATCH /repos/o/private-repo/issues/3",
+    ]);
+    // The scan hit carried no labels at all, so the reattached marker is the whole list.
+    const patch = api.calls.find((c) => c.method === "PATCH");
+    expect(patch?.payload).toEqual({ body: "body", state: "open", labels: [MARKER_LABEL] });
   });
 
-  test("a fallback-scan hit without the marker reattaches it on the upsert PATCH", async () => {
-    // The marker was stripped by a human; without relabeling here, every
-    // future label-filtered lookup would miss this issue forever.
+  test("a fallback-scan hit without the marker is reclaimed and relabelled, whoever created it", async () => {
+    // A human stripped the marker and the PAT was since rotated to another account: the scan matches the title, not the
+    // creator, and the upsert PATCH reattaches the marker (without it, every future label-filtered lookup misses forever).
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: [{ ...reportIssue(3), labels: ["bug"] }] },
+      [TITLE_SCAN]: {
+        data: [{ ...reportIssue(3), labels: ["bug"], user: { login: "former-bot" } }],
+      },
       "PATCH /repos/o/private-repo/issues/3": { data: reportIssue(3) },
+      [ISSUE_CREATE]: { data: reportIssue(8) },
     });
-    await deliverIssueReport(api, SLUG, "body", true, "always");
+    const result = await deliverIssueReport(api, SLUG, "body", true, "always");
+    expect(result).toEqual({ delivered: "updated", number: 3, labelCreated: true });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      TITLE_SCAN,
+      "PATCH /repos/o/private-repo/issues/3",
+    ]);
     const patch = api.calls.find((c) => c.method === "PATCH");
     expect(patch?.payload).toEqual({ body: "body", state: "open", labels: ["bug", MARKER_LABEL] });
-  });
-
-  test("an issue found by the label lookup is PATCHed without a labels field", async () => {
-    // Human-added labels must never be clobbered: the normal upsert leaves
-    // the labels alone (the marker is already attached - that is how the
-    // lookup found it).
-    const api = new MockApi({
-      [LABEL_CREATE]: { error: { status: 422, message: "already_exists", body: "" } },
-      [LABEL_LOOKUP]: {
-        data: [{ ...reportIssue(7), labels: [{ name: "human-added" }, { name: MARKER_LABEL }] }],
-      },
-      "PATCH /repos/o/private-repo/issues/7": { data: reportIssue(7) },
-    });
-    await deliverIssueReport(api, SLUG, "body", true, "always");
-    const patch = api.calls.find((c) => c.method === "PATCH");
-    expect(patch?.payload).toEqual({ body: "body", state: "open" });
   });
 
   test("a healthy always run relabels a fallback-found stripped issue while closing it", async () => {
@@ -122,8 +171,7 @@ describe("deliverIssueReport", () => {
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: [{ ...reportIssue(3), labels: [{ name: "bug" }] }] },
+      [TITLE_SCAN]: { data: [{ ...reportIssue(3), labels: [{ name: "bug" }] }] },
       "PATCH /repos/o/private-repo/issues/3": { data: reportIssue(3) },
     });
     await deliverIssueReport(api, SLUG, "body", false, "always");
@@ -135,41 +183,75 @@ describe("deliverIssueReport", () => {
     });
   });
 
-  test("the creator scan early-exits once a page contains the issue", async () => {
-    const filler = Array.from({ length: 100 }, (_, i) => ({
-      number: 100 + i,
-      title: i === 50 ? ISSUE_TITLE : `noise ${i}`,
-      state: "closed",
-      html_url: `https://github.com/o/private-repo/issues/${100 + i}`,
-    }));
+  test("the title scan early-exits once a page contains the issue", async () => {
+    const filler = Array.from({ length: 100 }, (_, i) =>
+      i === 50 ? reportIssue(150, "closed") : humanIssue(100 + i, "closed"),
+    );
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: filler },
+      [TITLE_SCAN]: { data: filler },
       "PATCH /repos/o/private-repo/issues/150": { data: null },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/150" });
+    expect(result).toEqual({ delivered: "updated", number: 150, labelCreated: true });
     // A full page came back, but the match stops the walk: no page=2 request.
-    expect(api.calls.filter((c) => c.path.includes("page=2"))).toHaveLength(0);
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      TITLE_SCAN,
+      "PATCH /repos/o/private-repo/issues/150",
+    ]);
+  });
+
+  test.each<[name: string, listed: Array<Record<string, unknown>>, picks: number]>([
+    [
+      "two reports: the open one wins over a newer closed one",
+      [reportIssue(9, "closed"), reportIssue(3)],
+      3,
+    ],
+    ["two open reports: the newest wins", [reportIssue(9), reportIssue(3)], 9],
+    [
+      "two closed reports: the newest wins",
+      [reportIssue(9, "closed"), reportIssue(3, "closed")],
+      9,
+    ],
+  ])("candidate policy: %s", async (_name, listed, picks) => {
+    // Both lookups share one policy: a report body, then open over closed, then newest. The loser is never written.
+    const api = new MockApi({
+      [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
+      [LABEL_LOOKUP]: { data: [] },
+      [TITLE_SCAN]: { data: listed },
+      [ISSUE_CREATE]: { data: reportIssue(50) },
+      "PATCH /repos/o/private-repo/issues/*": { data: null },
+    });
+    const result = await deliverIssueReport(api, SLUG, "body", true, "always");
+    expect(result).toEqual({ delivered: "updated", number: picks, labelCreated: true });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      TITLE_SCAN,
+      `PATCH /repos/o/private-repo/issues/${picks}`,
+    ]);
   });
 
   test("nothing anywhere: POST with the marker label, then close when healthy", async () => {
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: [] },
+      [TITLE_SCAN]: { data: [] },
       [ISSUE_CREATE]: { data: reportIssue(9) },
       "PATCH /repos/o/private-repo/issues/9": { data: null },
     });
     const result = await deliverIssueReport(api, SLUG, "body", false, "always");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/9" });
-    const scanAt = api.calls.findIndex((c) => `${c.method} ${c.path}` === CREATOR_SCAN);
-    const createAt = api.calls.findIndex((c) => `${c.method} ${c.path}` === ISSUE_CREATE);
-    expect(scanAt).toBeGreaterThanOrEqual(0);
-    expect(scanAt).toBeLessThan(createAt);
+    expect(result).toEqual({ delivered: "created", number: 9, labelCreated: true });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      TITLE_SCAN,
+      ISSUE_CREATE,
+      "PATCH /repos/o/private-repo/issues/9",
+    ]);
     const close = api.calls.find((c) => c.method === "PATCH");
     expect(close?.payload).toEqual({ state: "closed" });
   });
@@ -178,13 +260,63 @@ describe("deliverIssueReport", () => {
     const api = new MockApi({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: [] },
+      [TITLE_SCAN]: { data: [] },
       [ISSUE_CREATE]: { data: reportIssue(9) },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/9" });
-    expect(api.calls.some((c) => c.method === "PATCH")).toBe(false);
+    expect(result).toEqual({ delivered: "created", number: 9, labelCreated: true });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      LABEL_CREATE,
+      LABEL_LOOKUP,
+      TITLE_SCAN,
+      ISSUE_CREATE,
+    ]);
+  });
+
+  test("a write that landed before a later failure rides on the warning: the created label, the created issue", async () => {
+    // Label created, then the lookup fails: the label is the landed write.
+    const afterLabel = new MockApi({
+      [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
+      [LABEL_LOOKUP]: { error: { status: 500, message: "boom", body: "" } },
+    });
+    expect(await deliverIssueReport(afterLabel, SLUG, "body", true, "always")).toEqual({
+      landed: { labelCreated: true, createdIssue: null },
+      warning: expect.stringMatching(/^could not deliver the private report \(HTTP 500\)/),
+    });
+    // Issue created (the label existed), then the healthy close fails: the issue is the landed write.
+    const afterCreate = new MockApi({
+      [LABEL_CREATE]: { error: { status: 422, message: "already_exists", body: "" } },
+      [LABEL_LOOKUP]: { data: [] },
+      [TITLE_SCAN]: { data: [] },
+      [ISSUE_CREATE]: { data: reportIssue(9) },
+      "PATCH /repos/o/private-repo/issues/9": {
+        error: { status: 403, message: "Resource not accessible", body: "" },
+      },
+    });
+    expect(await deliverIssueReport(afterCreate, SLUG, "body", false, "always")).toEqual({
+      landed: { labelCreated: false, createdIssue: 9 },
+      warning: expect.stringMatching(/^could not deliver the private report \(HTTP 403\)/),
+    });
+  });
+
+  test("a create response without an issue number is a malformed-response warning, whatever the state", async () => {
+    const routes: Record<string, Route> = {
+      [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
+      [LABEL_LOOKUP]: { data: [] },
+      [TITLE_SCAN]: { data: [] },
+      [ISSUE_CREATE]: { data: { html_url: "https://github.com/o/private-repo/issues/9" } },
+    };
+    for (const needsAttention of [true, false]) {
+      const api = new MockApi(routes);
+      const result = await deliverIssueReport(api, SLUG, "body", needsAttention, "always");
+      expect(result).toEqual({
+        landed: { labelCreated: true, createdIssue: null },
+        warning: expect.stringMatching(
+          /^could not deliver the private report: the report issue was created but its response carried no issue number/,
+        ),
+      });
+      expect(api.calls.filter((c) => c.method === "PATCH")).toEqual([]);
+    }
   });
 
   test("a denied marker-label create is a safe warning and stops everything", async () => {
@@ -194,13 +326,13 @@ describe("deliverIssueReport", () => {
       },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("HTTP 403");
-    expect(result.warning).toContain('"Issues" (read and write)');
-    expect(result.warning).not.toContain(SLUG.slug);
-    expect(api.calls).toHaveLength(1);
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning:
+        'could not deliver the private report (HTTP 403). To fix, grant "Issues" (read and write) ' +
+        "under the PAT's Repository permissions for the target repository, or set private-report: none",
+    });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([LABEL_CREATE]);
   });
 
   test("a non-permission failure gets re-run advice, no grant prose", async () => {
@@ -212,25 +344,24 @@ describe("deliverIssueReport", () => {
       },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("HTTP 500");
-    expect(result.warning).toContain("Re-run the workflow");
-    expect(result.warning).not.toContain("Issues");
-    expect(result.warning).not.toContain(SLUG.slug);
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning:
+        "could not deliver the private report (HTTP 500). Re-run, or set " +
+        "private-report: none if it persists",
+    });
   });
 
   test("a throwing transport never escapes; the warning stays slug-free", async () => {
-    // MockApi throws on unrouted mutations, standing in for a network-level
-    // failure (GithubApi throws those with the path in the message).
+    // MockApi throws on unrouted mutations, standing in for a network-level failure (GitHubApi throws those with the path in the message).
     const api = new MockApi({});
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("could not deliver the private report");
-    expect(result.warning).not.toContain(SLUG.slug);
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning:
+        "could not deliver the private report: the request failed before an HTTP response " +
+        "arrived. Re-run, or set private-report: none if it persists",
+    });
   });
 
   test("a non-list lookup response is a warning, not a crash", async () => {
@@ -239,25 +370,25 @@ describe("deliverIssueReport", () => {
       [LABEL_LOOKUP]: { data: { message: "unexpected" } },
     });
     const result = await deliverIssueReport(api, SLUG, "body", true, "always");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("the report-issue lookup returned a non-list response");
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning:
+        "could not deliver the private report: the report-issue lookup returned a non-list " +
+        'page. Check the "api-version" input, or set private-report: none',
+    });
   });
 });
 
 describe("deliverIssueReport under mode: on-failure", () => {
   const OPEN_LOOKUP =
-    "GET /repos/o/private-repo/issues?state=open&labels=settings-as-code-report&per_page=100";
+    "GET /repos/o/private-repo/issues?state=open&labels=settings-as-code-report&per_page=100&page=1";
   const OPEN_LOOKUP_PATH =
-    "/repos/o/private-repo/issues?state=open&labels=settings-as-code-report&per_page=100";
+    "/repos/o/private-repo/issues?state=open&labels=settings-as-code-report&per_page=100&page=1";
 
   test("healthy with no open issue: exactly one read, zero writes, skipped", async () => {
     const api = new MockApi({ [OPEN_LOOKUP]: { data: [] } });
     const result = await deliverIssueReport(api, SLUG, "body", false, "on-failure");
     expect(result).toEqual({ skipped: true });
-    // the single open-issue lookup and nothing else: no label ensure-create,
-    // no /user creator-scan fallback, no mutation of any kind
     expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([`GET ${OPEN_LOOKUP_PATH}`]);
   });
 
@@ -267,7 +398,7 @@ describe("deliverIssueReport under mode: on-failure", () => {
       "PATCH /repos/o/private-repo/issues/7": { data: reportIssue(7) },
     });
     const result = await deliverIssueReport(api, SLUG, "the report body", false, "on-failure");
-    expect(result).toEqual({ url: "https://github.com/o/private-repo/issues/7" });
+    expect(result).toEqual({ delivered: "updated", number: 7, labelCreated: false });
     expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       `GET ${OPEN_LOOKUP_PATH}`,
       "PATCH /repos/o/private-repo/issues/7",
@@ -281,11 +412,13 @@ describe("deliverIssueReport under mode: on-failure", () => {
       [OPEN_LOOKUP]: { error: { status: 500, message: "boom o/private-repo", body: "" } },
     });
     const result = await deliverIssueReport(api, SLUG, "body", false, "on-failure");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("HTTP 500");
-    expect(result.warning).not.toContain(SLUG.slug);
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning: expect.stringMatching(
+        /^could not deliver the private report \(HTTP 500\)\. Re-run, /,
+      ),
+    });
+    expect(JSON.stringify(result)).not.toContain("o/private-repo");
   });
 
   test("a failing close-PATCH is a safe warning too", async () => {
@@ -296,20 +429,24 @@ describe("deliverIssueReport under mode: on-failure", () => {
       },
     });
     const result = await deliverIssueReport(api, SLUG, "body", false, "on-failure");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("HTTP 403");
-    expect(result.warning).not.toContain(SLUG.slug);
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning: expect.stringMatching(
+        /^could not deliver the private report \(HTTP 403\)\. To fix, grant "Issues"/,
+      ),
+    });
+    expect(JSON.stringify(result)).not.toContain("o/private-repo");
   });
 
   test("a non-list quiet-path response is a warning, not a crash", async () => {
     const api = new MockApi({ [OPEN_LOOKUP]: { data: { message: "unexpected" } } });
     const result = await deliverIssueReport(api, SLUG, "body", false, "on-failure");
-    if (!("warning" in result)) {
-      throw new Error("expected a warning");
-    }
-    expect(result.warning).toContain("the open-issue lookup returned a non-list response");
+    expect(result).toEqual({
+      landed: NOTHING_LANDED,
+      warning:
+        "could not deliver the private report: the open-issue lookup returned a non-list " +
+        'page. Check the "api-version" input, or set private-report: none',
+    });
   });
 
   test("needs-attention requests are identical to always, on both upsert paths", async () => {
@@ -327,12 +464,11 @@ describe("deliverIssueReport under mode: on-failure", () => {
     const patched = await sequence(patchRoutes(), "on-failure");
     expect(patched).toEqual(await sequence(patchRoutes(), "always"));
     expect(patched.some((c) => c.method === "PATCH")).toBe(true);
-    // path 2: nothing anywhere -> ensure-create, lookup, creator scan, POST create
+    // path 2: nothing anywhere -> ensure-create, lookup, title scan, POST create
     const createRoutes = (): Record<string, Route> => ({
       [LABEL_CREATE]: { data: MARKER_LABEL_CONFIG },
       [LABEL_LOOKUP]: { data: [] },
-      "GET /user": { data: { login: "bot" } },
-      [CREATOR_SCAN]: { data: [] },
+      [TITLE_SCAN]: { data: [] },
       [ISSUE_CREATE]: { data: reportIssue(9) },
     });
     const created = await sequence(createRoutes(), "on-failure");
@@ -347,24 +483,22 @@ describe("injectMarkerLabel", () => {
     const { settings: injected, outcome } = injectMarkerLabel(settings);
     expect(outcome).toBe("injected");
     expect(injected.labels).toEqual([{ name: "bug", color: "d73a4a" }, MARKER_LABEL_CONFIG]);
-    expect(settings.labels).toHaveLength(1);
+    expect(settings.labels).toEqual([{ name: "bug", color: "d73a4a" }]);
   });
 
   test("a wrapped labels section stays wrapped, keeping its undeclared policy", () => {
-    // Injection must rebuild the operator's chosen shape: losing the wrapper
-    // here would silently restore the labels default (delete) on the next run.
+    // Injection must rebuild the operator's chosen shape: losing the wrapper here would silently restore the labels default (delete) on the next run.
     const settings: SettingsFile = {
-      labels: { undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] },
+      labels: { _undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] },
     };
     const result = injectMarkerLabel(settings);
     expect(result.outcome).toBe("injected");
     expect(result.settings.labels).toEqual({
-      undeclared: "keep",
+      _undeclared: "keep",
       entries: [{ name: "bug", color: "d73a4a" }, MARKER_LABEL_CONFIG],
     });
-    // input is not mutated
     expect(settings.labels).toEqual({
-      undeclared: "keep",
+      _undeclared: "keep",
       entries: [{ name: "bug", color: "d73a4a" }],
     });
   });
@@ -372,25 +506,20 @@ describe("injectMarkerLabel", () => {
   test("a rename-refusal in a wrapped labels section rebuilds the wrapped form", () => {
     const settings: SettingsFile = {
       labels: {
-        undeclared: "keep",
+        _undeclared: "keep",
         entries: [{ name: MARKER_LABEL, new_name: "something-else", color: "0e2a47" }],
       },
     };
     const result = injectMarkerLabel(settings);
     expect(result.outcome).toBe("rename-refused");
     expect(result.settings.labels).toEqual({
-      undeclared: "keep",
+      _undeclared: "keep",
       entries: [{ name: MARKER_LABEL, new_name: undefined, color: "0e2a47" }],
     });
   });
 
   test("a bare wrapper (no policy key) stays bare - omission is preserved", () => {
-    // Injection must not change the SHAPE of the operator's declaration: a
-    // bare wrapper stays bare. In multi-repo mode the merge has already
-    // resolved the policy before injection runs; in single-repo mode there
-    // is no merge and the section handler resolves the default itself.
-    // Materializing the key here would rewrite a declaration the user
-    // wrote, for no gain on either path.
+    // Injection must not change the SHAPE of the operator's declaration; the section handler resolves the default policy itself.
     const settings: SettingsFile = { labels: { entries: [{ name: "bug" }] } };
     const result = injectMarkerLabel(settings);
     expect(result.outcome).toBe("injected");
@@ -420,18 +549,15 @@ describe("injectMarkerLabel", () => {
   });
 
   test("a rename moving the marker AWAY is refused (new_name stripped), not injected", () => {
-    // Renaming the marker to another name would break the next run's lookup by
-    // the constant marker name, so the rename is dropped and flagged.
+    // Renaming the marker to another name would break the next run's lookup by the constant marker name, so the rename is dropped and flagged.
     const settings: SettingsFile = {
       labels: [{ name: MARKER_LABEL, new_name: "something-else", color: "0e2a47" }],
     };
     const result = injectMarkerLabel(settings);
     expect(result.outcome).toBe("rename-refused");
-    // the entry survives but its new_name is gone, so the marker keeps its name
     expect(result.settings.labels).toEqual([
       { name: MARKER_LABEL, new_name: undefined, color: "0e2a47" },
     ]);
-    // input is not mutated
     const original = (settings.labels as Array<{ new_name?: string }> | undefined)?.[0];
     expect(original?.new_name).toBe("something-else");
   });
@@ -445,18 +571,12 @@ describe("injectMarkerLabel", () => {
   });
 
   test("every injection outcome preserves document validity, in both label forms", () => {
-    // applyMarkerInjection (src/report/delivery.ts) carries the injected
-    // document across the ValidatedSettings brand on the strength of this
-    // property: the injection appends the constant marker config or strips a
-    // new_name, and neither may ever produce a document validateSettingsDoc
-    // rejects. The rename-refused arm is the risky one - it writes an
-    // explicit `new_name: undefined` key - so all three outcomes are pinned
-    // here, in the plain-array and wrapped forms alike.
-    const silentIo: Io = { annotate: () => {}, log: () => {}, mask: () => {} };
+    // applyMarkerInjection (src/report/delivery.ts) carries the injected document across the ValidatedSettings brand on the strength of this
+    // property; the rename-refused arm, which writes an explicit `new_name: undefined`, is the risky one.
     const cases: Array<{ doc: SettingsFile; expected: string }> = [
       { doc: { labels: [{ name: "bug", color: "d73a4a" }] }, expected: "injected" },
       {
-        doc: { labels: { undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] } },
+        doc: { labels: { _undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] } },
         expected: "injected",
       },
       { doc: { labels: [{ name: MARKER_LABEL, color: "0e2a47" }] }, expected: "unchanged" },
@@ -467,7 +587,7 @@ describe("injectMarkerLabel", () => {
       {
         doc: {
           labels: {
-            undeclared: "keep",
+            _undeclared: "keep",
             entries: [{ name: MARKER_LABEL, new_name: "elsewhere", color: "0e2a47" }],
           },
         },
@@ -477,9 +597,14 @@ describe("injectMarkerLabel", () => {
     for (const { doc, expected } of cases) {
       const result = injectMarkerLabel(doc);
       expect(result.outcome).toBe(expected as typeof result.outcome);
-      const verdict = validateSettingsDoc(result.settings, "injected doc", new Set(), silentIo);
+      const verdict = validateSettingsDoc(
+        result.settings,
+        "injected doc",
+        SectionSelection.ALL,
+        silentIo(),
+      );
       expect(
-        "error" in verdict ? verdict.error : null,
+        verdict.match(() => null, describeProblem),
         `outcome "${expected}" produced a document validation rejects`,
       ).toBeNull();
     }

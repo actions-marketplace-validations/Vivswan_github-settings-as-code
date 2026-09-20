@@ -1,0 +1,27 @@
+# Apply mode with the Contents grant: the advisory probe answers "Branch not
+# found" and the section fails before any write, with the same advice and exit
+# code the no-Contents apply gets from the PUT's rejection. The outcome does not
+# depend on which grant exposed the missing branch.
+name: branches-missing-branch-advisory-apply-fails
+settings:
+  branches:
+    - name: release
+      protection:
+        enforce_admins: true
+inputs:
+  mode: apply
+live_state:
+  branches: ["main"]
+  branch_protection: {}
+token_permissions:
+  administration: write
+  contents: read
+expect:
+  exit_code: 1
+  result: failed
+  outcomes:
+    branches: failed
+  summary_contains:
+    - "branches[release]: the declared branch does not exist on the repo, so its protection cannot be applied; create the branch, or remove it from the settings file"
+  never:
+    - "PUT /repos/{repo}/branches/release/protection"

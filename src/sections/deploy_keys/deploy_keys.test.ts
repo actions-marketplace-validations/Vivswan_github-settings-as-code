@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { planContext } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
-import { ctx } from "../../../test/sections/context.js";
+import { fragmentFake } from "../../../test/sections/fragment-fake.js";
+import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
+import { REPO } from "../../../test/sections/section-run.js";
 import { deployKeysSection, normalizeKeyMaterial } from "./index.js";
+import { deployKeysMockHandlers } from "./mock.js";
 
 const LIST = "GET /repos/o/r/keys?per_page=100&page=1";
 
@@ -12,14 +16,15 @@ function liveKey(id: number, title: string, key: string, read_only = false) {
 
 const BOT_KEY = "ssh-ed25519 AAAAC3botblob";
 const MIRROR_KEY = "ssh-ed25519 AAAAC3mirrorblob";
+const STALE_KEY = "ssh-ed25519 AAAAC3staleblob";
+const plan = (api: MockApi, desired: Parameters<typeof deployKeysSection.plan>[1]) =>
+  deployKeysSection.plan(planContext(deployKeysSection, api, REPO), desired);
 
 describe("normalizeKeyMaterial", () => {
   test("strips the trailing comment, keeping algorithm + blob", () => {
     expect(normalizeKeyMaterial("ssh-ed25519 AAAAC3blob deploy@host")).toBe(
       "ssh-ed25519 AAAAC3blob",
     );
-    // A multi-word comment is stripped whole, and surrounding whitespace is
-    // irrelevant to the compared material.
     expect(normalizeKeyMaterial("  ssh-rsa AAAAB3blob a b c  ")).toBe("ssh-rsa AAAAB3blob");
   });
 
@@ -34,294 +39,375 @@ describe("normalizeKeyMaterial", () => {
   });
 });
 
-describe("deploy_keys validation before any write", () => {
-  test("a malformed declared key is a settings-file error, before any API call", async () => {
+describe("deploy_keys validation before any read", () => {
+  test.each<[label: string, declared: Parameters<typeof deployKeysSection.plan>[1], error: RegExp]>(
+    [
+      [
+        "a malformed declared key",
+        [{ title: "deploy-bot", key: "ssh-ed25519" }],
+        /deploy_keys\[deploy-bot\]: the declared key must have at least two whitespace-separated fields/,
+      ],
+      [
+        "duplicate declared titles",
+        [
+          { title: "deploy-bot", key: BOT_KEY },
+          { title: "deploy-bot", key: MIRROR_KEY },
+        ],
+        /same deploy_keys entry/,
+      ],
+    ],
+  )("%s is a settings-file error, before any API call", async (_label, declared, error) => {
     const api = new MockApi({});
-    await expect(
-      deployKeysSection.run(ctx(api), [{ title: "deploy-bot", key: "ssh-ed25519" }]),
-    ).rejects.toThrow(
-      /deploy_keys\[deploy-bot\]: the declared key must have at least two whitespace-separated fields/,
-    );
+    await expect(plan(api, declared)).rejects.toThrow(error);
     expect(api.calls).toHaveLength(0);
   });
+});
 
-  test("duplicate declared titles are rejected upfront with zero calls", async () => {
+describe("deploy_keys conflicts", () => {
+  test("duplicate declared MATERIAL under different titles (comments ignored) is rejected before any request", async () => {
     const api = new MockApi({});
     await expect(
-      deployKeysSection.run(ctx(api), [
-        { title: "deploy-bot", key: BOT_KEY },
-        { title: "deploy-bot", key: MIRROR_KEY },
-      ]),
-    ).rejects.toThrow(/same deploy_keys entry/);
-    expect(api.calls).toHaveLength(0);
-  });
-
-  test("duplicate declared MATERIAL under different titles is rejected upfront with zero calls", async () => {
-    // GitHub attaches a public key to one repository once, so the second
-    // POST would 422 mid-section; the conflict is two lines apart in the
-    // settings file and must be named there, before the list read.
-    const api = new MockApi({});
-    await expect(
-      deployKeysSection.run(ctx(api), [
+      plan(api, [
         { title: "deploy-bot", key: `${BOT_KEY} deploy@bot` },
         { title: "mirror-pull", key: `${BOT_KEY} mirror@other-comment` },
       ]),
-    ).rejects.toThrow(/same deploy_keys entry.*"deploy-bot" and "mirror-pull"/s);
+    ).rejects.toThrow(
+      /^deploy_keys: the settings file declares conflicting deploy keys: the entries "deploy-bot" and "mirror-pull" declare the same key material.*keep one entry per key\. Fix the settings file, then re-run$/s,
+    );
     expect(api.calls).toHaveLength(0);
   });
 
-  test("declared material a live key holds under ANOTHER title fails loudly naming it (keep default), zero writes", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(7, "old-name", BOT_KEY)] },
-    });
+  test("material a live key holds under ANOTHER title is named after the one read, before any write", async () => {
+    const api = new MockApi({ [LIST]: { data: [liveKey(7, "old-name", MIRROR_KEY)] } });
     await expect(
-      deployKeysSection.run(ctx(api), [{ title: "new-name", key: `${BOT_KEY} deploy@renamed` }]),
+      plan(api, [{ title: "new-name", key: `${MIRROR_KEY} deploy@renamed` }]),
     ).rejects.toThrow(
-      /the entry "new-name" declares key material that live key "old-name" \(id 7\) already holds.*declare the entry under its live title "old-name"/,
+      new RegExp(
+        '^deploy_keys: the settings file conflicts with the live deploy keys: the entry "new-name" ' +
+          String.raw`declares key material that live key "old-name" \(id 7\) already holds.*` +
+          String.raw`declare the entry under its live title "old-name"\. Resolve each conflict on GitHub, then re-run$`,
+        "s",
+      ),
     );
-    expect(api.mutations()).toEqual([]);
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([LIST]);
   });
 
-  test("the cross-title conflict also fails under wrapped undeclared:delete, zero writes", async () => {
-    // Ordering cannot save this policy either: the create runs before the
-    // undeclared-delete pass, so the holder would still be live at POST time.
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(7, "old-name", BOT_KEY)] },
-    });
+  test("the live holder conflict also fails under wrapped _undeclared:delete: the create would run before the holder's delete", async () => {
+    const api = new MockApi({ [LIST]: { data: [liveKey(7, "old-name", BOT_KEY)] } });
     await expect(
-      deployKeysSection.run(ctx(api), {
-        undeclared: "delete",
-        entries: [{ title: "new-name", key: BOT_KEY }],
-      }),
+      plan(api, { _undeclared: "delete", entries: [{ title: "new-name", key: BOT_KEY }] }),
     ).rejects.toThrow(/live key "old-name" \(id 7\) already holds/);
     expect(api.mutations()).toEqual([]);
   });
 
-  test("a declared title matching SEVERAL live keys fails loudly naming their ids, zero writes", async () => {
+  test("two live keys under one title fail loudly, declared or not: GitHub does not enforce title uniqueness", async () => {
     const api = new MockApi({
       [LIST]: {
         data: [liveKey(11, "deploy-bot", BOT_KEY), liveKey(12, "deploy-bot", MIRROR_KEY)],
       },
     });
-    await expect(
-      deployKeysSection.run(ctx(api), [{ title: "deploy-bot", key: BOT_KEY }]),
-    ).rejects.toThrow(/matches 2 live deploy keys \(ids 11, 12\)/);
+    await expect(plan(api, [{ title: "deploy-bot", key: BOT_KEY }])).rejects.toThrow(
+      'deploy_keys: GitHub holds deploy keys that resolve to one identity: "deploy-bot (key id 11)" and "deploy-bot (key id 12)". ' +
+        "This section manages one deploy key per identity, so it cannot tell them apart; delete all but one of each on GitHub, then run again",
+    );
+    await expect(plan(api, [])).rejects.toThrow(/resolve to one identity/);
+    expect(api.mutations()).toEqual([]);
+  });
+
+  test("the guard runs before the section's live conflicts: a duplicated title wins over a colliding holder's material", async () => {
+    const api = new MockApi({
+      [LIST]: { data: [liveKey(7, "dup", BOT_KEY), liveKey(8, "dup", MIRROR_KEY)] },
+    });
+    await expect(plan(api, [{ title: "other", key: BOT_KEY }])).rejects.toThrow(
+      'deploy_keys: GitHub holds deploy keys that resolve to one identity: "dup (key id 7)" and "dup (key id 8)". ' +
+        "This section manages one deploy key per identity, so it cannot tell them apart; delete all but one of each on GitHub, then run again",
+    );
     expect(api.mutations()).toEqual([]);
   });
 });
 
 describe("deploy_keys loud live extraction", () => {
-  const cases: Array<[string, Record<string, unknown>]> = [
-    ["a non-string title", { id: 1, title: 7, key: BOT_KEY }],
-    ["a non-string key", { id: 1, title: "deploy-bot", key: null }],
-    ["a non-numeric id", { id: "1", title: "deploy-bot", key: BOT_KEY }],
-  ];
-  for (const [label, entry] of cases) {
-    test(`a live entry with ${label} is a contract violation naming the endpoint`, async () => {
-      const api = new MockApi({ [LIST]: { data: [entry] } });
-      await expect(deployKeysSection.run(ctx(api), [])).rejects.toThrow(
-        /GET \/repos\/\{owner\}\/\{repo\}\/keys returned a body outside the documented shape/,
-      );
-      expect(api.mutations()).toEqual([]);
-    });
-  }
+  test.each<[label: string, entry: Record<string, unknown>]>([
+    ["a non-string title", { id: 1, title: 7, key: BOT_KEY, read_only: false }],
+    ["a non-string key", { id: 1, title: "deploy-bot", key: null, read_only: false }],
+    ["a non-numeric id", { id: "1", title: "deploy-bot", key: BOT_KEY, read_only: false }],
+    // The documented shape requires the flag; a silent default would seed a recreate with a guess.
+    ["no read_only flag", { id: 1, title: "deploy-bot", key: BOT_KEY }],
+  ])("a live entry with %s is a contract violation naming the endpoint", async (_label, entry) => {
+    const api = new MockApi({ [LIST]: { data: [entry] } });
+    await expect(plan(api, [])).rejects.toThrow(
+      /GET \/repos\/\{owner\}\/\{repo\}\/keys returned a body outside the documented shape/,
+    );
+  });
 
   test("a live key with sub-two-field material is a contract violation naming id and endpoint", async () => {
     const api = new MockApi({ [LIST]: { data: [liveKey(9, "stub", "ssh-ed25519")] } });
-    await expect(deployKeysSection.run(ctx(api), [])).rejects.toThrow(
+    await expect(plan(api, [])).rejects.toThrow(
       /GET \/repos\/\{owner\}\/\{repo\}\/keys returned key id 9 \("stub"\) whose material has fewer than two whitespace-separated fields/,
     );
-    expect(api.mutations()).toEqual([]);
   });
 });
 
 describe("deploy_keys reconcile", () => {
-  test("a matching key (declared comment vs stored comment-free) is a no-op", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(1, "deploy-bot", BOT_KEY, true)] },
-    });
-    const result = await deployKeysSection.run(ctx(api), [
+  test("a matching key (declared comment vs stored comment-free) plans nothing, reading only", async () => {
+    const api = new MockApi({ [LIST]: { data: [liveKey(1, "deploy-bot", BOT_KEY, true)] } });
+    const result = await plan(api, [
       { title: "deploy-bot", key: `${BOT_KEY} deploy@host`, read_only: true },
     ]);
-    expect(result.changes).toEqual([]);
-    expect(api.mutations()).toEqual([]);
+    expect(result).toEqual({ ops: [], notes: [], drift: [] });
+    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([LIST]);
   });
 
-  test("a missing declared key is created with the entry passed through verbatim", async () => {
-    const api = new MockApi({ [LIST]: { data: [] } }).allowMutations("POST /repos/o/r/keys");
-    const result = await deployKeysSection.run(ctx(api), [
+  test("a missing declared key is one create carrying the material as GitHub stores it (comment stripped)", async () => {
+    const api = new MockApi({ [LIST]: { data: [] } });
+    const result = await plan(api, [
       { title: "deploy-bot", key: `${BOT_KEY} deploy@host`, read_only: true },
     ]);
-    expect(result.changes).toEqual(['created deploy key "deploy-bot"']);
-    expect(api.mutations()).toEqual([
+    expect(result).toEqual({
+      ops: [
+        {
+          role: "create",
+          payload: { title: "deploy-bot", key: BOT_KEY, read_only: true },
+          describe: 'creating deploy key "deploy-bot"',
+          drift: [
+            "deploy_keys[deploy-bot]: missing - declared in the settings file but not on the repo; apply will create it",
+          ],
+          change: 'created deploy key "deploy-bot"',
+        },
+      ],
+      notes: [],
+      drift: [],
+    });
+  });
+
+  test("a divergent key is DELETE then POST: the generic line on the delete, the differing fields on the recreate", async () => {
+    const api = new MockApi({ [LIST]: { data: [liveKey(10, "mirror-pull", STALE_KEY, false)] } });
+    const result = await plan(api, [
+      { title: "mirror-pull", key: `${MIRROR_KEY} mirror@new`, read_only: true },
+    ]);
+    expect(result).toEqual({
+      ops: [
+        {
+          role: "remove",
+          params: { key_id: "10" },
+          describe: 'deleting deploy key "mirror-pull" before recreating it',
+          drift: [
+            "deploy_keys[mirror-pull]: live settings differ from the settings file, and deploy keys cannot be edited; apply will delete and recreate it",
+          ],
+          change: 'deleted deploy key "mirror-pull" to recreate it with the declared settings',
+        },
+        {
+          role: "create",
+          payload: { title: "mirror-pull", key: MIRROR_KEY, read_only: true },
+          describe: 'recreating deploy key "mirror-pull"',
+          drift: [
+            `deploy_keys[mirror-pull].key: declared "${MIRROR_KEY}" != live "${STALE_KEY}"`,
+            "deploy_keys[mirror-pull].read_only: declared true != live false",
+          ],
+          change: 'recreated deploy key "mirror-pull"',
+        },
+      ],
+      notes: [],
+      drift: [],
+    });
+  });
+
+  test.each<
+    [
+      label: string,
+      declaredReadOnly: boolean | undefined,
+      live: ReturnType<typeof liveKey>[],
+      payload: Record<string, string | boolean>,
+    ]
+  >([
+    [
+      "a fresh create carries the declared flag",
+      true,
+      [],
+      { title: "mirror-pull", key: MIRROR_KEY, read_only: true },
+    ],
+    [
+      "a fresh create OMITS an undeclared flag, leaving GitHub's read/write default",
+      undefined,
+      [],
+      { title: "mirror-pull", key: MIRROR_KEY },
+    ],
+    [
+      "a recreate re-sends the live true under an undeclared flag (no privilege widening)",
+      undefined,
+      [liveKey(10, "mirror-pull", STALE_KEY, true)],
+      { title: "mirror-pull", key: MIRROR_KEY, read_only: true },
+    ],
+    [
+      "a recreate re-sends the live false under an undeclared flag",
+      undefined,
+      [liveKey(10, "mirror-pull", STALE_KEY, false)],
+      { title: "mirror-pull", key: MIRROR_KEY, read_only: false },
+    ],
+    [
+      "a declared false beats the live true on a recreate",
+      false,
+      [liveKey(10, "mirror-pull", STALE_KEY, true)],
+      { title: "mirror-pull", key: MIRROR_KEY, read_only: false },
+    ],
+  ])("%s", async (_label, declaredReadOnly, live, payload) => {
+    const api = new MockApi({ [LIST]: { data: live } });
+    const result = await plan(api, [
       {
-        method: "POST",
-        path: "/repos/o/r/keys",
-        payload: { title: "deploy-bot", key: `${BOT_KEY} deploy@host`, read_only: true },
+        title: "mirror-pull",
+        key: `${MIRROR_KEY} mirror@new`,
+        ...(declaredReadOnly === undefined ? {} : { read_only: declaredReadOnly }),
       },
     ]);
-  });
-
-  test("a rotated blob is replaced: DELETE by id then POST, in that order", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "mirror-pull", "ssh-ed25519 AAAAC3staleblob")] },
-    }).allowMutations("DELETE /repos/o/r/keys/10", "POST /repos/o/r/keys");
-    const result = await deployKeysSection.run(ctx(api), [
-      { title: "mirror-pull", key: `${MIRROR_KEY} mirror@new` },
-    ]);
-    expect(result.changes).toEqual(['replaced deploy key "mirror-pull"']);
-    expect(api.mutations().map((m) => `${m.method} ${m.path}`)).toEqual([
-      "DELETE /repos/o/r/keys/10",
-      "POST /repos/o/r/keys",
+    expect(result.ops.map((op) => op.role)).toEqual(
+      live.length === 0 ? ["create"] : ["remove", "create"],
+    );
+    expect(result.ops.filter((op) => op.role === "create").map((op) => op.payload)).toEqual([
+      payload,
     ]);
   });
 
-  test("a rotated read-only key stays read-only when the declaration omits the flag", async () => {
-    // The recreate must seed the LIVE read_only: without it GitHub's
-    // read/write default silently widens a rotated read-only key's access.
-    // The mutation sequence is identical either way, so the assertion that
-    // matters is on the POST payload itself.
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "mirror-pull", "ssh-ed25519 AAAAC3staleblob", true)] },
-    }).allowMutations("DELETE /repos/o/r/keys/10", "POST /repos/o/r/keys");
-    await deployKeysSection.run(ctx(api), [
-      { title: "mirror-pull", key: `${MIRROR_KEY} mirror@new` },
+  test("a divergent DECLARED read_only alone forces the replace; an undeclared one is never compared", async () => {
+    const live = [liveKey(10, "deploy-bot", BOT_KEY, true)];
+    const forced = await plan(new MockApi({ [LIST]: { data: live } }), [
+      { title: "deploy-bot", key: BOT_KEY, read_only: false },
     ]);
-    const post = api.mutations().find((m) => m.method === "POST");
-    if (post === undefined) {
-      throw new Error("the replace issued no POST");
-    }
-    expect((post.payload as Record<string, unknown>).read_only).toBe(true);
-  });
-
-  test("a declared read_only: false beats a live true on the recreate (spread order)", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "mirror-pull", "ssh-ed25519 AAAAC3staleblob", true)] },
-    }).allowMutations("DELETE /repos/o/r/keys/10", "POST /repos/o/r/keys");
-    await deployKeysSection.run(ctx(api), [
-      { title: "mirror-pull", key: `${MIRROR_KEY} mirror@new`, read_only: false },
-    ]);
-    const post = api.mutations().find((m) => m.method === "POST");
-    if (post === undefined) {
-      throw new Error("the replace issued no POST");
-    }
-    expect((post.payload as Record<string, unknown>).read_only).toBe(false);
-  });
-
-  test("a divergent DECLARED read_only alone forces the replace", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "deploy-bot", BOT_KEY, false)] },
-    }).allowMutations("DELETE /repos/o/r/keys/10", "POST /repos/o/r/keys");
-    const result = await deployKeysSection.run(ctx(api), [
-      { title: "deploy-bot", key: BOT_KEY, read_only: true },
-    ]);
-    expect(result.changes).toEqual(['replaced deploy key "deploy-bot"']);
-    expect(api.mutations().map((m) => `${m.method} ${m.path}`)).toEqual([
-      "DELETE /repos/o/r/keys/10",
-      "POST /repos/o/r/keys",
-    ]);
-  });
-
-  test("an UNDECLARED read_only is never compared: a live difference alone is a no-op", async () => {
-    // read_only true on the live key, absent from the declaration: not drift,
-    // no replace - only declared fields are managed.
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "deploy-bot", BOT_KEY, true)] },
-    });
-    const applied = await deployKeysSection.run(ctx(api), [{ title: "deploy-bot", key: BOT_KEY }]);
-    expect(applied.changes).toEqual([]);
-    expect(api.mutations()).toEqual([]);
-    const checked = await deployKeysSection.run(ctx(api, true), [
+    expect(forced.ops.map((op) => op.role)).toEqual(["remove", "create"]);
+    const ignored = await plan(new MockApi({ [LIST]: { data: live } }), [
       { title: "deploy-bot", key: BOT_KEY },
     ]);
-    expect(checked.drift).toEqual([]);
+    expect(ignored).toEqual({ ops: [], notes: [], drift: [] });
   });
 
   test('a declared passthrough field named "material" earns the phantom-key note, diffed against the RAW api body', async () => {
-    // The handler keeps its normalized material in a side map, never on the
-    // object handed to subsetDiff/phantomKeys - so a user field that happens
-    // to be called "material" is compared against what GitHub returns
-    // (nothing) and phantomKeys names it, instead of silently colliding with
-    // a synthetic field (false drift or false convergence).
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "deploy-bot", BOT_KEY)] },
-    }).allowMutations("DELETE /repos/o/r/keys/10", "POST /repos/o/r/keys");
-    const result = await deployKeysSection.run(ctx(api), [
+    // The normalized material replaces the live `key` in place and never lands under another name, so a user field called "material" reads as absent
+    // live rather than matching a synthetic field.
+    const api = new MockApi({ [LIST]: { data: [liveKey(10, "deploy-bot", BOT_KEY)] } });
+    const result = await plan(api, [
       { title: "deploy-bot", key: BOT_KEY, material: "whatever" } as never,
     ]);
-    expect(result.notes).toEqual([
-      expect.stringMatching(
-        /deploy_keys\[deploy-bot\]: declared key\(s\) "material" do not exist on the live deploy key/,
-      ),
+    expect(result.ops.map((op) => [op.role, op.drift])).toEqual([
+      [
+        "remove",
+        [
+          "deploy_keys[deploy-bot]: live settings differ from the settings file, and deploy keys cannot be edited; apply will delete and recreate it",
+        ],
+      ],
+      [
+        "create",
+        [
+          'deploy_keys[deploy-bot].material: declared "whatever" but the API response has no such field (new or write-only field?)',
+        ],
+      ],
     ]);
-    expect(result.changes).toEqual(['replaced deploy key "deploy-bot"']);
+    expect(result.notes).toEqual([
+      'deploy_keys[deploy-bot]: declared key "material" does not exist on the live deploy key, so if GitHub ignores it this delete-and-recreate will repeat on every apply without converging. Fix the key name, or remove it from the settings file',
+    ]);
   });
 });
 
 describe("deploy_keys undeclared policy", () => {
   const liveKeys = [liveKey(1, "deploy-bot", BOT_KEY), liveKey(2, "retired-service", MIRROR_KEY)];
+  const KEEP_NOTE =
+    'deploy key "retired-service" exists on the repo but is not declared in the settings file; kept under "_undeclared: keep" - add it to the settings file to manage it, or set "_undeclared: delete" to have apply DELETE it';
 
-  test("the keep default notes the undeclared key, never a DELETE", async () => {
-    const api = new MockApi({ [LIST]: { data: liveKeys } });
-    const result = await deployKeysSection.run(ctx(api), [{ title: "deploy-bot", key: BOT_KEY }]);
-    expect(result.changes).toEqual([]);
-    expect(result.notes).toEqual([
-      'deploy key "retired-service" exists on the repo but is not declared in the settings file; kept under "undeclared: keep" - add it to the settings file to manage it, or set "undeclared: delete" to have apply DELETE it',
-    ]);
-    expect(api.mutations()).toEqual([]);
-  });
-
-  test("wrapped undeclared:delete removes the undeclared key", async () => {
-    const api = new MockApi({ [LIST]: { data: liveKeys } }).allowMutations(
-      "DELETE /repos/o/r/keys/*",
-    );
-    const result = await deployKeysSection.run(ctx(api), {
-      undeclared: "delete",
-      entries: [{ title: "deploy-bot", key: BOT_KEY }],
-    });
-    expect(result.changes).toEqual(['DELETED undeclared deploy key "retired-service"']);
-    expect(api.mutations().map((m) => `${m.method} ${m.path}`)).toEqual([
-      "DELETE /repos/o/r/keys/2",
-    ]);
-  });
-
-  test("wrapped undeclared:delete in check mode reports drift instead of deleting", async () => {
-    const api = new MockApi({ [LIST]: { data: liveKeys } });
-    const result = await deployKeysSection.run(ctx(api, true), {
-      undeclared: "delete",
-      entries: [{ title: "deploy-bot", key: BOT_KEY }],
-    });
-    expect(result.drift).toEqual([
-      'deploy_keys[retired-service]: undeclared - not in the settings file and "undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
-    ]);
-    expect(api.mutations()).toEqual([]);
-  });
+  test.each<
+    [
+      form: string,
+      declared: Parameters<typeof deployKeysSection.plan>[1],
+      ops: Awaited<ReturnType<typeof plan>>["ops"],
+      notes: string[],
+    ]
+  >([
+    [
+      "wrapped _undeclared:delete",
+      { _undeclared: "delete", entries: [{ title: "deploy-bot", key: BOT_KEY }] },
+      [
+        {
+          role: "remove",
+          params: { key_id: "2" },
+          describe: 'deleting undeclared deploy key "retired-service"',
+          drift: [
+            'deploy_keys[retired-service]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
+          ],
+          change: 'DELETED undeclared deploy key "retired-service"',
+        },
+      ],
+      [],
+    ],
+    [
+      "the wrapper without a policy",
+      { entries: [{ title: "deploy-bot", key: BOT_KEY }] },
+      [],
+      [KEEP_NOTE],
+    ],
+    ["the plain list", [{ title: "deploy-bot", key: BOT_KEY }], [], [KEEP_NOTE]],
+  ])(
+    "%s resolves the undeclared key against the keep default",
+    async (_form, declared, ops, notes) => {
+      const api = new MockApi({ [LIST]: { data: liveKeys } });
+      expect(await plan(api, declared)).toEqual({ ops, notes, drift: [] });
+    },
+  );
 });
 
-describe("deploy_keys check mode", () => {
-  test("a divergent key emits the generic delete-and-recreate line plus the field lines, zero writes", async () => {
-    const api = new MockApi({
-      [LIST]: { data: [liveKey(10, "mirror-pull", "ssh-ed25519 AAAAC3staleblob", false)] },
+describe("deploy_keys convergence", () => {
+  test("executing the plan against the derived mock converges: create, DELETE-then-POST replace, undeclared delete, and an empty re-plan", async () => {
+    const api = fragmentFake(deployKeysSection, deployKeysMockHandlers, {
+      deploy_keys: [
+        liveKey(10, "mirror-pull", STALE_KEY, false),
+        liveKey(20, "retired-service", "ssh-rsa AAAAB3retiredblob", true),
+      ],
     });
-    const result = await deployKeysSection.run(ctx(api, true), [
-      { title: "mirror-pull", key: `${MIRROR_KEY} mirror@new`, read_only: true },
+    const { second, changes, notes } = await provePlanIdempotent(deployKeysSection, api, {
+      _undeclared: "delete",
+      entries: [
+        { title: "deploy-bot", key: `${BOT_KEY} deploy@bot`, read_only: true },
+        { title: "mirror-pull", key: `${MIRROR_KEY} mirror@new` },
+      ],
+    });
+    expect(changes).toEqual([
+      'created deploy key "deploy-bot"',
+      'deleted deploy key "mirror-pull" to recreate it with the declared settings',
+      'recreated deploy key "mirror-pull"',
+      'DELETED undeclared deploy key "retired-service"',
     ]);
-    expect(result.drift).toEqual([
-      "deploy_keys[mirror-pull]: live settings differ from the settings file, and deploy keys cannot be edited; apply will delete and recreate it",
-      `deploy_keys[mirror-pull].key: declared material "${MIRROR_KEY}" != live "ssh-ed25519 AAAAC3staleblob" (compared as algorithm + blob, comments ignored)`,
-      "deploy_keys[mirror-pull].read_only: declared true != live false",
+    expect(notes).toEqual([]);
+    expect(api.writes).toEqual([
+      "POST /repos/o/r/keys",
+      "DELETE /repos/o/r/keys/10",
+      "POST /repos/o/r/keys",
+      "DELETE /repos/o/r/keys/20",
     ]);
-    expect(api.mutations()).toEqual([]);
+    expect(second).toEqual({ ops: [], notes: [], drift: [] });
+    // The mock stores comment-free material the way GitHub does; the rotated key kept its live read_only through the recreate.
+    expect(api.state.deploy_keys.map((k) => [k.title, k.key, k.read_only])).toEqual([
+      ["deploy-bot", BOT_KEY, true],
+      ["mirror-pull", MIRROR_KEY, false],
+    ]);
   });
 
-  test("a missing declared key is create drift, zero writes", async () => {
-    const api = new MockApi({ [LIST]: { data: [] } });
-    const result = await deployKeysSection.run(ctx(api, true), [
-      { title: "deploy-bot", key: BOT_KEY },
-    ]);
-    expect(result.drift).toEqual([
-      "deploy_keys[deploy-bot]: missing - declared in the settings file but not on the repo; apply will create it",
-    ]);
-    expect(api.mutations()).toEqual([]);
+  test("the derived mock holds MATERIAL unique like GitHub: a repeated title is accepted, a repeated blob is 422", async () => {
+    const api = fragmentFake(deployKeysSection, deployKeysMockHandlers, {
+      deploy_keys: [liveKey(1, "deploy-bot", BOT_KEY)],
+    });
+    const post = async (body: Record<string, unknown>) => {
+      const result = await api.tryRequest("POST", "/repos/o/r/keys", body);
+      return "error" in result ? result.error.status : 201;
+    };
+    expect(await post({ title: "deploy-bot", key: MIRROR_KEY })).toBe(201);
+    expect(await post({ title: "other-title", key: `${BOT_KEY} some@comment` })).toBe(422);
+    expect(api.state.deploy_keys.map((k) => k.title)).toEqual(["deploy-bot", "deploy-bot"]);
+  });
+
+  test("the read port exposes exactly the list role in its denied posture", () => {
+    const ctx = planContext(deployKeysSection, new MockApi({}), REPO);
+    expect(Object.keys(ctx.read)).toEqual(["list"]);
+    // @ts-expect-error a write role is not a read: the port has no `create`
+    ctx.read.create;
+    // @ts-expect-error nor a `remove`
+    ctx.read.remove;
+    // @ts-expect-error a "denied" primary read offers no 404-tolerant helper
+    ctx.read.list.probeAbsent;
   });
 });

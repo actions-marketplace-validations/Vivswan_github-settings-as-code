@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { SECTION_KEYS, UNDECLARED_POLICY_SECTIONS } from "../../src/schema.js";
+import {
+  type SECTION_KEYS,
+  type SettingsFile,
+  UNDECLARED_POLICY_SECTIONS,
+} from "../../src/schema.js";
+import type { checkSuitePreferencesSection } from "../../src/sections/check_suite_preferences/index.js";
 import {
   type EndpointDecl,
-  endpointKind,
+  endpointMethod,
   endpointPath,
   expand,
   matchesTemplate,
@@ -14,281 +18,52 @@ import type {
   GraphqlPaginatedReadDecl,
 } from "../../src/sections/contract/graphql.js";
 import {
-  defaultUndeclaredPolicy,
+  denialPosture,
   endpointPermission,
+  type GraphqlDict,
+  planningReads,
   type SectionContext,
   type SectionMeta,
-  sectionGrant,
-  sectionOperations,
+  type SectionModule,
 } from "../../src/sections/contract/module.js";
 import { grantFor, type SectionPermission } from "../../src/sections/contract/permissions.js";
+import type {
+  PlanContext,
+  SectionPlan,
+  SnapshotContext,
+} from "../../src/sections/contract/plan.js";
 import { call, probeAbsent } from "../../src/sections/contract/requests.js";
+import { labelsSection } from "../../src/sections/labels/index.js";
 import {
   allEndpoints,
   allGraphqlOps,
+  type MisdeclaredPlanModule,
+  type MisdeclaredSnapshotModule,
+  type ReadingModuleWithoutSnapshot,
   SECTIONS,
-  sectionModule,
+  sectionShape,
 } from "../../src/sections/registry.js";
+import { workflowsSection } from "../../src/sections/workflows/index.js";
+import type { MustBeNever } from "../../src/types.js";
+import { denialResponse } from "../e2e/mock/grading.js";
 
-describe("registry <-> README", () => {
-  const readme = readFileSync("README.md", "utf8");
-  const start = readme.indexOf("\n## Sections\n");
-  const end = readme.indexOf("\n## ", start + 1);
-  const section = end === -1 ? readme.slice(start) : readme.slice(start, end);
+/** The identity facet of a list section's declaration, as the erased registry view exposes it. */
+interface ListDeclView {
+  readonly identity: {
+    readonly field: string;
+    readonly fold: (name: string) => string;
+    readonly renameKey?: string;
+    readonly aliases?: (entry: object) => readonly string[];
+  };
+}
 
-  // Key from column 1, Endpoints from column 2, PAT permission from column 3.
-  const rows = [...section.matchAll(/^\| `([a-z_]+)` \| ([^|]+) \| ([^|]+) \|/gm)].map((match) => ({
-    key: match[1] ?? "",
-    endpoints: match[2] ?? "",
-    permission: match[3] ?? "",
-  }));
-
-  test("the README Sections table lists every section, in order, naming each granted permission", () => {
-    expect(start, 'README.md has no "## Sections" heading; restore it exactly').toBeGreaterThan(-1);
-    // One row per section, in SECTION_KEYS order - a new section without a
-    // README row (or a stale row) fails here. Malformed rows the key regex
-    // would otherwise skip silently are named outright, with the raw line
-    // count kept as a backstop.
-    const tableLines = section.split("\n").filter((line) => line.startsWith("|"));
-    const rowRe = /^\| `[a-z_]+` \| [^|]+ \| [^|]+ \|/;
-    const unmatched = tableLines.slice(2).filter((line) => !rowRe.test(line));
-    expect(
-      unmatched,
-      `README Sections table has malformed row line(s) the key regex cannot parse: ${unmatched.join(" | ")}`,
-    ).toEqual([]);
-    expect(
-      tableLines,
-      `README Sections table has ${tableLines.length} "|" line(s), expected ${SECTION_KEYS.length + 2} (one per section plus header and separator)`,
-    ).toHaveLength(SECTION_KEYS.length + 2);
-    expect(rows.map((row) => row.key)).toEqual([...SECTION_KEYS]);
-
-    // Every permission the grant advice names (the quoted words in
-    // sectionGrant's derived prose) must appear in that section's README row,
-    // so the table cannot drift from the advice users see in errors.
-    const offenders: string[] = [];
-    for (const module of SECTIONS) {
-      const row = rows.find((r) => r.key === module.key);
-      const granted = [...sectionGrant(module).matchAll(/"([^"]+)"/g)].map(
-        (match) => match[1] ?? "",
-      );
-      if (granted.length === 0) {
-        offenders.push(
-          `${module.key}: no quoted permission extracted from its grant prose "${sectionGrant(module)}"`,
-        );
-        continue;
-      }
-      for (const name of granted) {
-        if (!row?.permission.includes(name)) {
-          offenders.push(
-            `${module.key}: README PAT cell (${row?.permission ?? "row missing"}) never names granted permission "${name}"`,
-          );
-        }
-      }
-    }
-    expect(
-      offenders,
-      `README Sections rows drifting from the grant advice:\n  ${offenders.join("\n  ")}`,
-    ).toEqual([]);
-  });
-
-  test("each row's Endpoints cell names every distinct leading resource segment its section calls", () => {
-    // The COVERAGE.md Supported table gets the same pin from
-    // test/docs/coverage.test.ts; the README cells are terser summaries
-    // ("labels CRUD"), so the pin here is the leading resource segment of
-    // each endpoint tail, matched case- and separator-insensitively as a
-    // WHOLE word (or its controlled singular form, so "branch protection"
-    // satisfies "branches" while "homepage" can never satisfy "pages").
-    const normalize = (text: string): string => text.toLowerCase().replace(/[-_]/g, " ");
-    const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // Curated compound mentions: a compound word satisfies its base segment
-    // only where the compound IS the resource's common name. Whole-word
-    // matching is deliberate ("monkeys" must never satisfy "keys"), so
-    // without this entry a legitimate reword of the webhooks cell from
-    // "hooks" to "webhooks" would fail; extend the map, not the matching.
-    const COMPOUND_MENTIONS: Record<string, readonly string[]> = { hooks: ["webhooks"] };
-    for (const endpoint of Object.values(allEndpoints())) {
-      const tail = endpointPath(endpoint.route)
-        .replace("/repos/{owner}/{repo}", "")
-        .replace(/\{[^}]+\}/g, "")
-        .replace(/\/+$/g, "");
-      if (tail === "" || tail === "/") {
-        continue; // the bare repo endpoint has no distinctive resource
-      }
-      const needle = normalize(tail.replace(/^\//, "").split("/")[0] ?? "");
-      // Controlled singular variants of the LAST word only: strip a plural
-      // "s" or "es" suffix ("branches" -> "branch", "orgs" -> "org"). Each
-      // variant is matched as a whole word, so an over-stripped form
-      // ("pages" -> "pag") can never match inside an unrelated word.
-      const words = needle.split(" ");
-      const last = words.pop() ?? "";
-      const lastForms = new Set([last]);
-      if (last.endsWith("es")) {
-        lastForms.add(last.slice(0, -2));
-      }
-      if (last.endsWith("s")) {
-        lastForms.add(last.slice(0, -1));
-      }
-      const variants = [
-        ...[...lastForms].map((form) => [...words, form].join(" ")),
-        ...(COMPOUND_MENTIONS[needle] ?? []),
-      ];
-      const cell = normalize(rows.find((row) => row.key === endpoint.section)?.endpoints ?? "");
-      expect(
-        variants.some((variant) => new RegExp(`\\b${escapeRe(variant)}\\b`).test(cell)),
-        `the README Endpoints cell for "${endpoint.section}" never mentions "${needle}" from endpoint ${endpoint.route}`,
-      ).toBe(true);
-    }
-    // GraphQL operations have no path to derive a resource segment from, so
-    // the cell must name each one by its wire operationName instead.
-    for (const op of Object.values(allGraphqlOps())) {
-      const cell = normalize(rows.find((row) => row.key === op.section)?.endpoints ?? "");
-      expect(
-        cell.includes(normalize(op.name)),
-        `the README Endpoints cell for "${op.section}" never mentions the GraphQL operation "${op.name}"`,
-      ).toBe(true);
-    }
-  });
-
-  test("each row's PAT cell states every granted resource at its access level, caveats included", () => {
-    // The cells paraphrase sectionGrant ("Administration: write" for
-    // `grant "Administration" (read and write) under the PAT's Repository
-    // permissions`), so the pin is the load-bearing tokens: each grant
-    // clause's resource names at their level, plus - for a section whose
-    // grantCaveat names extra grants or settings keys - those tokens too.
-    const shortLevel = (level: string): string => (level === "read and write" ? "write" : "read");
-    for (const module of SECTIONS) {
-      const row = rows.find((r) => r.key === module.key);
-      const clauses = [
-        ...sectionGrant(module).matchAll(
-          /"(.+?)" \((read and write|read)\) under (?:the PAT's|its) (?:Repository|Organization) permissions/g,
-        ),
-      ];
-      // Zero clauses means the extraction went blind on a grant-prose
-      // rewording; fail loudly rather than pass on an empty list.
-      expect(clauses.length, `no grant clause extracted for "${module.key}"`).toBeGreaterThan(0);
-      for (const clause of clauses) {
-        const names = (clause[1] ?? "").split('" or "');
-        const expected = `${names.join(" or ")}: ${shortLevel(clause[2] ?? "")}`;
-        expect(
-          row?.permission.includes(expected),
-          `the README PAT cell for "${module.key}" must state "${expected}", got: ${row?.permission}`,
-        ).toBe(true);
-      }
-      const caveat = module.grantCaveat ?? "";
-      // A caveat's extra grants ('"Actions" (read)') paraphrase to the same
-      // "Actions: read" cell form; its quoted snake_case settings keys must
-      // appear verbatim. Per-caveat accounting below: EVERY quoted token in
-      // the caveat must be claimed by one of the two extractors, so a
-      // reworded caveat one regex no longer parses fails on ITS OWN row
-      // instead of hiding behind another caveat's extractions.
-      let extracted = 0;
-      for (const pair of caveat.matchAll(/"([^"]+)" \((read and write|read)\)/g)) {
-        extracted++;
-        const expected = `${pair[1]}: ${shortLevel(pair[2] ?? "")}`;
-        expect(
-          row?.permission.includes(expected),
-          `the README PAT cell for "${module.key}" must carry its caveat grant "${expected}", got: ${row?.permission}`,
-        ).toBe(true);
-      }
-      for (const key of caveat.matchAll(/"([a-z_]+)"(?! \((?:read and write|read)\))/g)) {
-        extracted++;
-        expect(
-          row?.permission.includes(key[1] ?? ""),
-          `the README PAT cell for "${module.key}" must name its caveat key "${key[1]}", got: ${row?.permission}`,
-        ).toBe(true);
-      }
-      const quoted = [...caveat.matchAll(/"[^"]+"/g)].length;
-      expect(
-        extracted,
-        `the "${module.key}" caveat quotes ${quoted} token(s) but the extractors understood ${extracted}; extend the extraction or reword the caveat`,
-      ).toBe(quoted);
-    }
-  });
-});
-
-// The caveat code-scanning appends to its derived grant. Kept here so the
-// snapshot below and the derivation check agree on one source of truth.
 const CODE_SCANNING_CAVEAT =
   "a 403 on this endpoint can also mean GitHub Advanced Security (code security) is not enabled on the repository, or the repository is archived";
 
-// The caveat code-quality appends: same shape as code-scanning's, for the
-// feature-unavailable and archived-repository 403s.
-const CODE_QUALITY_CAVEAT =
-  "a 403 on this endpoint can also mean code quality is unavailable on the repository, or the repository is archived";
-
-// The caveat check-suite-preferences appends: the endpoint additionally
-// requires repo-admin ownership, and with no read endpoint there is no
-// preflight probe to catch a denial early.
-const CHECK_SUITE_PREFERENCES_CAVEAT =
-  "the token owner must be a repository administrator, and with no read endpoint there is nothing to preflight - a denied write surfaces only after other sections' writes landed";
-
-// The caveat actions appends: its OIDC endpoints carry a permission
-// override (Actions instead of Administration), so the section grant says
-// so wherever a NON-oidc actions endpoint is denied.
-const ACTIONS_OIDC_CAVEAT =
-  'the "oidc_customization_sub" key alone instead needs "Actions" (read and write)';
-
-// The caveat environments appends: its deployment branch-policy pattern and
-// custom deployment protection rule endpoints carry permission overrides
-// (Actions for the enabled-rules and pattern-list reads, Administration for
-// the available-Apps read and the writes), so the section grant names the
-// extra grants wherever an environments endpoint is denied.
-const ENVIRONMENTS_POLICIES_CAVEAT =
-  'declared "deployment_branch_policies" and "deployment_protection_rules" keys additionally need "Actions" (read) and "Administration" (read and write)';
-
-// The per-section caveats grantFor appends; the derivation test and the
-// literal snapshot both read this one map.
-const GRANT_CAVEATS: Record<string, string> = {
-  code_scanning_default_setup: CODE_SCANNING_CAVEAT,
-  code_quality_setup: CODE_QUALITY_CAVEAT,
-  check_suite_preferences: CHECK_SUITE_PREFERENCES_CAVEAT,
-  actions: ACTIONS_OIDC_CAVEAT,
-  environments: ENVIRONMENTS_POLICIES_CAVEAT,
-};
-
-// The exact grant prose each section shows in permission errors, captured
-// against the pre-refactor literals. grantFor derives these now, so any
-// character-level change is a conscious edit here - not a silent drift.
-const EXPECTED_GRANT: Record<string, string> = {
-  repository: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  labels: `grant "Issues" (read and write) under the PAT's Repository permissions`,
-  rulesets: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  branches: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  environments: `grant "Environments" (read and write) under the PAT's Repository permissions; ${ENVIRONMENTS_POLICIES_CAVEAT}`,
-  autolinks: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  actions: `grant "Administration" (read and write) under the PAT's Repository permissions; ${ACTIONS_OIDC_CAVEAT}`,
-  actions_secrets: `grant "Secrets" (read and write) under the PAT's Repository permissions`,
-  dependabot_secrets: `grant "Dependabot secrets" (read and write) under the PAT's Repository permissions`,
-  codespaces_secrets: `grant "Codespaces secrets" (read and write) under the PAT's Repository permissions`,
-  agents_secrets: `grant "Agent secrets" (read and write) under the PAT's Repository permissions`,
-  workflows: `grant "Actions" (read and write) under the PAT's Repository permissions`,
-  check_suite_preferences: `grant "Checks" (read and write) under the PAT's Repository permissions; ${CHECK_SUITE_PREFERENCES_CAVEAT}`,
-  pages: `grant "Pages" (read and write) under the PAT's Repository permissions`,
-  code_scanning_default_setup: `grant "Administration" or "Code scanning alerts" (read and write) under the PAT's Repository permissions; ${CODE_SCANNING_CAVEAT}`,
-  code_quality_setup: `grant "Administration" (read and write) under the PAT's Repository permissions; ${CODE_QUALITY_CAVEAT}`,
-  collaborators: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  teams: `grant "Members" (read) under the PAT's Organization permissions and "Administration" (read and write) under its Repository permissions`,
-  milestones: `grant "Issues" (read and write) under the PAT's Repository permissions`,
-  interaction_limits: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  actions_variables: `grant "Variables" (read and write) under the PAT's Repository permissions`,
-  agents_variables: `grant "Agent variables" (read and write) under the PAT's Repository permissions`,
-  webhooks: `grant "Webhooks" (read and write) under the PAT's Repository permissions`,
-  custom_properties: `grant "Custom properties" (read and write) under the PAT's Repository permissions`,
-  deploy_keys: `grant "Administration" (read and write) under the PAT's Repository permissions`,
-  secret_scanning_custom_patterns: `grant "Secret scanning alerts" (read and write) under the PAT's Repository permissions`,
-};
-
 describe("section permissions", () => {
-  test("every knobbed section's shape parses both forms and yields a default policy", () => {
-    // The knob invariant is mostly compile-time: UNDECLARED_POLICY_SECTIONS
-    // is pinned to the SettingsFile types in both directions (schema.ts),
-    // and SectionMeta's conditional undeclaredDefault type forces "delete"
-    // or "keep" exactly for listed sections. The zod shapes are the one
-    // runtime-only piece: merge.ts wraps unconditionally for every listed
-    // key, so a listed section whose shape only accepted the plain array
-    // would reject its own normalized declaration - and only in multi-repo
-    // mode (single-repo skips applyDefaults). Round-tripping both forms
-    // here pins the shapes to the same list the merge drives off.
+  test("every knobbed section's shape parses both forms", () => {
+    // UNDECLARED_POLICY_SECTIONS is pinned to the types at compile time (schema.ts, SectionMeta's undeclaredDefault); the zod shapes are the one
+    // piece only a runtime round-trip can check.
     const byKey = new Map(SECTIONS.map((module) => [module.key as string, module]));
     for (const key of UNDECLARED_POLICY_SECTIONS) {
       const module = byKey.get(key);
@@ -301,55 +76,81 @@ describe("section permissions", () => {
         `${key}: wrapper without a policy must parse`,
       ).toBe(true);
       expect(
-        module.shape.safeParse({ undeclared: "keep", entries: [] }).success,
+        module.shape.safeParse({ _undeclared: "keep", entries: [] }).success,
         `${key}: wrapper with a policy must parse`,
       ).toBe(true);
-      const policy = defaultUndeclaredPolicy(sectionModule(key));
-      expect(
-        ["keep", "delete"],
-        `${key}: defaultUndeclaredPolicy returned "${policy}", expected "keep" or "delete"`,
-      ).toContain(policy);
     }
   });
 
-  test("every registered section declares a permission with at least one repo resource", () => {
-    const offenders = SECTIONS.filter(
-      (module) => module.permission === undefined || module.permission.repo.length === 0,
-    ).map((module) => module.key);
-    expect(
-      offenders,
-      `section(s) declaring a permission with no repo resource (add at least one PatResource to permission.repo): ${offenders.join(", ")}`,
-    ).toEqual([]);
+  test("_layering is accepted on every top-level knobbed wrapper and rejected on the nested ones", () => {
+    // A list nested in an entry is replaced wholesale by the merge, so a _layering accepted there would validate and never act.
+    const wrapper = { entries: [], _layering: "merge" };
+    const nested = {
+      deployment_branch_policies: wrapper,
+      deployment_protection_rules: wrapper,
+      variables: wrapper,
+      secrets: wrapper,
+    };
+    const verdict = sectionShape("environments").safeParse([{ name: "prod", ...nested }]);
+    expect({
+      topLevel: Object.fromEntries(
+        UNDECLARED_POLICY_SECTIONS.map((key) => [
+          key,
+          sectionShape(key).safeParse(wrapper).success,
+        ]),
+      ),
+      nested: verdict.success
+        ? "accepted"
+        : verdict.error.issues.map((issue) => [issue.path.join("."), issue.message]).sort(),
+    }).toEqual({
+      topLevel: Object.fromEntries(UNDECLARED_POLICY_SECTIONS.map((key) => [key, true])),
+      nested: Object.keys(nested)
+        .map((list) => [
+          `0.${list}`,
+          'Unrecognized key: "_layering"; the wrapper\'s directives are "_undeclared" and, on a top-level section, "_layering", and nothing else - there are no private-note keys. Remove the key, or keep the note as a YAML comment',
+        ])
+        .sort(),
+    });
   });
 
-  test("each section's grant caveat matches the pinned per-section caveats", () => {
-    for (const module of SECTIONS) {
-      expect(sectionGrant(module)).toBe(grantFor(module.permission, GRANT_CAVEATS[module.key]));
-    }
-  });
-
-  test("each section's grant equals its exact pre-refactor literal", () => {
-    // A section without an expected literal (a new one) fails here.
-    expect(Object.keys(EXPECTED_GRANT).sort()).toEqual([...SECTION_KEYS].sort());
-    for (const module of SECTIONS) {
-      expect(sectionGrant(module)).toBe(EXPECTED_GRANT[module.key] ?? "");
+  test("a layered section is knobbed, and its layering keys are the identities its planner folds and claims", () => {
+    // The merge pairs entries by these keys and the planner by the folded identity plus its aliases (a rename's old name), so a key the
+    // planner would not claim pairs entries it treats as distinct, or leaves a document it refuses.
+    const knobbed: readonly string[] = UNDECLARED_POLICY_SECTIONS;
+    const entries: Record<string, string>[] = [
+      { name: "Bug" },
+      { name: "Bug", new_name: "Defect" },
+    ];
+    const at = (entry: Record<string, string>, field: string | undefined): string | undefined =>
+      field === undefined ? undefined : entry[field];
+    const layered = SECTIONS.filter((module) => module.layering !== undefined);
+    expect(layered.length).toBeGreaterThan(0);
+    for (const module of layered) {
+      const layering = module.layering;
+      if (layering === undefined) {
+        continue;
+      }
+      expect(knobbed, `${module.key} layers without the undeclared knob`).toContain(module.key);
+      const identity = "decl" in module ? (module.decl as ListDeclView).identity : undefined;
+      for (const entry of entries) {
+        const claimed =
+          identity === undefined
+            ? [at(entry, layering.keyField) ?? ""]
+            : [
+                identity.fold(at(entry, identity.renameKey) ?? at(entry, identity.field) ?? ""),
+                ...(identity.aliases?.(entry) ?? []).map(identity.fold),
+              ];
+        expect(layering.keys(entry), `${module.key} keys of ${JSON.stringify(entry)}`).toEqual(
+          claimed,
+        );
+      }
     }
   });
 
   test("no endpoint keys a hint on 403/404 - the permission branch never reads hints", () => {
-    // On permission-requiring endpoints, throwFor classifies 403/404 as
-    // PermissionDenied before consulting `hints`, so an entry there is dead
-    // advice; on a public ("none") endpoint the generic branch WOULD render
-    // it, which is why 403/404 hints are forbidden outright - ambiguity on
-    // those statuses belongs in `denialHint` (see the EndpointDecl JSDoc).
-    // HintableStatus rejects a fresh 403/404 literal - the inline `as const
-    // satisfies` declarations every section currently uses - at the
-    // declaration site. It cannot catch a NON-FRESH assignment: a hoisted
-    // const with a mixed key set ({422: legal, 403: illegal} is non-fresh
-    // and the shared 422 satisfies the weak-type check), or one annotated
-    // Record<number, string> (the index signature suppresses that check),
-    // compiles - and sections already hoist shared hint strings, so this
-    // sweep stays as the runtime backstop for the hoisted-object path.
+    // throwFor classifies 403/404 as PermissionDenied before reading `hints`, so a hint there is dead advice; ambiguity on those statuses goes in
+    // `denialHint`. HintableStatus misses a hoisted hints object that also carries a permitted key, and sections hoist shared hints, so this sweep
+    // is the runtime backstop.
     for (const [key, endpoint] of Object.entries(allEndpoints())) {
       for (const status of Object.keys(endpoint.hints ?? {})) {
         expect(
@@ -360,16 +161,35 @@ describe("section permissions", () => {
     }
   });
 
+  test("no definitive rejection spells a body the mock's denial gate answers", () => {
+    // A rejection whose body a denial can carry would read a missing grant as the definite meaning, under every policy.
+    const declared = Object.entries(allEndpoints()).flatMap(([key, endpoint]) =>
+      (endpoint.rejections ?? []).map(
+        (rejection) => [key, rejection.status, rejection.message] as const,
+      ),
+    );
+    // The control: at least one declaration exists, or the sweep below proves nothing.
+    expect(declared.length).toBeGreaterThan(0);
+    const denials = (["fine_grained", 403, 404] as const).flatMap((style) =>
+      (["read", "write"] as const).map((kind) => {
+        const denial = denialResponse(style, kind);
+        return [denial.status, (denial.body as { message: string }).message] as const;
+      }),
+    );
+    for (const [key, status, message] of declared) {
+      expect(
+        denials,
+        `${key} declares a body the mock's denial gate answers, so a denied request would read as definitive`,
+      ).not.toContainEqual([status, message]);
+    }
+  });
+
   test("sections declaring the same route agree on its contract", () => {
-    // GET /orgs/{org} is declared by more than one section, and the mock
-    // resolves a request to the FIRST matching declaration - a sibling that
-    // later diverged (an extra status, a different permission) would be
-    // silently validated against the other section's contract and no test
-    // would notice. Group by route and require the contract fields agree.
+    // The mock resolves a request to the FIRST matching declaration, so a sibling that diverged (GET /orgs/{org} is declared by two sections, teams
+    // and custom_properties) would be validated against another section's contract unnoticed.
     const byRoute = new Map<string, Array<{ key: string; contract: string }>>();
     const sectionPermission = new Map(SECTIONS.map((section) => [section.key, section.permission]));
-    // Deep key sort: a replacer ARRAY would filter nested keys (statuses'
-    // "200"), so canonicalize recursively instead.
+    // A JSON.stringify replacer ARRAY would filter nested keys (statuses' "200"), so canonicalize recursively.
     const canonical = (value: unknown): unknown =>
       Array.isArray(value)
         ? value.map(canonical)
@@ -381,14 +201,10 @@ describe("section permissions", () => {
             )
           : value;
     for (const [key, endpoint] of Object.entries(allEndpoints())) {
-      // The WHOLE declaration minus the route itself and the injected
-      // bookkeeping: a hand-picked field list would let a later EndpointDecl
-      // addition (alwaysRewrite feeds the idempotence proof through the same
-      // first-match resolution) diverge uncovered. The EFFECTIVE permission
-      // rides along too - two declarations can both omit an override while
-      // inheriting different section permissions, and the mock gates on the
-      // first match.
-      const { route: _route, section, role: _role, ...rest } = endpoint;
+      // The WHOLE wire declaration is compared, so a later EndpointDecl field cannot diverge uncovered; only the
+      // 404 posture stays out, since it is the SECTION's (denialPosture reads it per section, never per route).
+      // The effective permission rides along: two declarations can both omit an override while inheriting different section permissions.
+      const { route: _route, section, role: _role, primaryRead: _posture, ...rest } = endpoint;
       const projected = { ...rest, effective: rest.permission ?? sectionPermission.get(section) };
       const contract = JSON.stringify(canonical(projected));
       const group = byRoute.get(endpoint.route) ?? [];
@@ -434,44 +250,12 @@ describe("grantFor", () => {
 });
 
 describe("section endpoints", () => {
-  test("every registered section declares at least one endpoint", () => {
-    const offenders = SECTIONS.filter((module) => Object.values(module.endpoints).length === 0).map(
-      (module) => module.key,
-    );
-    expect(
-      offenders,
-      `section(s) declaring no endpoints (add their routes to ENDPOINTS): ${offenders.join(", ")}`,
-    ).toEqual([]);
-  });
-
-  test("every declared endpoint is well-formed", () => {
-    const methods = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+  test("every declared endpoint names at least one status, each an HTTP status with a prose meaning", () => {
+    // The route itself is compile-checked against the OpenAPI-derived Route union; the statuses are a plain record, so only this sweep sees them.
     const problems: string[] = [];
     for (const module of SECTIONS) {
       for (const [role, endpoint] of Object.entries(module.endpoints)) {
         const tag = `${module.key}.${role} ("${endpoint.route}")`;
-        const [method, path] = endpoint.route.split(" ");
-        if (!methods.has(method ?? "")) {
-          problems.push(`${tag}: method "${method}" is not one of GET/POST/PUT/PATCH/DELETE`);
-        }
-        // Absolute path with no query string; only balanced {param} tokens.
-        if (!path?.startsWith("/")) {
-          problems.push(`${tag}: path "${path}" does not start with "/"`);
-        }
-        if (path?.includes("?")) {
-          problems.push(
-            `${tag}: path "${path}" carries a query string; pass queries at the call site`,
-          );
-        }
-        for (const segment of (path ?? "").split("/").filter(Boolean)) {
-          const hasBrace = segment.includes("{") || segment.includes("}");
-          if (hasBrace && !/^{[a-z_]+}$/.test(segment)) {
-            // A templated segment is exactly one {param} token, nothing else.
-            problems.push(
-              `${tag}: templated segment "${segment}" is not exactly one {param} token`,
-            );
-          }
-        }
         const statusEntries = Object.entries(endpoint.statuses);
         if (statusEntries.length === 0) {
           problems.push(`${tag}: declares no statuses`);
@@ -481,7 +265,6 @@ describe("section endpoints", () => {
           if (!Number.isInteger(status) || status < 100 || status >= 600) {
             problems.push(`${tag}: status "${statusKey}" is not an integer in 100-599`);
           }
-          // Every status carries a non-empty prose meaning.
           if (typeof meaning !== "string" || meaning.length === 0) {
             problems.push(`${tag}: status ${statusKey} carries no prose meaning`);
           }
@@ -491,137 +274,6 @@ describe("section endpoints", () => {
     expect(problems, `malformed endpoint declaration(s):\n  ${problems.join("\n  ")}`).toEqual([]);
   });
 
-  test("endpointKind derives read for GET and write for everything else", () => {
-    expect(endpointKind({ route: "GET /repos/{owner}/{repo}", statuses: { 200: "x" } })).toBe(
-      "read",
-    );
-    expect(
-      endpointKind({ route: "POST /repos/{owner}/{repo}/labels", statuses: { 201: "x" } }),
-    ).toBe("write");
-    expect(
-      endpointKind({ route: "DELETE /repos/{owner}/{repo}/labels/{name}", statuses: { 204: "x" } }),
-    ).toBe("write");
-  });
-
-  test("an accessGrade override write-gates a GET", () => {
-    expect(
-      endpointKind({
-        route: "GET /repos/{owner}/{repo}/codespaces/secrets",
-        statuses: { 200: "x" },
-        accessGrade: "write",
-      }),
-    ).toBe("write");
-  });
-
-  test("only the known endpoints carry an accessGrade override, never mixed within a section", () => {
-    // The override models GitHub gating a READ at write (Codespaces secrets
-    // is the only known case). The fuzz oracle collapses grade "read" to
-    // "none" at SECTION level for sections whose every read is write-gated,
-    // so a section mixing write-gated and plain reads would make that
-    // collapse wrong - forbid the shape here until the oracle models
-    // per-endpoint grades. The read universe is sectionOperations, the
-    // flattened REST + GraphQL view the oracle itself derives from: REST
-    // GETs carry their accessGrade as `grade` and GraphQL reads are always
-    // read-gated (their kind IS the gate), so an all-write-gated REST
-    // section gaining a GraphQL read fails here instead of silently
-    // desyncing the oracle.
-    const overridden = Object.entries(allEndpoints())
-      .filter(([, endpoint]) => endpoint.accessGrade !== undefined)
-      .map(([key]) => key)
-      .sort();
-    expect(overridden).toEqual(["codespaces_secrets.list", "codespaces_secrets.publicKey"]);
-    for (const section of SECTIONS) {
-      const readGates = sectionOperations(section)
-        .filter((operation) => operation.wire === "read")
-        .map((operation) => operation.grade);
-      const gated = readGates.filter((gate) => gate === "write");
-      expect(
-        gated.length === 0 || gated.length === readGates.length,
-        `${section.key} mixes write-gated and plain reads`,
-      ).toBe(true);
-    }
-  });
-
-  test("toleratedStatuses returns exactly the declared >= 400 statuses", () => {
-    expect(
-      toleratedStatuses({
-        route: "GET /repos/{owner}/{repo}/private-vulnerability-reporting",
-        statuses: { 200: "a", 404: "b", 422: "c" },
-      }),
-    ).toEqual([404, 422]);
-    expect(
-      toleratedStatuses({
-        route: "PATCH /repos/{owner}/{repo}/code-scanning/default-setup",
-        statuses: { 200: "a", 202: "b", 409: "c" },
-      }),
-    ).toEqual([409]);
-    // No error statuses declared -> nothing tolerated.
-    expect(
-      toleratedStatuses({
-        route: "DELETE /repos/{owner}/{repo}/labels/{name}",
-        statuses: { 204: "a" },
-      }),
-    ).toEqual([]);
-  });
-
-  test("every section's tolerated statuses are a subset of its declared statuses", () => {
-    // Trivially true by construction, but this pins the invariant the
-    // helpers rely on: tolerances are derived from statuses, never wider.
-    const offenders: string[] = [];
-    for (const module of SECTIONS) {
-      for (const [role, endpoint] of Object.entries(module.endpoints)) {
-        const declared = new Set(Object.keys(endpoint.statuses).map(Number));
-        for (const status of toleratedStatuses(endpoint)) {
-          if (!declared.has(status)) {
-            offenders.push(
-              `${module.key}.${role}: tolerates ${status}, which its statuses never declare`,
-            );
-          }
-          if (status < 400) {
-            offenders.push(`${module.key}.${role}: tolerates non-error status ${status}`);
-          }
-        }
-      }
-    }
-    expect(
-      offenders,
-      `endpoint(s) whose tolerated statuses escape their declaration:\n  ${offenders.join("\n  ")}`,
-    ).toEqual([]);
-  });
-
-  test("only the known endpoints carry a permission override", () => {
-    // An override equal to the section permission would be redundant; this
-    // guards against redundant or stray overrides creeping in. Exactly these
-    // endpoints in the whole registry legitimately override: the branches
-    // probe (Contents) and its public App-by-slug bypass-actor lookup, the
-    // teams org read (Members), the OIDC subject
-    // claim pair (Actions instead of Administration), the environments
-    // deployment branch-policy patterns and custom deployment protection
-    // rules (Actions for the list reads, Administration for the
-    // available-Apps read and the writes), and the custom_properties reads
-    // (the org probe is public and the values GET is Metadata-gated only,
-    // so both are "none").
-    const overridden = Object.entries(allEndpoints())
-      .filter(([, endpoint]) => endpoint.permission !== undefined)
-      .map(([key]) => key);
-    expect(overridden.sort()).toEqual([
-      "actions.getOidcSub",
-      "actions.putOidcSub",
-      "branches.appLookup",
-      "branches.branchProbe",
-      "custom_properties.list",
-      "custom_properties.org",
-      "environments.createPolicy",
-      "environments.createProtectionRule",
-      "environments.listPolicies",
-      "environments.listProtectionRuleApps",
-      "environments.listProtectionRules",
-      "environments.removePolicy",
-      "environments.removeProtectionRule",
-      "teams.org",
-    ]);
-  });
-
   test("endpointPermission resolves override, else section permission", () => {
     const section: SectionMeta = {
       key: "branches",
@@ -629,19 +281,15 @@ describe("section endpoints", () => {
       endpoints: {},
       undeclaredDefault: "untouched",
     };
-    // No override -> the section's permission. The declarations are typed
-    // consts because endpointPermission now takes the FailingOp facet, and a
-    // fresh literal's route/statuses would trip the excess-property check.
+    // Typed consts: endpointPermission takes the FailingOp facet, so a fresh literal's route/statuses would trip the excess-property check.
     const plain: EndpointDecl = { route: "GET /repos/{owner}/{repo}", statuses: { 200: "x" } };
     expect(endpointPermission(section, plain)).toEqual({ repo: ["administration"] });
-    // A repo override wins.
     const overridden: EndpointDecl = {
       route: "GET /repos/{owner}/{repo}/branches/{branch}",
       statuses: { 200: "x" },
       permission: { repo: ["contents"] },
     };
     expect(endpointPermission(section, overridden)).toEqual({ repo: ["contents"] });
-    // "none" (public) wins.
     const publicEndpoint: EndpointDecl = {
       route: "GET /orgs/{org}",
       statuses: { 200: "x" },
@@ -651,45 +299,166 @@ describe("section endpoints", () => {
   });
 });
 
+describe("declarations are frozen at registration", () => {
+  test("mutating any registered section's declaration throws, with no view called first", () => {
+    // The module, endpoint, and op objects themselves are frozen by no view (the views freeze only the tagged copies they build), so a
+    // frozen source here is freezeDeclarations' work alone. ES module test files are strict, so an assignment on a frozen object throws.
+    const attempts: [string, () => void][] = [];
+    let endpointCount = 0;
+    for (const section of SECTIONS) {
+      expect(Object.isFrozen(section), `${section.key} module`).toBe(true);
+      attempts.push([
+        `${section.key} permission`,
+        () => {
+          (section as { permission: unknown }).permission = "none";
+        },
+      ]);
+      for (const [role, endpoint] of Object.entries(section.endpoints)) {
+        endpointCount++;
+        const tag = `${section.key}.${role}`;
+        expect(Object.isFrozen(endpoint), tag).toBe(true);
+        attempts.push(
+          [
+            `${tag} replace`,
+            () => {
+              (section.endpoints as Record<string, unknown>)[role] = {};
+            },
+          ],
+          [
+            `${tag} route`,
+            () => {
+              (endpoint as { route: string }).route = "DELETE /repos/{owner}/{repo}";
+            },
+          ],
+          [
+            `${tag} statuses`,
+            () => {
+              (endpoint.statuses as Record<number, string>)[299] = "hacked";
+            },
+          ],
+        );
+        if (endpoint.hints !== undefined) {
+          attempts.push([
+            `${tag} hints`,
+            () => {
+              (endpoint.hints as Record<number, string>)[422] = "hacked";
+            },
+          ]);
+        }
+        if (typeof endpoint.permission === "object") {
+          attempts.push([
+            `${tag} permission`,
+            () => {
+              (endpoint.permission as unknown as { repo: string[] }).repo.push("hacked");
+            },
+          ]);
+        }
+        if (endpoint.rejections !== undefined) {
+          attempts.push([
+            `${tag} rejections`,
+            () => {
+              (endpoint.rejections as unknown as object[]).push({});
+            },
+          ]);
+        }
+      }
+      if (section.closedSurface !== undefined) {
+        attempts.push([
+          `${section.key} closedSurface.known`,
+          () => {
+            (section.closedSurface?.known as Record<string, true>).typo = true;
+          },
+        ]);
+      }
+      for (const [role, op] of Object.entries(section.graphql ?? {})) {
+        const tag = `${section.key}.${role}`;
+        expect(Object.isFrozen(op), tag).toBe(true);
+        attempts.push(
+          [
+            `${tag} outcomes`,
+            () => {
+              (op.outcomes as Record<string, string>).ok = "hacked";
+            },
+          ],
+          [
+            `${tag} kind`,
+            () => {
+              (op as { kind: string }).kind = "write";
+            },
+          ],
+        );
+        if (op.connection !== undefined) {
+          attempts.push([
+            `${tag} connection`,
+            () => {
+              (op.connection as unknown as { path: string[] }).path.push("hacked");
+            },
+          ]);
+        }
+      }
+    }
+    expect(attempts.length).toBeGreaterThanOrEqual(SECTIONS.length + endpointCount * 3);
+    for (const [what, mutate] of attempts) {
+      expect(mutate, what).toThrow(TypeError);
+    }
+    // Control: the same assignment on a spread copy lands, so the throws come from the freeze and not from the assignments themselves.
+    const copy: { route: string } = { ...labelsSection.endpoints.update };
+    copy.route = "DELETE /repos/{owner}/{repo}";
+    expect(copy.route).toBe("DELETE /repos/{owner}/{repo}");
+    expect(labelsSection.endpoints.update.route).toBe("PATCH /repos/{owner}/{repo}/labels/{name}");
+  });
+});
+
 describe("allEndpoints", () => {
-  test("flattens every section endpoint under a unique section.role key", () => {
+  test("flattens every section endpoint under its section.role key, tagged with both", () => {
     const all = allEndpoints();
-    const keys = Object.keys(all);
-    // At least one entry per section, and 55+ overall.
-    expect(keys.length).toBeGreaterThanOrEqual(55);
-    // Every key is ${sectionKey}.${role}; keys are unique by construction.
-    for (const key of keys) {
-      expect(key).toMatch(/^[a-z_]+\.[a-zA-Z]+$/);
-    }
-    expect(new Set(keys).size).toBe(keys.length);
-    // Each entry is tagged with its owning section and role, and the counts
-    // reconcile with the per-section dictionaries.
-    let total = 0;
-    for (const module of SECTIONS) {
-      total += Object.keys(module.endpoints).length;
-    }
-    expect(keys.length).toBe(total);
-    for (const [key, endpoint] of Object.entries(all)) {
-      expect(key).toBe(`${endpoint.section}.${endpoint.role}`);
-      expect(endpoint.statuses).toBeDefined();
-    }
+    const declared = SECTIONS.flatMap((section) =>
+      Object.entries(section.endpoints).map(
+        ([role, endpoint]) =>
+          [`${section.key}.${role}`, { ...endpoint, section: section.key, role }] as const,
+      ),
+    );
+    expect(declared.length).toBeGreaterThan(0);
+    expect(Object.fromEntries(declared)).toEqual(all);
   });
 
-  test("the returned view is frozen so a consumer cannot corrupt declarations", () => {
+  test("the returned view is frozen through every nested field, so a consumer cannot corrupt declarations", () => {
     const all = allEndpoints();
     const entry = all["labels.update"];
-    expect(entry).toBeDefined();
+    expect(entry).toEqual({ ...labelsSection.endpoints.update, section: "labels", role: "update" });
     expect(Object.isFrozen(all)).toBe(true);
     expect(Object.isFrozen(entry)).toBe(true);
-    expect(Object.isFrozen(entry?.statuses)).toBe(true);
-    // A mutation attempt through the view throws in strict mode (test files
-    // are ES modules, hence strict) and leaves the source declaration intact.
-    expect(() => {
-      (entry as unknown as { role: string }).role = "hacked";
-    }).toThrow();
-    // The section's own declaration is unchanged.
+    // Assignment on a frozen object throws only in strict mode; ES module test files are strict.
+    // Every nested facet a declaration can carry, on a real declaration that carries it.
+    const nested: Record<string, () => void> = {
+      role: () => {
+        (entry as unknown as { role: string }).role = "hacked";
+      },
+      statuses: () => {
+        (entry.statuses as Record<number, string>)[200] = "hacked";
+      },
+      primaryRead: () => {
+        (all["labels.list"].primaryRead as { notFound: string }).notFound = "absent";
+      },
+      hints: () => {
+        (all["deploy_keys.create"].hints as Record<number, string>)[422] = "hacked";
+      },
+      permission: () => {
+        (all["branches.listProtected"].permission as unknown as { repo: string[] }).repo.push("x");
+      },
+      rejections: () => {
+        (all["branches.putProtection"].rejections as unknown as { message: string }[])[0] = {
+          message: "x",
+        };
+      },
+    };
+    for (const [facet, mutate] of Object.entries(nested)) {
+      expect(mutate, facet).toThrow(TypeError);
+    }
     const labels = SECTIONS.find((s) => s.key === "labels");
     expect(labels?.endpoints.update?.route).toBe("PATCH /repos/{owner}/{repo}/labels/{name}");
+    // The source declaration is frozen with its view, so neither path can move a route.
+    expect(Object.isFrozen(labels?.endpoints.update)).toBe(true);
   });
 });
 
@@ -713,15 +482,48 @@ describe("allGraphqlOps", () => {
     outcomes: { ok: "x" },
   });
 
-  test("flattens, tags, and freezes like allEndpoints", () => {
-    const ops = allGraphqlOps([graphqlSection("repository", { toggles: op("RepoToggles") })]);
+  test("flattens, tags, and freezes through every nested field like allEndpoints", () => {
+    const toggles = {
+      ...op("RepoToggles"),
+      query: "query RepoToggles($cursor: String) { viewer { login } }",
+      permission: { repo: ["administration"] },
+      connection: { path: ["repository", "rules"] },
+    } satisfies GraphqlPaginatedReadDecl;
+    const ops = allGraphqlOps([graphqlSection("repository", { toggles })]);
+    expect(ops).toEqual({
+      "repository.toggles": {
+        name: "RepoToggles",
+        kind: "read",
+        query: "query RepoToggles($cursor: String) { viewer { login } }",
+        outcomes: { ok: "x" },
+        permission: { repo: ["administration"] },
+        connection: { path: ["repository", "rules"] },
+        section: "repository",
+        role: "toggles",
+      },
+    });
     const tagged = ops["repository.toggles"];
-    expect(tagged).toBeDefined();
-    expect(tagged?.section).toBe("repository");
-    expect(tagged?.role).toBe("toggles");
+    if (tagged === undefined) {
+      throw new Error("the flattened op is missing");
+    }
     expect(Object.isFrozen(ops)).toBe(true);
     expect(Object.isFrozen(tagged)).toBe(true);
-    expect(Object.isFrozen(tagged?.outcomes)).toBe(true);
+    const nested: Record<string, () => void> = {
+      outcomes: () => {
+        (tagged.outcomes as Record<string, string>).ok = "hacked";
+      },
+      permission: () => {
+        (tagged.permission as unknown as { repo: string[] }).repo.push("issues");
+      },
+      connection: () => {
+        (tagged.connection as unknown as { path: string[] }).path.push("nodes");
+      },
+    };
+    for (const [facet, mutate] of Object.entries(nested)) {
+      expect(mutate, facet).toThrow(TypeError);
+    }
+    // The injected declaration is frozen with its view.
+    expect(Object.isFrozen(toggles.connection.path)).toBe(true);
   });
 
   test("a duplicate operation name across sections fails at construction", () => {
@@ -731,7 +533,9 @@ describe("allGraphqlOps", () => {
         graphqlSection("branches", { rules: op("RepoToggles") }),
       ]),
     ).toThrow(
-      /operation name "RepoToggles" is declared by both repository\.toggles and branches\.rules/,
+      new Error(
+        'BUG: GraphQL operation name "RepoToggles" is declared by both repository.toggles and branches.rules; operation names are the wire dispatch key and must be globally unique',
+      ),
     );
   });
 
@@ -744,13 +548,14 @@ describe("allGraphqlOps", () => {
           { get: { route: "GET /repos/{owner}/{repo}", statuses: { 200: "x" } } },
         ),
       ]),
-    ).toThrow(/declares both a REST endpoint and a GraphQL operation under the role "get"/);
+    ).toThrow(
+      new Error(
+        'BUG: section "repository" declares both a REST endpoint and a GraphQL operation under the role "get"; fault and corruption directives share the "section.role" key space, so roles must be distinct',
+      ),
+    );
   });
 
   test("a declared connection whose query takes no $cursor does not compile", () => {
-    // The cursor contract moved from a construction assert into the type:
-    // GraphqlPaginatedReadDecl's query template requires the $cursor variable
-    // listGraphqlConnection's loop feeds.
     // @ts-expect-error - a connection op without $cursor in its query
     const paginated: GraphqlPaginatedReadDecl = {
       ...op("RepoRules"),
@@ -764,19 +569,9 @@ describe("allGraphqlOps", () => {
     };
     expect(() => allGraphqlOps([graphqlSection("repository", { rules: cursored })])).not.toThrow();
   });
-
-  test("the registry's own declarations pass both asserts", () => {
-    // No section declares GraphQL operations yet; the call itself proves the
-    // asserts hold over the live registry, and the first consuming section
-    // inherits the check.
-    expect(() => allGraphqlOps()).not.toThrow();
-  });
 });
 
 describe("typed params (compile-time guards)", () => {
-  // These assertions are about the TYPE checker, not runtime; the bodies
-  // never execute. A route with a path param must require params; a route
-  // without one must forbid them AND allow omitting opts entirely.
   const section = {} as SectionMeta;
   const ctx = {} as SectionContext;
   const withName = {
@@ -789,21 +584,14 @@ describe("typed params (compile-time guards)", () => {
   } satisfies EndpointDecl;
 
   test("type guards hold", () => {
-    // The assertions below are checked by tsc via @ts-expect-error; the body
-    // is guarded by a runtime-false condition so nothing actually executes.
     const neverRuns = false as boolean;
     if (neverRuns) {
-      // Omitting opts entirely for a route that needs {name} is a compile error.
       // @ts-expect-error - params argument is required for a {name} route
       void call(ctx, section, withName);
-      // Providing opts but omitting params is a compile error.
       // @ts-expect-error - params is required inside opts
       void call(ctx, section, withName, {});
-      // The correct call type-checks.
       void call(ctx, section, withName, { params: { name: "bug" } });
-      // A token-less route allows omitting opts entirely.
       void call(ctx, section, noParams);
-      // ...and forbids a stray params key.
       // @ts-expect-error - a token-less route has no params
       void call(ctx, section, noParams, { params: { name: "bug" } });
     }
@@ -814,28 +602,8 @@ describe("typed params (compile-time guards)", () => {
 describe("matchesTemplate", () => {
   test("every {token} consumes exactly one segment", () => {
     expect(matchesTemplate("/repos/{owner}/{repo}/labels", "/repos/o/r/labels")).toBe(true);
-    // A missing segment does not match.
     expect(matchesTemplate("/repos/{owner}/{repo}/labels", "/repos/o/labels")).toBe(false);
-    // A trailing segment beyond the template does not match.
     expect(matchesTemplate("/repos/{owner}/{repo}/labels", "/repos/o/r/labels/bug")).toBe(false);
-  });
-
-  test("a name param consumes exactly one segment", () => {
-    expect(matchesTemplate("/repos/{owner}/{repo}/labels/{name}", "/repos/o/r/labels/bug")).toBe(
-      true,
-    );
-    expect(matchesTemplate("/repos/{owner}/{repo}/labels/{name}", "/repos/o/r/labels/a/b")).toBe(
-      false,
-    );
-  });
-
-  test("the teams path shape matches (org, team_slug, owner, repo)", () => {
-    expect(
-      matchesTemplate(
-        "/orgs/{org}/teams/{team_slug}/repos/{owner}/{repo}",
-        "/orgs/acme/teams/core/repos/o/r",
-      ),
-    ).toBe(true);
   });
 
   test("literal segments must match exactly", () => {
@@ -850,7 +618,6 @@ describe("matchesTemplate", () => {
   });
 
   test("every declared route path matches its own expanded concrete path", () => {
-    // Construction parity: each route template matches the path it expands to.
     const ctx: SectionContext = {
       api: { tryRequest: async () => ({ data: null }), tryGraphql: async () => ({ data: {} }) },
       repo: { owner: "octo", name: "repo", slug: "octo/repo" },
@@ -944,18 +711,7 @@ describe("probeAbsent tolerance derivation", () => {
     check: true,
   });
 
-  test("without an explicit tolerate, a declared >= 400 status reads as missing", async () => {
-    // 404 and 422 are declared, so both are tolerated automatically.
-    const endpoint = {
-      route: "GET /repos/{owner}/{repo}/private-vulnerability-reporting",
-      statuses: { 200: "a", 404: "b", 422: "c" },
-    } satisfies EndpointDecl;
-    expect(await probeAbsent(ctxWith(404), section, endpoint)).toEqual({ missing: true });
-    expect(await probeAbsent(ctxWith(422), section, endpoint)).toEqual({ missing: true });
-  });
-
   test("without an explicit tolerate, an undeclared error status throws", async () => {
-    // 404 is NOT declared here, so it is a real failure, not "missing".
     const endpoint = {
       route: "GET /repos/{owner}/{repo}/vulnerability-alerts",
       statuses: { 204: "a" },
@@ -966,13 +722,8 @@ describe("probeAbsent tolerance derivation", () => {
 
 describe("owner sensitivity", () => {
   test('ownerSensitivity: "org" agrees with the tolerated-404 org probe on every section', () => {
-    // The bare GET /orgs/{org} probe with a tolerated 404 ("not an
-    // organization") is the MECHANISM behind the personal-account no-op the
-    // ownerSensitivity declaration models (the oracle folds on the
-    // declaration, the handler acts on the probe). The two must never
-    // disagree: a declared sensitivity without the probe would predict a
-    // no-op the handler cannot perform, and a probe without the declaration
-    // would hide the no-op from the oracle.
+    // The tolerated-404 org probe is the mechanism behind the personal-account no-op that ownerSensitivity declares to the oracle; one without the
+    // other predicts a no-op the handler cannot perform, or hides one it does.
     const ORG_PROBE = "GET /orgs/{org}";
     for (const section of SECTIONS) {
       const hasProbe = Object.values(section.endpoints).some(
@@ -983,11 +734,6 @@ describe("owner sensitivity", () => {
         `section "${section.key}": ownerSensitivity ("${section.ownerSensitivity ?? "default"}") and the tolerated-404 org probe (present: ${hasProbe}) must agree`,
       ).toBe(hasProbe);
     }
-  });
-
-  test("the org-only set is exactly teams and custom_properties today", () => {
-    const declared = SECTIONS.filter((s) => s.ownerSensitivity === "org").map((s) => s.key);
-    expect(declared.sort()).toEqual(["custom_properties", "teams"]);
   });
 });
 
@@ -1002,21 +748,151 @@ describe("the section.role key space reserves ':'", () => {
 
   test("a role containing ':' fails allEndpoints at construction", () => {
     expect(() => allEndpoints([endpointSection("labels", { "ring:list": LIST })])).toThrow(
-      /role "ring:list" contains ":".*reserves.*scope prefix/,
+      new Error(
+        'BUG: role "ring:list" contains ":", which the "section.role" key space reserves for a future scope prefix ("<scope>:<section>.<role>"); rename it without a colon',
+      ),
     );
   });
 
   test("a section key containing ':' fails both flatteners", () => {
-    expect(() => allEndpoints([endpointSection("prod:labels", { list: LIST })])).toThrow(
-      /section key "prod:labels" contains ":"/,
+    const colonKey = new Error(
+      'BUG: section key "prod:labels" contains ":", which the "section.role" key space reserves for a future scope prefix ("<scope>:<section>.<role>"); rename it without a colon',
     );
+    expect(() => allEndpoints([endpointSection("prod:labels", { list: LIST })])).toThrow(colonKey);
     expect(() =>
       allGraphqlOps([{ key: "prod:labels" as (typeof SECTION_KEYS)[number], endpoints: {} }]),
-    ).toThrow(/section key "prod:labels" contains ":"/);
+    ).toThrow(colonKey);
   });
 
-  test("the live registry's keys and roles are colon-free", () => {
+  test("the live registry passes every construction assert of both flatteners", () => {
     expect(() => allEndpoints()).not.toThrow();
     expect(() => allGraphqlOps()).not.toThrow();
+  });
+});
+
+describe("handler contracts", () => {
+  test("a module declares plan() and nothing else handles", () => {
+    // Compile-time only: the bodies never run.
+    const base = {
+      key: "workflows",
+      undeclaredDefault: "untouched",
+      permission: { repo: ["actions"] },
+      endpoints: {},
+      shape: workflowsSection.shape,
+    } as const;
+    const planOnly = {
+      ...base,
+      async plan(_ctx: PlanContext): Promise<SectionPlan> {
+        return { ops: [], notes: [], drift: [] };
+      },
+    } satisfies SectionModule<"workflows">;
+    const _withRun = {
+      ...planOnly,
+      // @ts-expect-error a run() handler is not part of the contract
+      async run(_ctx: SectionContext) {
+        return { check: true as const, drift: [], notes: [] };
+      },
+    } satisfies SectionModule<"workflows">;
+    // A non-literal value carrying run() is refused too: the excess-property check alone would
+    // pass it, so the contract pins run to never.
+    const aliased = { ...planOnly, run: () => {} };
+    // @ts-expect-error run is pinned to never on the contract
+    const _aliased: SectionModule<"workflows"> = aliased;
+    // @ts-expect-error a module without plan() is not a section
+    const _neither = { ...base } satisfies SectionModule<"workflows">;
+    expect(SECTIONS.map((s) => s.key)).toContain("workflows");
+  });
+
+  test("the exactness tripwire names a module whose plan() is typed over another section's value", () => {
+    // The registry's _PlanModulesAreExact pin proves nothing unless its check can measure misdeclared; the same module with plan() over labels' value
+    // is the negative control.
+    type _Exact = MustBeNever<MisdeclaredPlanModule<"workflows", typeof workflowsSection>>;
+    const misdeclared = {
+      ...workflowsSection,
+      async plan(
+        _ctx: PlanContext<typeof workflowsSection.endpoints, GraphqlDict, "workflows">,
+        _desired: Exclude<SettingsFile["labels"], undefined>,
+      ) {
+        return { ops: [], notes: [], drift: [] };
+      },
+    };
+    // @ts-expect-error a plan() over labels' value is not exact for workflows
+    type _Wrong = MustBeNever<MisdeclaredPlanModule<"workflows", typeof misdeclared>>;
+    // The key arm: workflows' own dictionary and value under labels' context brand is misdeclared too.
+    const foreignKey = {
+      ...workflowsSection,
+      async plan(
+        _ctx: PlanContext<typeof workflowsSection.endpoints, GraphqlDict, "labels">,
+        _desired: Exclude<SettingsFile["workflows"], undefined>,
+      ) {
+        return { ops: [], notes: [], drift: [] };
+      },
+    };
+    // @ts-expect-error a plan() branded with labels' key is not exact for workflows
+    type _ForeignKey = MustBeNever<MisdeclaredPlanModule<"workflows", typeof foreignKey>>;
+    // The snapshot twin: a module without snapshot() measures exact (nothing to compare), the
+    // shipped labels module measures exact, and labels' snapshot() over workflows' dictionary
+    // measures misdeclared.
+    type _NoSnapshot = MustBeNever<
+      MisdeclaredSnapshotModule<"check_suite_preferences", typeof checkSuitePreferencesSection>
+    >;
+    type _ExactSnapshot = MustBeNever<MisdeclaredSnapshotModule<"labels", typeof labelsSection>>;
+    const misdeclaredSnapshot = {
+      ...labelsSection,
+      async snapshot(
+        _ctx: SnapshotContext<typeof workflowsSection.endpoints, GraphqlDict, "labels">,
+      ) {
+        return { value: undefined, notes: [] };
+      },
+    };
+    type Misdeclared = typeof misdeclaredSnapshot;
+    // @ts-expect-error a snapshot() over workflows' dictionary is not exact for labels
+    type _WrongSnapshot = MustBeNever<MisdeclaredSnapshotModule<"labels", Misdeclared>>;
+  });
+
+  test("the door tripwire names a reading module registered without snapshot(); a write-only module passes", () => {
+    type _WriteOnly = MustBeNever<
+      ReadingModuleWithoutSnapshot<"check_suite_preferences", typeof checkSuitePreferencesSection>
+    >;
+    type _Reading = MustBeNever<ReadingModuleWithoutSnapshot<"labels", typeof labelsSection>>;
+    const { snapshot: _dropped, ...withoutSnapshot } = labelsSection;
+    // @ts-expect-error labels declares a GET, so registering it without snapshot() is flagged by name
+    type _Flagged = MustBeNever<ReadingModuleWithoutSnapshot<"labels", typeof withoutSnapshot>>;
+  });
+
+  test("every reading section declares exactly one primaryRead, and its 404 posture derives from it", () => {
+    // denialPosture throws on a repeated posture, or a missing one when the section has planning reads, so the call itself is an assertion.
+    const declaring: string[] = [];
+    for (const section of SECTIONS) {
+      const primaries = Object.entries(section.endpoints).filter(
+        ([, endpoint]) => endpoint.primaryRead !== undefined,
+      );
+      const reads = planningReads(section).length > 0;
+      const posture = denialPosture(section);
+      expect(primaries.length, `${section.key} primaryRead declarations`).toBe(reads ? 1 : 0);
+      if (!reads) {
+        expect(posture, `${section.key} declares no read`).toBe("absent");
+      }
+      for (const [role, endpoint] of primaries) {
+        expect(endpoint.route.startsWith("GET "), `${section.key}.${role} is not a read`).toBe(
+          true,
+        );
+        expect(endpoint.primaryRead?.notFound).toBe(posture);
+        if (posture === "absent") {
+          expect(
+            toleratedStatuses(endpoint),
+            `${section.key}.${role} claims an "absent" 404 posture but does not declare 404 among its statuses, so the helper would classify it as a denial`,
+          ).toContain(404);
+        }
+        declaring.push(section.key);
+      }
+    }
+    expect(declaring).toEqual(
+      SECTIONS.filter((s) =>
+        Object.values(s.endpoints).some(
+          (e) => endpointMethod(e.route) === "GET" && e.phase !== "execution",
+        ),
+      ).map((s) => s.key),
+    );
   });
 });

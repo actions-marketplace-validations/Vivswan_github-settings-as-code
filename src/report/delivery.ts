@@ -1,45 +1,86 @@
 /**
- * Private-report delivery, shared by the single- and multi-repo run flows:
- * compose the full unredacted report for a redacted target and hand it to
- * the chosen channel (the target repo's report issue, or the age-encrypted
- * workflow artifact), plus the marker-label injection the issue channel
- * needs so an apply cannot delete the label the report module creates.
+ * The private-report channel of one run: the full unredacted report per redacted
+ * target, delivered to the target's report issue or the age-encrypted artifact,
+ * plus the marker-label injection that keeps an apply from deleting the issue's label.
  */
 
-import type { IssueChannel, PrivateReportChannel } from "../action/redact.js";
 import type { RepoRef } from "../discovery/targets.js";
-import type { RepoRunResult, ValidatedSettings } from "../engine/orchestrate.js";
-import type { GithubClient } from "../github/api.js";
-import type { Io } from "../io.js";
+import type { SectionOutcome, ValidatedSettings } from "../engine/orchestrate.js";
+import type { RunOutcome } from "../engine/outcome.js";
+import type { SectionSnapshotOutcome } from "../engine/snapshot.js";
+import type { GitHubClient } from "../github/api.js";
+import type { CollectedLine, Io } from "../io.js";
+import type { Private } from "../private.js";
+import { revealPrivate } from "../private-open.js";
+import type { SectionKey } from "../schema.js";
 import { type ArtifactUploader, deliverArtifactReport } from "./artifact-report.js";
-import { composeReport, type TranscriptLine } from "./composer.js";
+import { composeReport } from "./composer.js";
 import {
   deliverIssueReport,
   type IssueReportMode,
   injectMarkerLabel,
+  type LandedWrites,
   MARKER_LABEL,
 } from "./issue-report.js";
 
-/** The run metadata a private report needs, minus the per-target fields. */
+/**
+ * A report reaches only a redacted target proven private or internal (flows/deliver.ts decides).
+ *
+ * `none`              -> delivers nothing
+ * `issue`             -> the full report on the private target repo itself, the one GitHub-ACL-private channel a public run has
+ * `issue-on-failure`  -> the same issue, created only when the run needs attention; recovery closes it with the healthy report
+ * `artifact`          -> the delivered reports as one age-encrypted artifact, for readers with the key but no GitHub access
+ */
+export const PRIVATE_REPORT_CHANNELS = ["none", "issue", "issue-on-failure", "artifact"] as const;
+
+export type PrivateReportChannel = (typeof PRIVATE_REPORT_CHANNELS)[number];
+
+export type IssueChannel = Extract<PrivateReportChannel, "issue" | "issue-on-failure">;
+
+export function isIssueChannel(channel: PrivateReportChannel): channel is IssueChannel {
+  return channel === "issue" || channel === "issue-on-failure";
+}
+
+/**
+ * A section row as every mode closes it: the key and status are closed values, the detail lines are live, and an
+ * apply or check row carries the HTTP code of its failure or skip.
+ */
+export interface ClosedOutcome {
+  key: SectionKey;
+  status: SectionOutcome["status"] | SectionSnapshotOutcome["status"];
+  detail: string[];
+  httpStatus?: number;
+}
+
+/**
+ * One target's rich end state, whatever the mode: slug, section outcomes with live detail, the note for a skip or
+ * failure that produced no outcomes, and the snapshot file the target wrote (its path names the slug). Open in the
+ * clear; sealed with the transcript when redacted.
+ */
+export interface TargetDetail {
+  slug: string;
+  outcomes: ClosedOutcome[];
+  note?: string;
+  file?: string;
+}
+
+export interface RedactedDetail extends TargetDetail {
+  transcript: CollectedLine[];
+}
+
 export interface ReportRunMeta {
   /** The admin repository the workflow ran in (GITHUB_REPOSITORY / selfSlug). */
   adminRepo: string;
   /** Link to the workflow run (may be empty on local runs). */
   runUrl: string;
-  /** "apply" or "check". */
   mode: string;
   /** ISO timestamp captured once at the run's start, passed in (never Date.now here). */
   timestamp: string;
 }
 
 /**
- * Apply the marker-label injection for the issue report channel and describe
- * the change. When `on` is false (the channel is off, or the target is not
- * redacted) the settings pass through untouched with no notice. Otherwise
- * injectMarkerLabel appends the report's marker label if the settings declare a
- * labels section and it is absent (or refuses a rename that would move the
- * marker away). The notice is returned rather than emitted, so the caller can
- * route it through the target's capturing sink (the private report).
+ * `on` is false when the channel is off or the target is not redacted. The notice is returned rather than emitted, so
+ * the caller can route it through the target's capturing sink.
  */
 export function applyMarkerInjection(
   settings: ValidatedSettings,
@@ -48,10 +89,8 @@ export function applyMarkerInjection(
   if (!on) {
     return { settings };
   }
-  // The injection is validity-preserving - it appends MARKER_LABEL_CONFIG (a
-  // constant, schema-valid label entry) or strips a new_name, both of which
-  // keep every section shape satisfied - so the brand survives it. This is
-  // the one place that fact is asserted; the cast below is its whole cost.
+  // The injection appends MARKER_LABEL_CONFIG (a constant, schema-valid entry) or strips a new_name, both keeping every
+  // section shape satisfied, so the brand survives; this cast is the one place that fact is asserted.
   const injection = injectMarkerLabel(settings) as {
     settings: ValidatedSettings;
     outcome: "unchanged" | "injected" | "rename-refused";
@@ -72,117 +111,152 @@ export function applyMarkerInjection(
   }
 }
 
+declare const CONCLUDED: unique symbol;
+
+/** The brand makes runOutcome() the only constructor, so the report cannot be told a result and a verdict that disagree. */
+export interface RunConclusion {
+  readonly result: RunOutcome;
+  readonly exitCode: 0 | 1;
+  readonly [CONCLUDED]: true;
+}
+
+interface ReportTarget {
+  /** The owner/name pair the issue channel posts into; null when the slug did not parse. */
+  repo: RepoRef | null;
+  /** The public placeholder, the only name a delivery warning may carry. */
+  display: string;
+  /** The target's own conclusion; an exit of 1 opens the report issue, 0 closes it. */
+  conclusion: RunConclusion;
+  detail: Private<RedactedDetail>;
+}
+
 /**
- * Compose the full unredacted report document for one target. Shared by both
- * delivery channels: the issue channel PATCHes it into the target's report
- * issue, the artifact channel accumulates it for the encrypted upload. The
- * `check` flag decides needsAttention alongside the result (a check-mode drift
- * needs attention; an apply-mode drift cannot occur).
+ * A delivery failure is one safe warning (placeholder and HTTP status, or the artifact service; never a slug or report
+ * content) and never changes any target's result.
  */
-export function composeTargetReport(
+export interface ReportChannel {
+  deliver(target: ReportTarget): Promise<void>;
+  flush(): Promise<void>;
+}
+
+/**
+ * parseConfig refuses the artifact channel for a face without an upload capability, so an artifact channel with no
+ * uploader here is a face that declared a capability it does not hand in: an invariant violation, not a run outcome.
+ */
+export function openReportChannel(
+  api: GitHubClient,
+  channel: PrivateReportChannel,
   meta: ReportRunMeta,
-  slug: string,
-  result: RepoRunResult["result"],
-  outcomes: RepoRunResult["outcomes"],
-  transcript: TranscriptLine[],
-  check: boolean,
-): { body: string; needsAttention: boolean } {
-  const body = composeReport({
+  reportPublicKey: string,
+  io: Io,
+  uploader?: ArtifactUploader,
+): ReportChannel | null {
+  switch (channel) {
+    case "none":
+      return null;
+    case "issue":
+      return issueChannel(api, meta, "always", io);
+    case "issue-on-failure":
+      return issueChannel(api, meta, "on-failure", io);
+    case "artifact":
+      if (uploader === undefined) {
+        throw new Error(
+          "BUG: the artifact report channel was opened without an uploader; parseConfig admits private-report: artifact only for a face with an artifact upload, which must hand its uploader to the run",
+        );
+      }
+      return artifactChannel(meta, reportPublicKey, io, uploader);
+  }
+}
+
+/** The seal opens in full here: the readers are the target repository's own, or hold the artifact's decryption key. */
+function composeTargetReport(meta: ReportRunMeta, target: ReportTarget): string {
+  const { slug, outcomes, transcript } = revealPrivate(target.detail);
+  return composeReport({
     target: slug,
     adminRepo: meta.adminRepo,
     runUrl: meta.runUrl,
     mode: meta.mode,
-    result,
+    result: target.conclusion.result,
     timestamp: meta.timestamp,
     outcomes: outcomes.map((o) => ({ key: o.key, status: o.status, detail: o.detail })),
     transcript,
   });
-  const needsAttention = result === "failed" || (check && result === "drift");
-  return { body, needsAttention };
 }
 
-/**
- * Compose the full unredacted report for a redacted target and deliver it to
- * the issue channel. Under `always` this runs on EVERY result (the report is
- * the private mirror of the run log); under `on-failure` a healthy run at
- * most closes a leftover open issue and its no-op skip is silent. Returns a
- * safe summary-row note on delivery failure - and emits one public-safe
- * warning naming only the placeholder and the HTTP status - or undefined on
- * success; the target's result is never changed either way.
- */
-export async function deliverReport(
-  api: GithubClient,
+function issueChannel(
+  api: GitHubClient,
   meta: ReportRunMeta,
-  repo: RepoRef,
-  display: string,
-  result: RepoRunResult["result"],
-  outcomes: RepoRunResult["outcomes"],
-  transcript: TranscriptLine[],
-  check: boolean,
-  channel: IssueChannel,
+  mode: IssueReportMode,
   io: Io,
-): Promise<string | undefined> {
-  const { body, needsAttention } = composeTargetReport(
-    meta,
-    repo.slug,
-    result,
-    outcomes,
-    transcript,
-    check,
-  );
-  // The one channel-to-mode conversion, exhaustive over IssueChannel: a future
-  // issue channel fails to compile here instead of inheriting a default.
-  let mode: IssueReportMode;
-  switch (channel) {
-    case "issue":
-      mode = "always";
-      break;
-    case "issue-on-failure":
-      mode = "on-failure";
-      break;
-  }
-  const delivery = await deliverIssueReport(api, repo, body, needsAttention, mode);
-  if ("warning" in delivery) {
-    io.annotate("warning", `${display}: ${delivery.warning}`);
-    return delivery.warning;
-  }
-  return undefined;
+): ReportChannel {
+  return {
+    async deliver(target) {
+      if (target.repo === null) {
+        // The issue channel posts INTO the target repository, and an unparseable slug names none; the loss must not be silent.
+        io.annotate(
+          "warning",
+          `${target.display}: could not deliver the private report: the target name is not an owner/name repository slug, so there is no repository to hold the report issue`,
+        );
+        return;
+      }
+      const body = composeTargetReport(meta, target);
+      const delivery = await deliverIssueReport(
+        api,
+        target.repo,
+        body,
+        target.conclusion.exitCode === 1,
+        mode,
+      );
+      // The marker label and the report issue are the writes a run lands outside the settings apply, so the log names
+      // each one like every other write, a failure after it included, and names the decision not to write, so silence
+      // never has to be read as a delivery.
+      const announce = (landed: LandedWrites): void => {
+        if (landed.labelCreated) {
+          io.log(`report: created label "${MARKER_LABEL}" in ${target.display}`);
+        }
+        if (landed.createdIssue !== null) {
+          io.log(`report: created issue #${landed.createdIssue} in ${target.display}`);
+        }
+      };
+      if ("warning" in delivery) {
+        announce(delivery.landed);
+        io.annotate("warning", `${target.display}: ${delivery.warning}`);
+        return;
+      }
+      if ("skipped" in delivery) {
+        io.log(`report: nothing to deliver for ${target.display}`);
+        return;
+      }
+      announce({ labelCreated: delivery.labelCreated, createdIssue: null });
+      io.log(`report: ${delivery.delivered} issue #${delivery.number} in ${target.display}`);
+    },
+    flush: async () => {},
+  };
 }
 
 /**
- * Concatenate every accumulated per-target report into one document, encrypt it
- * to the operator's recipient, and upload it as the single workflow artifact.
- * A no-op when the channel is not `artifact` or no report was accumulated -
- * the guard lives HERE, not on caller discipline, so a non-artifact channel
- * can never upload whatever a caller accumulated by mistake. Delivery failure
- * warns safely (the artifact service or missing runtime token, never a slug
- * or report content) and leaves the run result untouched. `uploader` is the
- * injectable test port; production passes undefined and the real
- * @actions/artifact uploader applies.
+ * Reports accumulate under placeholder headings and leave as one document on flush. The channel never addresses the
+ * target repository, so it mirrors even a target whose slug failed to parse.
  */
-export async function uploadArtifactReport(
-  channel: PrivateReportChannel,
-  reports: Array<{ display: string; body: string }>,
+function artifactChannel(
+  meta: ReportRunMeta,
   reportPublicKey: string,
   io: Io,
-  uploader?: ArtifactUploader,
-): Promise<void> {
-  if (channel !== "artifact" || reports.length === 0) {
-    return;
-  }
-  const document = concatArtifactReports(reports);
-  const delivery = await deliverArtifactReport(document, reportPublicKey, uploader);
-  if ("warning" in delivery) {
-    io.annotate("warning", delivery.warning);
-  }
-}
-
-/**
- * Join accumulated per-target reports into one document, each under a heading
- * carrying its public placeholder (the document itself is private, but the
- * heading is the only added text and stays placeholder-keyed for consistency
- * with the public surfaces).
- */
-function concatArtifactReports(reports: Array<{ display: string; body: string }>): string {
-  return reports.map((report) => `<!-- ${report.display} -->\n\n${report.body}`).join("\n\n");
+  uploader: ArtifactUploader,
+): ReportChannel {
+  const reports: string[] = [];
+  return {
+    async deliver(target) {
+      reports.push(`<!-- ${target.display} -->\n\n${composeTargetReport(meta, target)}`);
+    },
+    async flush() {
+      if (reports.length === 0) {
+        return;
+      }
+      const delivery = await deliverArtifactReport(uploader, reports.join("\n\n"), reportPublicKey);
+      if ("warning" in delivery) {
+        io.annotate("warning", delivery.warning);
+      }
+    },
+  };
 }

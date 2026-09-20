@@ -4,7 +4,6 @@ import { z } from "zod";
 
 // --- Actor vocabulary (branches force_push_bypassers) ------------------------
 
-/** A parsed force_push_bypassers actor string. */
 export type BypassActor =
   | { kind: "user"; login: string }
   | { kind: "team"; org: string; team: string }
@@ -12,12 +11,7 @@ export type BypassActor =
 
 const NAME_SEGMENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*)$/;
 
-/**
- * Parse one declared actor string, or null when it fits no form: a bare
- * login is a user, "org/team-slug" is a team, and "app/slug" is a GitHub
- * App (the "app" head is reserved; an organization named "app" cannot be
- * addressed as a team holder here).
- */
+/** The lowercase "app" head is reserved for GitHub Apps. */
 export function parseBypassActor(raw: string): BypassActor | null {
   const parts = raw.split("/");
   if (parts.length === 1) {
@@ -37,7 +31,6 @@ export function parseBypassActor(raw: string): BypassActor | null {
 const ACTOR_FORM_ERROR =
   'each force_push_bypassers actor must be a bare user login ("octocat"), "org/team-slug" for a team, or "app/slug" for a GitHub App';
 
-/** The first duplicate under case-insensitive comparison, or null. */
 function duplicateIn(list: readonly string[]): string | null {
   const seen = new Set<string>();
   for (const item of list) {
@@ -57,47 +50,29 @@ export const BranchProtectionConfig = z
         error:
           'required_signatures must be an unquoted true or false (YAML parses "no"/"off"/"yes" as strings, not booleans), so the toggle direction is unambiguous',
       })
-      .optional()
-      .describe(
-        "Require signed commits on the branch. A routed key the PUT silently drops, so it is applied through the POST/DELETE .../protection/required_signatures sub-endpoint after the PUT. GitHub does not document whether the protection PUT preserves an existing signature requirement, so declare the toggle on any branch that carries one - a declared value is pinned either way.",
-      ),
+      .optional(),
     force_push_bypassers: z
       .array(
         z.string().refine((raw) => parseBypassActor(raw) !== null, { error: ACTOR_FORM_ERROR }),
       )
-      .optional()
-      .describe(
-        'Who may force-push to the branch when "allow force pushes" is in its "specify who" mode. Each actor is one string: a bare login is a user ("octocat"), "org/team-slug" is a team, and "app/slug" is a GitHub App. A REST-invisible surface, so this routed key is stripped from the protection PUT and applied through the updateBranchProtectionRule GraphQL mutation after it; check mode reads the live list back through GraphQL. An empty list clears every allowance; an absent key leaves the live list untouched.',
-      ),
+      .optional(),
     required_deployments: z
       .strictObject({ environments: z.array(z.string()) })
       .nullable()
-      .optional()
-      .describe(
-        "Require deployments to succeed before merging (the checkbox and its environment list). REST-invisible like force_push_bypassers, so the routed key rides the same GraphQL mutation. Declaring `null` turns the requirement OFF; an absent key leaves the live state untouched. GitHub SILENTLY drops environment names that do not exist on the repository, so apply verifies the mutation's read-back and fails loudly naming any dropped name; the environments section runs before branches, so environments declared in the same settings file exist by the time this key applies.",
-      ),
+      .optional(),
   })
-  .describe("The protection PUT payload, passed through verbatim except its routed keys.")
   .meta({ id: "BranchProtectionConfig" });
 export type BranchProtectionConfig = z.infer<typeof BranchProtectionConfig>;
 
 export const BranchConfig = z
   .object({
-    name: z
-      .string()
-      .describe(
-        'The branch name, or a wildcard pattern (any name containing `*`, `?`, or `[`, e.g. "release/*"). A literal name applies through the REST protection endpoints; a wildcard rule is REST-invisible, so it applies entirely through the GraphQL branch-protection-rule mutations and its protection accepts only the keys this action can round-trip through that surface (the validator names them; prefer rulesets for new pattern-based configuration).',
-      ),
-    protection: BranchProtectionConfig.nullable().describe(
-      "PUT .../protection payload; null removes protection (Probot parity).",
-    ),
+    name: z.string(),
+    protection: BranchProtectionConfig.nullable(),
   })
   .superRefine((entry, refineCtx) => {
-    // The routed lists are replace-wholesale semantics keyed by actor or
-    // environment identity, which GitHub canonicalizes case-insensitively:
-    // a duplicate would apply "successfully" and then drift forever
-    // against the deduplicated read-back, so both lists reject them
-    // upfront (rejectDuplicates' precedent, at the field level).
+    // GitHub canonicalizes actor and environment names case-insensitively and the routed lists
+    // replace wholesale, so a duplicate would apply "successfully" and then drift forever against
+    // the deduplicated read-back.
     const routed = entry.protection;
     if (routed !== null) {
       const duplicateActor = duplicateIn(routed.force_push_bypassers ?? []);
@@ -122,9 +97,7 @@ export const BranchConfig = z
       }
     }
   })
-  .describe("Classic protection for one branch name or wildcard pattern.")
   .meta({ id: "BranchConfig" });
 export type BranchConfig = z.infer<typeof BranchConfig>;
 
-/** The `branches:` document slice: the entry list the document composes from. */
 export const BranchesConfig = z.array(BranchConfig);
