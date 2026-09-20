@@ -14,8 +14,10 @@ import { flattenProtection } from "../../../src/sections/branches/index.js";
 import { flattenEnvironment } from "../../../src/sections/environments/index.js";
 import { SECTIONS } from "../../../src/sections/registry.js";
 import { roleForPermission } from "../../../src/sections/shared/roles.js";
+import { TEAM_REPOSITORY_MEDIA_TYPE, teamsMockHandlers } from "../../../src/sections/teams/mock.js";
 import { genScenario } from "../generators.js";
 import { Rng } from "../prng.js";
+import { handlerTestContext } from "./handler-test-ctx.js";
 import { decodeNodeId, mintAppNodeId, mintNodeId } from "./node-id.js";
 import {
   applyRuleInput,
@@ -47,6 +49,27 @@ describe("buildState overlay semantics", () => {
     expect(state.pages).toBeNull();
     expect(state.org).not.toBeNull();
     expect((state.org as Record<string, unknown>).login).toBe("e2e-owner");
+  });
+
+  // GitHub stores a team slug lowercase, so the section addresses "core-team" whatever the seed spelled;
+  // a seed kept verbatim would be unreachable and the scenario would read as "team has no access".
+  test("a mixed-case teams seed is reachable by the probe under GitHub's lowercase slug", () => {
+    const state = buildState({ teams: { "Core-Team": { role_name: "maintain" } } }, "org");
+    const response = teamsMockHandlers["teams.probe"](
+      handlerTestContext("teams.probe", state, {
+        params: { org: "e2e-owner", team_slug: "Core-Team", owner: "e2e-owner", repo: "e2e-repo" },
+        headers: { accept: TEAM_REPOSITORY_MEDIA_TYPE },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect((response.body as { role_name: unknown }).role_name).toBe("maintain");
+    expect(Object.keys(state.teams)).toEqual(["core-team"]);
+  });
+
+  test("two teams seeds folding to one slug fail loudly instead of one silently replacing the other", () => {
+    expect(() =>
+      buildState({ teams: { "Core-Team": { role_name: "write" }, "core-team": null } }, "org"),
+    ).toThrow(/live_state\.teams: "Core-Team" and "core-team" both fold to the slug "core-team"/);
   });
 
   test("repo overlay wins field-by-field, deep-merging nested objects", () => {
@@ -357,26 +380,49 @@ describe("branch protection rule projections", () => {
 });
 
 describe("environmentFromPut round trip", () => {
-  test("the engine flattener over environmentFromPut(payload) shows no drift", () => {
-    const payload = {
-      wait_timer: 30,
-      prevent_self_review: true,
-      reviewers: [
-        { type: "User", id: 101 },
-        { type: "Team", id: 201 },
+  // flattenEnvironment leaves the un-nested protection_rules on the object; subsetDiff (declared-keys-only,
+  // exactly as the environments section uses it) ignores that undeclared key.
+  test.each<[string, Record<string, unknown>, unknown[]]>([
+    [
+      "every protection key on",
+      {
+        wait_timer: 30,
+        prevent_self_review: true,
+        reviewers: [
+          { type: "User", id: 101 },
+          { type: "Team", id: 201 },
+        ],
+        deployment_branch_policy: { protected_branches: true, custom_branch_policies: false },
+      },
+      [
+        { type: "wait_timer", wait_timer: 30 },
+        {
+          type: "required_reviewers",
+          prevent_self_review: true,
+          reviewers: [
+            { type: "User", reviewer: { id: 101 } },
+            { type: "Team", reviewer: { id: 201 } },
+          ],
+        },
       ],
-      deployment_branch_policy: { protected_branches: true, custom_branch_policies: false },
-    };
-    // flattenEnvironment leaves the un-nested protection_rules on the object; subsetDiff (declared-keys-only,
-    // exactly as the environments section uses it) ignores that undeclared key.
-    const flattened = flattenEnvironment(environmentFromPut(payload));
-    expect(subsetDiff(payload, flattened, "environments[production]")).toEqual([]);
-  });
+    ],
+    // GitHub creates no rule for the disabled values, and the flattener's baseline reads them back.
+    ["the disabled values", { wait_timer: 0, prevent_self_review: false, reviewers: [] }, []],
+    ["a null branch policy", { deployment_branch_policy: null }, []],
+  ])(
+    "%s: the engine flattener over environmentFromPut(payload) shows no drift",
+    (_name, payload, rules) => {
+      const get = environmentFromPut(payload);
+      expect(get.protection_rules).toEqual(rules);
+      expect(subsetDiff(payload, flattenEnvironment(get), "environments[production]")).toEqual([]);
+    },
+  );
 
-  test("deployment_branch_policy passes through untouched", () => {
-    const get = environmentFromPut({ deployment_branch_policy: null });
-    expect(get.deployment_branch_policy).toBeNull();
-    expect(get.protection_rules).toEqual([]);
+  test("a null branch policy passes through as null, which subsetDiff alone would not notice", () => {
+    // subsetDiff reads a declared null as absent, so the each-row above passes even if the mock drops the key.
+    expect(
+      environmentFromPut({ deployment_branch_policy: null }).deployment_branch_policy,
+    ).toBeNull();
   });
 });
 

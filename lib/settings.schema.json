@@ -146,8 +146,9 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The secret name, the natural key; compared case-insensitively and written uppercase.",
-          "type": "string"
+          "description": "The secret name, the natural key; compared case-insensitively and written uppercase. GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case (`github_token` is the reserved `GITHUB_TOKEN` once uppercased).",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
           "description": "A whole-value `$NAME` reference to an environment variable holding the secret - never a literal (settings files are committed plaintext). Resolved from the action step's env at run time and sealed client-side into the sealed box GitHub's secrets API expects (libsodium's crypto_box_seal format) before upload; GitHub cannot return the value, so check mode verifies existence only and apply re-seals it on every run.",
@@ -164,12 +165,14 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The variable name, the natural key; case-insensitive (stored uppercased by GitHub).",
-          "type": "string"
+          "description": "The variable name, the natural key; case-insensitive (stored uppercased by GitHub). GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case.",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
-          "description": "The plain-text value workflows read through the vars context.",
-          "type": "string"
+          "description": "The plain-text value workflows read through the vars context. GitHub caps one variable at 48 KB; a value over 49152 bytes of UTF-8 is refused when the file is parsed, before any API call.",
+          "type": "string",
+          "maxLength": 49152
         }
       },
       "required": [
@@ -182,8 +185,9 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The secret name, the natural key; compared case-insensitively and written uppercase.",
-          "type": "string"
+          "description": "The secret name, the natural key; compared case-insensitively and written uppercase. GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case (`github_token` is the reserved `GITHUB_TOKEN` once uppercased).",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
           "description": "A whole-value `$NAME` reference to an environment variable holding the secret - never a literal (settings files are committed plaintext). Resolved from the action step's env at run time and sealed client-side into the sealed box GitHub's secrets API expects (libsodium's crypto_box_seal format) before upload; GitHub cannot return the value, so check mode verifies existence only and apply re-seals it on every run.",
@@ -200,12 +204,14 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The variable name, the natural key; case-insensitive (stored uppercased by GitHub).",
-          "type": "string"
+          "description": "The variable name, the natural key; case-insensitive (stored uppercased by GitHub). GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case.",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
-          "description": "The plain-text value Copilot coding agents read.",
-          "type": "string"
+          "description": "The plain-text value Copilot coding agents read. GitHub caps one variable at 48 KB; a value over 49152 bytes of UTF-8 is refused when the file is parsed, before any API call.",
+          "type": "string",
+          "maxLength": 49152
         }
       },
       "required": [
@@ -236,15 +242,17 @@
       "type": "object",
       "properties": {
         "key_prefix": {
-          "description": "Text prefix that triggers the link (e.g. \"TICKET-\"), the natural key.",
-          "type": "string"
+          "description": "Text prefix that triggers the link (e.g. \"TICKET-\"), the natural key; letters, digits, and \". - _ + = : / #\" only, and no declared prefix may begin another.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9.\\-_+=:/#]+$"
         },
         "url_template": {
           "description": "Target URL template containing \"<num>\".",
-          "type": "string"
+          "type": "string",
+          "pattern": "<num>"
         },
         "is_alphanumeric": {
-          "description": "Whether <num> also matches letters; upstream default is true.",
+          "description": "Whether <num> also matches letters; upstream default is true on a create, and a recreate re-sends the live value when undeclared.",
           "type": "boolean"
         }
       },
@@ -440,8 +448,9 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The secret name, the natural key; compared case-insensitively and written uppercase.",
-          "type": "string"
+          "description": "The secret name, the natural key; compared case-insensitively and written uppercase. GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case (`github_token` is the reserved `GITHUB_TOKEN` once uppercased).",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
           "description": "A whole-value `$NAME` reference to an environment variable holding the secret - never a literal (settings files are committed plaintext). Resolved from the action step's env at run time and sealed client-side into the sealed box GitHub's secrets API expects (libsodium's crypto_box_seal format) before upload; GitHub cannot return the value, so check mode verifies existence only and apply re-seals it on every run.",
@@ -462,8 +471,9 @@
           "type": "string"
         },
         "permission": {
-          "description": "\"pull\", \"triage\", \"push\", \"maintain\", \"admin\", or a custom org role; defaults to \"push\".",
-          "type": "string"
+          "description": "\"pull\", \"triage\", \"push\", \"maintain\", \"admin\", or a custom org role name; defaults to \"push\". The grant's own vocabulary, lowercase: \"read\" and \"write\" are what GitHub reports a role as, not what a grant accepts, so they and a mis-cased standard permission fail at parse time, naming the form to declare.",
+          "type": "string",
+          "pattern": "^(?:pull|triage|push|maintain|admin|(?!(?:[Pp][Uu][Ll][Ll]|[Tt][Rr][Ii][Aa][Gg][Ee]|[Pp][Uu][Ss][Hh]|[Mm][Aa][Ii][Nn][Tt][Aa][Ii][Nn]|[Aa][Dd][Mm][Ii][Nn]|[Ww][Rr][Ii][Tt][Ee]|[Rr][Ee][Aa][Dd])$)\\S(?:.*\\S)?)$"
         }
       },
       "required": [
@@ -512,8 +522,9 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The secret name, the natural key; compared case-insensitively and written uppercase.",
-          "type": "string"
+          "description": "The secret name, the natural key; compared case-insensitively and written uppercase. GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case (`github_token` is the reserved `GITHUB_TOKEN` once uppercased).",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
           "description": "A whole-value `$NAME` reference to an environment variable holding the secret - never a literal (settings files are committed plaintext). Resolved from the action step's env at run time and sealed client-side into the sealed box GitHub's secrets API expects (libsodium's crypto_box_seal format) before upload; GitHub cannot return the value, so check mode verifies existence only and apply re-seals it on every run.",
@@ -557,11 +568,11 @@
         },
         "type": {
           "description": "What the pattern matches: \"branch\" (the upstream default) or \"tag\". Immutable on GitHub, so changing it is applied as delete plus recreate.",
+          "type": "string",
           "enum": [
             "branch",
             "tag"
-          ],
-          "type": "string"
+          ]
         }
       },
       "required": [
@@ -595,15 +606,18 @@
           "type": "boolean"
         },
         "wait_timer": {
-          "description": "Minutes to wait before deployments proceed.",
-          "type": "number"
+          "description": "Minutes to wait before deployments proceed, 0 to 43200 (30 days). 0 declares the wait timer off and matches a live environment without one.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 43200
         },
         "prevent_self_review": {
-          "description": "Whether the deployer may approve their own deployment.",
+          "description": "Whether to prevent the deployer from approving their own deployment. The flag lives on the required-reviewers rule, so `true` needs at least one reviewer; `false` declares it off and matches a live environment without the rule.",
           "type": "boolean"
         },
         "reviewers": {
-          "description": "Required reviewers by numeric user/team id.",
+          "description": "Required reviewers by numeric user/team id, at most 6. An empty list declares required reviewers off and matches a live environment without the rule.",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "object",
@@ -628,7 +642,7 @@
           }
         },
         "deployment_branch_policy": {
-          "description": "Which branches may deploy; null clears the policy.",
+          "description": "Which branches may deploy; null lets any branch deploy. As an object, exactly one of the two flags is true: both true is rejected by GitHub, and both false is spelled null.",
           "anyOf": [
             {
               "type": "object",
@@ -645,7 +659,28 @@
               "required": [
                 "protected_branches",
                 "custom_branch_policies"
-              ]
+              ],
+              "if": {
+                "properties": {
+                  "protected_branches": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "custom_branch_policies": {
+                    "const": false
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "custom_branch_policies": {
+                    "const": true
+                  }
+                }
+              }
             },
             {
               "type": "null"
@@ -712,37 +747,64 @@
       "required": [
         "name"
       ],
-      "if": {
-        "required": [
-          "deployment_branch_policies"
-        ]
-      },
-      "then": {
-        "required": [
-          "deployment_branch_policy"
-        ],
-        "properties": {
-          "deployment_branch_policy": {
-            "type": "object",
+      "allOf": [
+        {
+          "if": {
             "required": [
-              "custom_branch_policies"
+              "deployment_branch_policies"
+            ]
+          },
+          "then": {
+            "required": [
+              "deployment_branch_policy"
             ],
             "properties": {
-              "custom_branch_policies": {
+              "deployment_branch_policy": {
+                "type": "object",
+                "required": [
+                  "custom_branch_policies"
+                ],
+                "properties": {
+                  "custom_branch_policies": {
+                    "const": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "prevent_self_review"
+            ],
+            "properties": {
+              "prevent_self_review": {
                 "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reviewers"
+            ],
+            "properties": {
+              "reviewers": {
+                "minItems": 1
               }
             }
           }
         }
-      }
+      ]
     },
     "EnvironmentSecretConfig": {
       "description": "One per-environment Actions secret, matched by case-insensitive name (GitHub stores secret names uppercase). Keys other than name and value are rejected: the API body is built from the sealed value alone, so an extra key would silently do nothing.",
       "type": "object",
       "properties": {
         "name": {
-          "description": "The secret name, the natural key; compared case-insensitively and written uppercase.",
-          "type": "string"
+          "description": "The secret name, the natural key; compared case-insensitively and written uppercase. GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case (`github_token` is the reserved `GITHUB_TOKEN` once uppercased).",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
           "description": "A whole-value `$NAME` reference to an environment variable holding the secret - never a literal (settings files are committed plaintext). Resolved from the action step's env at run time and sealed client-side into the sealed box GitHub's secrets API expects (libsodium's crypto_box_seal format) before upload; GitHub cannot return the value, so check mode verifies existence only and apply re-seals it on every run.",
@@ -760,12 +822,14 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The variable name, the natural key (case-insensitive on GitHub).",
-          "type": "string"
+          "description": "The variable name, the natural key (case-insensitive on GitHub). GitHub's naming rule is checked when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case.",
+          "type": "string",
+          "pattern": "^(?![Gg][Ii][Tt][Hh][Uu][Bb]_)[A-Za-z_][A-Za-z0-9_]*$"
         },
         "value": {
-          "description": "The plain-text value; environment secrets are the place for secrets.",
-          "type": "string"
+          "description": "The plain-text value; environment secrets are the place for secrets. GitHub caps one variable at 48 KB; a value over 49152 bytes of UTF-8 is refused when the file is parsed, before any API call.",
+          "type": "string",
+          "maxLength": 49152
         }
       },
       "required": [
@@ -774,16 +838,28 @@
       ]
     },
     "InteractionLimitsConfig": {
-      "description": "The `interaction_limits:` section. The base object is sent verbatim to PUT /repos/{r}/interaction-limits minus the two routed keys below, which go to their own .../interaction-limits/pulls sub-endpoints instead. GitHub reads the base limit back as limit, origin, and the computed expires_at only. Declare at least one of `limit`, `pull_request_creation_cap`, or `pull_request_creation_bypass`.",
+      "description": "The `interaction_limits:` section, exactly four keys: `limit` and `expiry` are the body of PUT /repos/{r}/interaction-limits, and the two pull-request keys go to their own .../interaction-limits/pulls sub-endpoints. Any other key fails at parse time, origin and expires_at included: GitHub reports them on the GET but never accepts them. Declare at least one of `limit`, `pull_request_creation_cap`, or `pull_request_creation_bypass`.",
       "type": "object",
       "properties": {
         "limit": {
-          "description": "Who may interact: \"existing_users\", \"contributors_only\", or \"collaborators_only\". Optional when only the pull-request keys below are declared; an omitted limit leaves the live base limit untouched.",
-          "type": "string"
+          "description": "Who may interact: \"existing_users\", \"contributors_only\", or \"collaborators_only\"; any other value fails at parse time (GitHub would 422 the PUT). Optional when only the pull-request keys below are declared; an omitted limit leaves the live base limit untouched.",
+          "type": "string",
+          "enum": [
+            "existing_users",
+            "contributors_only",
+            "collaborators_only"
+          ]
         },
         "expiry": {
-          "description": "How long the limit lasts (\"one_day\" through \"six_months\"); GitHub defaults to one_day. Write-only: GitHub reports back the computed expires_at, never the duration, so check mode cannot verify this field and apply re-arms it on every run. Requires a sibling `limit`.",
-          "type": "string"
+          "description": "How long the limit lasts: \"one_day\", \"three_days\", \"one_week\", \"one_month\", or \"six_months\"; GitHub defaults to one_day, and any other value fails at parse time. Write-only: GitHub reports back the computed expires_at, never the duration, so check mode cannot verify this field and apply re-arms it on every run. Requires a sibling `limit`.",
+          "type": "string",
+          "enum": [
+            "one_day",
+            "three_days",
+            "one_week",
+            "one_month",
+            "six_months"
+          ]
         },
         "pull_request_creation_cap": {
           "description": "The pull request creation cap, routed to GET/PATCH /repos/{r}/interaction-limits/pulls/creation-cap. Unlike the base limit it is persistent desired state with no self-expiry and reads back verbatim, so check mode diffs it exactly and apply PATCHes only on divergence. max_open_pull_requests is 1-1000. On repositories where the cap is not available, the endpoints answer 405: apply surfaces that as a note, check mode as drift.",
@@ -794,8 +870,10 @@
               "type": "boolean"
             },
             "max_open_pull_requests": {
-              "description": "The maximum number of open pull requests one user may have (1-1000).",
-              "type": "number"
+              "description": "The maximum number of open pull requests one user may have, a whole number from 1 to 1000 (GitHub's range); anything else fails at parse time.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
             }
           },
           "required": [
@@ -809,7 +887,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "LabelConfig": {
       "description": "One label, matched to the live repo by name.",
@@ -820,12 +899,14 @@
           "type": "string"
         },
         "color": {
-          "description": "Hex color, with or without the leading \"#\".",
-          "type": "string"
+          "description": "Six hex digits, the leading \"#\" optional (\"#d73a4a\" or \"d73a4a\"). Color names and three-digit shorthand fail at parse time; GitHub rejects them.",
+          "type": "string",
+          "pattern": "^#?[0-9a-fA-F]{6}$"
         },
         "description": {
-          "description": "Short explanation shown in the label picker.",
-          "type": "string"
+          "description": "Short explanation shown in the label picker, at most 100 characters (GitHub's cap); longer ones fail at parse time.",
+          "type": "string",
+          "maxLength": 100
         },
         "new_name": {
           "description": "Probot compat: rename an existing label.",
@@ -855,6 +936,19 @@
             "open",
             "closed"
           ]
+        },
+        "due_on": {
+          "description": "The due day as `YYYY-MM-DD`; GitHub keeps only the day, so only the day is compared. The day is sent as noon UTC, `YYYY-MM-DDT12:00:00Z`, which GitHub stores on the same calendar day in PST and PDT, and a snapshot reads it back in that form. A UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` is accepted for its date part.",
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+            },
+            {
+              "type": "string",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+            }
+          ]
         }
       },
       "required": [
@@ -883,7 +977,11 @@
             },
             "path": {
               "description": "The directory within the branch Pages publishes: / or /docs.",
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "/",
+                "/docs"
+              ]
             }
           },
           "required": [
@@ -902,9 +1000,48 @@
           "type": "boolean"
         },
         "public": {
-          "description": "Enterprise Cloud site visibility: true for public, false for repository members only. Documented only in the GHEC flavor of the Pages PUT; the GET echoes it everywhere.",
+          "description": "Enterprise Cloud site visibility: true for public, false for repository members only. Only an organization on Enterprise Cloud can set it; everywhere else GitHub reports true and ignores the field, so false drifts on every run.",
           "type": "boolean"
         }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "url"
+            ]
+          },
+          {
+            "required": [
+              "html_url"
+            ]
+          },
+          {
+            "required": [
+              "status"
+            ]
+          },
+          {
+            "required": [
+              "custom_404"
+            ]
+          },
+          {
+            "required": [
+              "protected_domain_state"
+            ]
+          },
+          {
+            "required": [
+              "pending_domain_unverified_at"
+            ]
+          },
+          {
+            "required": [
+              "https_certificate"
+            ]
+          }
+        ]
       }
     },
     "RepositoryConfig": {
@@ -1411,12 +1548,14 @@
       "type": "object",
       "properties": {
         "name": {
-          "description": "The team slug, the natural key.",
-          "type": "string"
+          "description": "The team slug (the name in the team's URL), the natural key: letters, digits, \".\", \"_\", and \"-\". A display name with spaces fails at parse time, since the slug is what every API path takes and a wrong one reads as \"no access\".",
+          "type": "string",
+          "pattern": "^(?=.*[A-Za-z0-9])[A-Za-z0-9._-]+$"
         },
         "permission": {
-          "description": "Same vocabulary as collaborators; defaults to \"push\".",
-          "type": "string"
+          "description": "Same vocabulary and parse rules as collaborators; defaults to \"push\".",
+          "type": "string",
+          "pattern": "^(?:pull|triage|push|maintain|admin|(?!(?:[Pp][Uu][Ll][Ll]|[Tt][Rr][Ii][Aa][Gg][Ee]|[Pp][Uu][Ss][Hh]|[Mm][Aa][Ii][Nn][Tt][Aa][Ii][Nn]|[Aa][Dd][Mm][Ii][Nn]|[Ww][Rr][Ii][Tt][Ee]|[Rr][Ee][Aa][Dd])$)\\S(?:.*\\S)?)$"
         }
       },
       "required": [
@@ -2077,10 +2216,67 @@
           ]
         },
         "events": {
-          "description": "Events that trigger deliveries, compared order-insensitively; GitHub defaults a new hook to [\"push\"].",
+          "description": "Events that trigger deliveries, compared order-insensitively; GitHub defaults a new hook to [\"push\"]. Each name is one GitHub delivers to repository webhooks, or \"*\" for every event; anything else is refused at parse time, since GitHub would 422 it at apply time. The list is src/upstream-gaps/webhook-events.ts, kept from GitHub's webhook events reference, so an event GitHub adds is refused until a release adds the line.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "branch_protection_configuration",
+              "branch_protection_rule",
+              "check_run",
+              "check_suite",
+              "code_scanning_alert",
+              "commit_comment",
+              "create",
+              "custom_property_values",
+              "delete",
+              "dependabot_alert",
+              "deploy_key",
+              "deployment",
+              "deployment_status",
+              "discussion",
+              "discussion_comment",
+              "fork",
+              "gollum",
+              "issue_comment",
+              "issue_dependencies",
+              "issues",
+              "label",
+              "member",
+              "meta",
+              "milestone",
+              "package",
+              "page_build",
+              "ping",
+              "project",
+              "project_card",
+              "project_column",
+              "public",
+              "pull_request",
+              "pull_request_review",
+              "pull_request_review_comment",
+              "pull_request_review_thread",
+              "push",
+              "registry_package",
+              "release",
+              "repository",
+              "repository_advisory",
+              "repository_import",
+              "repository_ruleset",
+              "repository_vulnerability_alert",
+              "secret_scanning_alert",
+              "secret_scanning_alert_location",
+              "secret_scanning_scan",
+              "security_and_analysis",
+              "star",
+              "status",
+              "sub_issues",
+              "team_add",
+              "watch",
+              "workflow_job",
+              "workflow_run",
+              "*"
+            ]
           }
         },
         "active": {
@@ -2097,22 +2293,39 @@
       "type": "object",
       "properties": {
         "url": {
-          "description": "The delivery URL, the natural key: a changed url declares a NEW hook (the old one becomes undeclared).",
+          "description": "The delivery URL, the natural key: a changed url declares a NEW hook (the old one becomes undeclared). Must be an absolute URL; GitHub refuses anything else.",
           "type": "string"
         },
         "content_type": {
-          "description": "Payload encoding: \"json\" or \"form\".",
-          "type": "string"
+          "description": "Payload encoding: exactly \"json\" or \"form\" (GitHub's default); other spellings such as \"JSON\" or a MIME type are refused at parse time.",
+          "type": "string",
+          "enum": [
+            "json",
+            "form"
+          ]
         },
         "secret": {
           "description": "The shared delivery secret, as a whole-value `$NAME` reference to an environment variable on the action step (never a literal: settings files are committed plaintext). Resolved at apply time; GitHub echoes it back as \"********\", so check mode cannot verify it and apply re-sends it on every run so rotations propagate.",
           "type": "string"
         },
         "insecure_ssl": {
-          "description": "Whether to skip TLS verification (\"0\" verify / \"1\" skip); GitHub stores it as a string.",
-          "type": [
-            "string",
-            "number"
+          "description": "Whether to skip TLS verification: \"0\" (verify) or \"1\" (skip), as the string or the number; GitHub stores the string, and any other spelling is refused at parse time.",
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "0",
+                "1"
+              ]
+            },
+            {
+              "type": "number",
+              "const": 0
+            },
+            {
+              "type": "number",
+              "const": 1
+            }
           ]
         }
       },

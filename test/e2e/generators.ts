@@ -42,6 +42,7 @@ import { allEndpoints, allGraphqlOps, SECTIONS } from "../../src/sections/regist
 import { genRepository } from "../../src/sections/repository/generators.js";
 import { genRulesets } from "../../src/sections/rulesets/generators.js";
 import { genSecretScanningPatterns } from "../../src/sections/secret_scanning_custom_patterns/generators.js";
+import { MAX_VARIABLE_VALUE_BYTES } from "../../src/sections/shared/schema-helpers.js";
 import { genTeams } from "../../src/sections/teams/generators.js";
 import { genWebhooks } from "../../src/sections/webhooks/generators.js";
 import { genWorkflows } from "../../src/sections/workflows/generators.js";
@@ -382,6 +383,16 @@ const NATURAL_KEYS: Record<(typeof ARRAY_SECTIONS)[number], string> = {
   secret_scanning_custom_patterns: "name",
 };
 
+/** The sections whose entry `name` is a GitHub secret or variable name (the environments section nests the same two lists). */
+const GITHUB_NAMED_SECTIONS = [
+  ...SECRET_LIST_SECTIONS,
+  "actions_variables",
+  "agents_variables",
+] as const satisfies readonly (typeof ARRAY_SECTIONS)[number][];
+
+/** A hyphen, a leading digit, and the reserved prefix in both cases; `github_token` folds to GITHUB_TOKEN once uppercased. */
+const REFUSED_GITHUB_NAMES = ["my-secret", "2_TOKEN", "GITHUB_TOKEN", "github_token"] as const;
+
 /** Entries come back by reference, so a case's mutation lands inside whichever form was drawn; itemToken spells that form's validator path. */
 function validItems(
   rng: Rng,
@@ -449,12 +460,32 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
     }),
   },
   {
-    name: "interaction-limits-bad-limit",
-    build: (rng) => ({
-      // Base keys ride a PUT that requires `limit`, so expiry alone fails the refinement; a non-string limit fails its type.
-      doc: { interaction_limits: rng.pick([{ expiry: "one_week" }, { limit: 7 }] as const) },
-      offendingToken: "interaction_limits",
-    }),
+    name: "interaction-limits-refused-at-parse",
+    build: (rng) => {
+      // What the PUT would 422, or what GitHub reports but never accepts, fails at parse; the token is the key each issue names.
+      const cases: ReadonlyArray<readonly [Json, string]> = [
+        [{ expiry: "one_week" }, "interaction_limits.limit"],
+        [{ limit: 7 }, "interaction_limits.limit"],
+        [{ limit: "collaborators" }, "interaction_limits.limit"],
+        [{ limit: "existing_users", expiry: "two_weeks" }, "interaction_limits.expiry"],
+        [
+          { limit: "existing_users", expires_at: "2027-01-01T00:00:00Z" },
+          'Unrecognized key: "expires_at"',
+        ],
+        [{ limit: "existing_users", origin: "repository" }, 'Unrecognized key: "origin"'],
+        [
+          {
+            pull_request_creation_cap: {
+              enabled: true,
+              max_open_pull_requests: rng.pick([0, -1, 2.5, 1001]),
+            },
+          },
+          "interaction_limits.pull_request_creation_cap.max_open_pull_requests",
+        ],
+      ];
+      const [doc, offendingToken] = rng.pick(cases);
+      return { doc: { interaction_limits: doc }, offendingToken };
+    },
   },
   {
     name: "scalar-item",
@@ -484,11 +515,67 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
     },
   },
   {
+    name: "secret-or-variable-name-refused",
+    build: (rng) => {
+      const key = rng.pick(GITHUB_NAMED_SECTIONS);
+      const { value, entries, index, itemToken } = validItems(rng, key);
+      (entries[index] as Json).name = rng.pick(REFUSED_GITHUB_NAMES);
+      return { doc: { [key]: value }, offendingToken: `${itemToken}.name` };
+    },
+  },
+  {
+    name: "environment-nested-name-refused",
+    build: (rng) => {
+      const list = rng.pick(["variables", "secrets"] as const);
+      const value = list === "secrets" ? "$E2E_SECRET_A" : "debug";
+      const entry = { name: rng.pick(REFUSED_GITHUB_NAMES), value };
+      return {
+        doc: { environments: [{ name: "prod", [list]: [entry] }] },
+        offendingToken: `environments[0].${list}[0].name`,
+      };
+    },
+  },
+  {
+    name: "variable-value-over-cap",
+    build: (rng) => {
+      const key = rng.pick(["actions_variables", "agents_variables"] as const);
+      const { value, entries, index, itemToken } = validItems(rng, key);
+      (entries[index] as Json).value = "x".repeat(MAX_VARIABLE_VALUE_BYTES + 1);
+      return { doc: { [key]: value }, offendingToken: `${itemToken}.value` };
+    },
+  },
+  {
     name: "labels-new-name-not-a-string",
     build: (rng) => {
       const { value, entries, index, itemToken } = validItems(rng, "labels");
       (entries[index] as Json).new_name = 7;
       return { doc: { labels: value }, offendingToken: `${itemToken}.new_name` };
+    },
+  },
+  {
+    // "write" converges on an existing Write collaborator and 422s on a new one; "Push" and "" 422 on both.
+    name: "collaborators-permission-not-grantable",
+    build: (rng) => {
+      const { value, entries, index, itemToken } = validItems(rng, "collaborators");
+      (entries[index] as Json).permission = rng.pick([
+        "read",
+        "write",
+        "Write",
+        "Push",
+        "ADMIN",
+        "",
+        "push\n",
+      ]);
+      return { doc: { collaborators: value }, offendingToken: `${itemToken}.permission` };
+    },
+  },
+  {
+    // A display name is the team_slug in the API path: the probe 404s and check reports "no access".
+    name: "teams-name-not-a-slug",
+    build: (rng) => {
+      const { value, entries, index, itemToken } = validItems(rng, "teams");
+      (entries[index] as Json).name = rng.pick(["Core Team", "core/team", "@core", " core", ""]);
+      return { doc: { teams: value }, offendingToken: `${itemToken}.name` };
     },
   },
   {
@@ -556,6 +643,26 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
       doc: { pages: { source: { path: "/" } } },
       offendingToken: "pages.source.branch",
     }),
+  },
+  {
+    // Each is a value GitHub 422s at apply time; the parser refuses it first, naming the field.
+    name: "webhooks-value-github-refuses",
+    build: (rng) => {
+      const { value, entries, index, itemToken } = validItems(rng, "webhooks");
+      const hook = entries[index] as Json;
+      const config = hook.config as Json;
+      const [field, mutate] = rng.pick<[string, () => void]>([
+        ["events[0]", () => (hook.events = ["pushes"])],
+        [
+          "config.content_type",
+          () => (config.content_type = rng.pick(["JSON", "application/json"])),
+        ],
+        ["config.insecure_ssl", () => (config.insecure_ssl = rng.pick([true, 2, "yes"]))],
+        ["config.url", () => (config.url = rng.pick(["hooks.example.com/ci", "not a url"]))],
+      ]);
+      mutate();
+      return { doc: { webhooks: value }, offendingToken: `${itemToken}.${field}` };
+    },
   },
 ];
 
@@ -1418,13 +1525,13 @@ export const MERGE_FEATURES = [
   "label-rename-union",
   /** A unioned ruleset re-declaring a held rule type with different parameters, so replacement is observable. */
   "rule-parameters",
-  /** A top-level null over a section the fold holds. */
+  /** A top-level null over a section the fold holds, where null is not the section's value. */
   "null-deletes",
   /** A null inside a mapping section (a nested key deletion). */
   "null-nested",
   /** A null field inside a ruleset entry. */
   "null-entry-field",
-  /** A top-level null over a section the fold does not hold, where null is the section's value (NULLABLE_SECTIONS). */
+  /** A top-level null on a section whose value null is (NULLABLE_SECTIONS), held below or not: the fold keeps it. */
   "null-stays",
   /** A top-level null over a section the fold does not hold and whose value null is not: it drops. */
   "null-drops",
@@ -1750,9 +1857,14 @@ export function mergeFeaturesOf(
     for (const key of keys) {
       const value = doc[key];
       if (value === null) {
-        features.add(
-          present.has(key) ? "null-deletes" : isNullValued(key) ? "null-stays" : "null-drops",
-        );
+        if (isNullValued(key)) {
+          // The fold writes `key: null` as the section's value, so the section stays held and a later declaration
+          // over it is an override, not a first declaration.
+          features.add("null-stays");
+          present.add(key);
+          continue;
+        }
+        features.add(present.has(key) ? "null-deletes" : "null-drops");
         present.delete(key);
         if (key === "labels" || key === "rulesets") {
           advanceHeld(held, key, null, false);

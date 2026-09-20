@@ -127,12 +127,21 @@ schema:
     among the declared ranks, apply moves them after the declared pins (surfaced as a note). GitHub
     allows at most 10 pinned environments, so more than 10 `pinned: true` entries are rejected
     upfront.
-  EnvironmentConfig.wait_timer: Minutes to wait before deployments proceed.
-  EnvironmentConfig.prevent_self_review: Whether the deployer may approve their own deployment.
-  EnvironmentConfig.reviewers: Required reviewers by numeric user/team id.
+  EnvironmentConfig.wait_timer: >-
+    Minutes to wait before deployments proceed, 0 to 43200 (30 days). 0 declares the wait timer
+    off and matches a live environment without one.
+  EnvironmentConfig.prevent_self_review: >-
+    Whether to prevent the deployer from approving their own deployment. The flag lives on the
+    required-reviewers rule, so `true` needs at least one reviewer; `false` declares it off and
+    matches a live environment without the rule.
+  EnvironmentConfig.reviewers: >-
+    Required reviewers by numeric user/team id, at most 6. An empty list declares required
+    reviewers off and matches a live environment without the rule.
   EnvironmentConfig.reviewers[].id: The user's or team's numeric id.
   EnvironmentConfig.reviewers[].type: User or Team.
-  EnvironmentConfig.deployment_branch_policy: Which branches may deploy; null clears the policy.
+  EnvironmentConfig.deployment_branch_policy: >-
+    Which branches may deploy; null lets any branch deploy. As an object, exactly one of the two
+    flags is true: both true is rejected by GitHub, and both false is spelled null.
   EnvironmentConfig.deployment_branch_policy|0.protected_branches: Restrict to branches with protection rules.
   EnvironmentConfig.deployment_branch_policy|0.custom_branch_policies: Restrict to name patterns, declared under `deployment_branch_policies`.
   EnvironmentConfig.deployment_branch_policies: >-
@@ -170,5 +179,10 @@ schema:
     uppercase). Keys other than name and value are rejected: the API body is built from the sealed
     value alone, so an extra key would silently do nothing.
   EnvironmentVariableConfig: One per-environment Actions variable, matched by case-insensitive name.
-  EnvironmentVariableConfig.name: The variable name, the natural key (case-insensitive on GitHub).
-  EnvironmentVariableConfig.value: The plain-text value; environment secrets are the place for secrets.
+  EnvironmentVariableConfig.name: >-
+    The variable name, the natural key (case-insensitive on GitHub). GitHub's naming rule is checked
+    when the file is parsed, before any API call: ASCII letters, digits, and underscores only, not
+    starting with a digit, and not starting with the reserved `GITHUB_` prefix in any case.
+  EnvironmentVariableConfig.value: >-
+    The plain-text value; environment secrets are the place for secrets. GitHub caps one variable at
+    48 KB; a value over 49152 bytes of UTF-8 is refused when the file is parsed, before any API call.

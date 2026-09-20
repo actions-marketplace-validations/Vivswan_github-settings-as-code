@@ -3,7 +3,8 @@ import type { Row } from "../snapshot-roundtrip.js";
 import { STAMPS } from "./families.js";
 
 // staging is the one pinned environment, so it LEADS the snapshot with pinned: true (the planner
-// reads declaration order as pin order) and production follows without the key.
+// reads declaration order as pin order) and production follows without the key. staging has no
+// protection rules, which the snapshot writes out as the three disabled values.
 export const row: Row = {
   section: environmentsSection,
   live: {
@@ -39,7 +40,7 @@ export const row: Row = {
     environment_secrets: {
       production: [
         { name: "DEPLOY_TOKEN", ...STAMPS },
-        { name: "GITHUB_PAT", ...STAMPS },
+        { name: "RELEASE_PAT", ...STAMPS },
       ],
       staging: [{ name: "DEPLOY_TOKEN", ...STAMPS }],
     },
@@ -70,6 +71,9 @@ export const row: Row = {
       {
         name: "staging",
         pinned: true,
+        wait_timer: 0,
+        prevent_self_review: false,
+        reviewers: [],
         deployment_branch_policy: null,
         secrets: {
           _undeclared: "keep",
@@ -90,7 +94,7 @@ export const row: Row = {
           _undeclared: "keep",
           entries: [
             { name: "DEPLOY_TOKEN", value: "$SECRET_ENVIRONMENT_PRODUCTION_DEPLOY_TOKEN" },
-            { name: "GITHUB_PAT", value: "$SECRET_ENVIRONMENT_PRODUCTION_GITHUB_PAT" },
+            { name: "RELEASE_PAT", value: "$SECRET_ENVIRONMENT_PRODUCTION_RELEASE_PAT" },
           ],
         },
         deployment_branch_policies: {
@@ -105,7 +109,7 @@ export const row: Row = {
     ],
     notes: [
       "environments[production].secrets[DEPLOY_TOKEN]: value of DEPLOY_TOKEN is not readable; export it into the environment as SECRET_ENVIRONMENT_PRODUCTION_DEPLOY_TOKEN before apply",
-      "environments[production].secrets[GITHUB_PAT]: value of GITHUB_PAT is not readable; export it into the environment as SECRET_ENVIRONMENT_PRODUCTION_GITHUB_PAT before apply",
+      "environments[production].secrets[RELEASE_PAT]: value of RELEASE_PAT is not readable; export it into the environment as SECRET_ENVIRONMENT_PRODUCTION_RELEASE_PAT before apply",
       "environments[staging].secrets[DEPLOY_TOKEN]: value of DEPLOY_TOKEN is not readable; export it into the environment as SECRET_ENVIRONMENT_STAGING_DEPLOY_TOKEN before apply",
     ],
   },
