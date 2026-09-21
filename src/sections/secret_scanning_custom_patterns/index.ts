@@ -11,9 +11,11 @@
 import { z } from "zod";
 import { agree } from "../../text.js";
 import type { EndpointDecl } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   defaultUndeclaredPolicy,
+  keyedBy,
   loosen,
   missingDrift,
   type SectionMeta,
@@ -27,8 +29,12 @@ import type { SectionPermission } from "../contract/permissions.js";
 import { hasDrift, type PlannedOp, type SectionPlan } from "../contract/plan.js";
 import { rejectDuplicates } from "../contract/requests.js";
 import { knobbed } from "../shared/schema-helpers.js";
-import { knobbedSnapshot, projectOntoSchema } from "../shared/snapshot-helpers.js";
-import { SecretScanningPatternConfig } from "./schema.js";
+import {
+  knobbedSnapshot,
+  leftOutOfSnapshot,
+  projectOntoSchema,
+} from "../shared/snapshot-helpers.js";
+import { SecretScanningPatternConfig, unverifiableRegexFields } from "./schema.js";
 
 const permission: SectionPermission = { repo: ["secret_scanning_alerts"] };
 
@@ -141,12 +147,14 @@ function patternsByName<T extends { id: number; name: string }>(
   section: SectionMeta,
   live: readonly T[],
 ): Map<string, T> {
-  return liveByIdentity(
-    section,
-    "secret scanning custom pattern",
-    live,
-    (p) => p.name,
-    (p) => liveIdentity(p.name, { pattern_id: p.id }),
+  return raise(
+    liveByIdentity(
+      section,
+      "secret scanning custom pattern",
+      live,
+      (p) => p.name,
+      (p) => liveIdentity(p.name, { pattern_id: p.id }),
+    ),
   );
 }
 
@@ -155,6 +163,8 @@ const key = "secret_scanning_custom_patterns";
 export const secretScanningPatternsSection = {
   key,
   undeclaredDefault: "keep",
+  // Verbatim, as plan() passes to rejectDuplicates: GitHub matches pattern names exactly.
+  layering: keyedBy("name"),
   permission,
   endpoints: ENDPOINTS,
   shape: loosen(knobbed(SecretScanningPatternConfig)),
@@ -174,11 +184,13 @@ export const secretScanningPatternsSection = {
   },
   async plan(ctx, declared) {
     const { policy, entries: desired } = undeclaredPolicy(declared, defaultUndeclaredPolicy(this));
-    rejectDuplicates(
-      this,
-      desired,
-      (p) => p.name,
-      (p) => p.name,
+    raise(
+      rejectDuplicates(
+        this,
+        desired,
+        (p) => p.name,
+        (p) => p.name,
+      ),
     );
     const live = (await ctx.read.list.listAll(LivePatternEntry)).map(liveFrom);
     const liveByName = patternsByName(this, live);
@@ -278,7 +290,26 @@ export const secretScanningPatternsSection = {
       return { value: undefined, notes: [] };
     }
     patternsByName(this, live);
-    const entries = live.map((pattern) => projectOntoSchema(SecretScanningPatternConfig, pattern));
-    return { value: knobbedSnapshot(this, entries), notes: [] };
+    const notes: string[] = [];
+    const entries: SecretScanningPatternConfig[] = [];
+    for (const pattern of live) {
+      const entry = projectOntoSchema(SecretScanningPatternConfig, pattern);
+      // A live value the syntax check cannot verify has no file-side fix: the entry is left out, the
+      // rest is written. A mis-shaped entry stays, for the engine's validation to name as the bug it is.
+      const unverifiable = unverifiableRegexFields(entry);
+      if (unverifiable.length > 0) {
+        notes.push(
+          leftOutOfSnapshot(
+            `${key}[${pattern.name}]`,
+            `its ${unverifiable.join(", ")} cannot be verified as ${agree(unverifiable.length, "a regular expression", "regular expressions")} by this tool; the pattern stays live and undeclared under the keep default`,
+          ),
+        );
+        continue;
+      }
+      entries.push(entry);
+    }
+    // Every entry left out still declares the section, empty: something exists on the repository,
+    // and the keep policy the empty declaration spells is what holds it.
+    return { value: knobbedSnapshot(this, entries), notes };
   },
 } satisfies SectionModule<"secret_scanning_custom_patterns", typeof ENDPOINTS>;

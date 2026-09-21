@@ -19,10 +19,10 @@ import { SECTIONS } from "../../src/sections/registry.js";
 /** A document spelled in the canonical order, so the shuffled twin below has something to converge on. */
 const ORDERED: Record<string, unknown> = {
   repository: {
-    topics: ["b", "a"],
-    enable_vulnerability_alerts: true,
     has_issues: true,
     has_wiki: false,
+    topics: ["b", "a"],
+    enable_vulnerability_alerts: true,
   },
   labels: {
     _undeclared: "keep",
@@ -52,12 +52,12 @@ const ORDERED: Record<string, unknown> = {
   ],
   pages: null,
   webhooks: [{ config: { url: "https://a" } }, { config: { url: "https://b" } }],
-  _layering: "merge",
+  _layering: "deep",
 };
 
 /** The same content: every mapping's keys reversed, every identity-sorted list reversed, the pinned block kept. */
 const SHUFFLED: Record<string, unknown> = {
-  _layering: "merge",
+  _layering: "deep",
   webhooks: [{ config: { url: "https://b" } }, { config: { url: "https://a" } }],
   pages: null,
   environments: [
@@ -150,10 +150,10 @@ describe("canonicalDocument", () => {
       rulesets: [{ name: "r", rules: [{ type: "t", parameters: { z: 1, m: 2, a: 3 } }] }],
     }) as { repository: object; rulesets: Array<{ rules: Array<{ parameters: object }> }> };
     expect(Object.keys(canonical.repository)).toEqual([
+      "has_wiki",
       "topics",
       "enable_vulnerability_alerts",
       "aaa",
-      "has_wiki",
       "zzz",
     ]);
     expect(Object.keys(canonical.rulesets[0]?.rules[0]?.parameters ?? {})).toEqual(["a", "m", "z"]);
@@ -216,8 +216,8 @@ describe("canonicalDocument", () => {
       repository: { toString: "b", has_wiki: true, constructor: "a" },
     }) as { repository: Record<string, unknown> };
     expect(Object.entries(canonical.repository)).toEqual([
-      ["constructor", "a"],
       ["has_wiki", true],
+      ["constructor", "a"],
       ["toString", "b"],
     ]);
   });
@@ -237,7 +237,7 @@ describe("canonicalDocument", () => {
 
 /** The directives as the schema declares them, spelled first so the test proves they move after the sections. */
 function _directivesFirst(): Array<[string, unknown]> {
-  return DOCUMENT_DIRECTIVE_KEYS.map((key) => [key, "merge"]);
+  return DOCUMENT_DIRECTIVE_KEYS.map((key) => [key, "deep"]);
 }
 
 interface Def {
@@ -252,11 +252,30 @@ interface Def {
 const defOf = (schema: z.ZodType): Def => (schema as unknown as { _zod: { def: Def } })._zod.def;
 
 /** Every list of mappings the schema declares, by the path LIST_IDENTITY spells (a knob wrapper's `entries` transparent). */
+/** Whether a list of this element is a mapping list: a mapping, or a union whose options include one (a ruleset's rules). */
+function isMappingSchema(schema: z.ZodType): boolean {
+  const def = defOf(schema);
+  switch (def.type) {
+    case "optional":
+    case "nullable":
+    case "default":
+      return isMappingSchema(def.innerType as z.ZodType);
+    case "object":
+    case "record":
+      return true;
+    case "union":
+      return (def.options ?? []).some(isMappingSchema);
+    default:
+      return false;
+  }
+}
+
 function mappingListPaths(schema: z.ZodType, path: string, out: Set<string>): void {
   const def = defOf(schema);
   switch (def.type) {
     case "optional":
     case "nullable":
+    case "default":
       mappingListPaths(def.innerType as z.ZodType, path, out);
       return;
     case "object":
@@ -265,11 +284,8 @@ function mappingListPaths(schema: z.ZodType, path: string, out: Set<string>): vo
       }
       return;
     case "array": {
-      let element = def.element as z.ZodType;
-      while (["optional", "nullable"].includes(defOf(element).type)) {
-        element = defOf(element).innerType as z.ZodType;
-      }
-      if (["object", "record"].includes(defOf(element).type)) {
+      const element = def.element as z.ZodType;
+      if (isMappingSchema(element)) {
         out.add(path);
       }
       mappingListPaths(element, `${path}[]`, out);

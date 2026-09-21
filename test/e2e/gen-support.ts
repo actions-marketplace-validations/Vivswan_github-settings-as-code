@@ -20,9 +20,31 @@ export const UNDECLARED_KEY = "_undeclared";
 /** The layering directive's key, on a knobbed wrapper or at a layer's top level. */
 export const LAYERING_KEY = "_layering";
 
-export type LayeringDirective = "merge" | "replace";
+/** The directive's values in the harness's own words: a value the engine adds or drops is a disagreement the fuzz surfaces. */
+export const LAYERING_DIRECTIVES = ["replace", "shallow", "deep"] as const;
 
-export const LAYERING_DIRECTIVES: readonly LayeringDirective[] = ["merge", "replace"];
+export type LayeringDirective = (typeof LAYERING_DIRECTIVES)[number];
+
+/** The run input's default, in the harness's own words. */
+export const DEFAULT_LAYERING_DIRECTIVE: LayeringDirective = "deep";
+
+/**
+ * The entry paths whose null is a VALUE under deep (never a delete marker), in the harness's own words: a custom
+ * property's `value: null` unsets the property, an environment's `deployment_branch_policy: null` lifts its branch
+ * restriction, a branch's `protection: null` removes its protection and `protection.required_deployments: null` turns
+ * that control off. oracle.test.ts pins the spelling against each module's declaration.
+ */
+export const NULL_VALUED_ENTRY_PATHS: Readonly<Partial<Record<string, readonly string[]>>> = {
+  custom_properties: ["value"],
+  environments: ["deployment_branch_policy"],
+  branches: [
+    "protection",
+    "protection.required_deployments",
+    "protection.required_pull_request_reviews",
+    "protection.required_status_checks",
+    "protection.restrictions",
+  ],
+};
 
 export type EntriesForm = Json[] | { [UNDECLARED_KEY]?: "keep" | "delete"; entries: Json[] };
 
@@ -188,8 +210,8 @@ export function generatorFromSlice(slice: z.ZodType, seed: SliceSeed = {}): (rng
 function drawObject(schema: z.ZodType, seed: SliceSeed, rng: Rng): Json {
   const entry: Json = {};
   for (const [field, child] of Object.entries(defOf(schema).shape ?? {})) {
-    const optional = defOf(child).type === "optional";
-    if (optional && !rng.bool(seed.present?.[field] ?? 0.5)) {
+    const omittable = ["optional", "default"].includes(defOf(child).type);
+    if (omittable && !rng.bool(seed.present?.[field] ?? 0.5)) {
       continue;
     }
     const pool = seed.fields?.[field];

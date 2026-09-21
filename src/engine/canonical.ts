@@ -33,6 +33,8 @@ export const LIST_IDENTITY: Readonly<Record<string, string>> = {
   labels: "name",
   rulesets: "name",
   "rulesets[].rules": "type",
+  "rulesets[].rules[].parameters.code_scanning_tools": "tool",
+  "rulesets[].rules[].parameters.required_reviewers": "reviewer.id",
   environments: "name",
   "environments[].deployment_branch_policies": "name",
   "environments[].deployment_protection_rules": "app",
@@ -54,6 +56,9 @@ export const LIST_IDENTITY: Readonly<Record<string, string>> = {
   custom_properties: "property_name",
   deploy_keys: "title",
   secret_scanning_custom_patterns: "name",
+  // GitHub keys a required check by (context, app_id) and allows one context under two Apps; the
+  // walk takes one field, so the name sorts and the canonical-JSON tiebreak orders the App ids.
+  "branches[].protection.required_status_checks.checks": "context",
 };
 
 /**
@@ -65,7 +70,15 @@ export const LISTS_AS_WRITTEN: Readonly<Record<string, string>> = {
     "GitHub applies overlapping wildcard rules in creation order, and apply creates the entries in file order",
   "rulesets[].bypass_actors":
     "an actor is a pair of fields GitHub keys, with no one identity field",
+  "rulesets[].rules[].parameters.required_status_checks":
+    "a check is a context and an integration_id GitHub keys together, with no one identity field",
+  "rulesets[].rules[].parameters.workflows":
+    "a workflow is a repository_id, path, and ref GitHub keys together, with no one identity field",
+  "rulesets[].rules[].parameters.dismissal_restriction.allowed_actors":
+    "an actor is a type and an id, with no one identity field",
   "environments[].reviewers": "a reviewer is a type and an id, with no one identity field",
+  "repository.security_and_analysis.secret_scanning_delegated_bypass_options.reviewers":
+    "a reviewer is a type and an id, with no one identity field",
 };
 
 /** The list whose leading entries carry a rank: `pinned: true` environments lead, in their written order. */
@@ -198,6 +211,7 @@ function admits(schema: z.ZodType, value: unknown): boolean {
     case "record":
       return isPlainObject(value);
     case "optional":
+    case "default":
       return value === undefined || admits(def.innerType as z.ZodType, value);
     case "nullable":
       return value === null || admits(def.innerType as z.ZodType, value);
@@ -242,6 +256,7 @@ function canonicalNode(value: unknown, schema: z.ZodType | undefined, path: stri
   switch (def.type) {
     case "optional":
     case "nullable":
+    case "default":
       return canonicalNode(value, def.innerType as z.ZodType, path);
     case "object": {
       if (!isPlainObject(value)) {

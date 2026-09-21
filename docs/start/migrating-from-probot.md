@@ -20,14 +20,16 @@ The app applies settings from a hosted GitHub App installation, and when somethi
 | Rulesets | Experimental upstream feature; schema may change | First class: branch, tag, and push targets, upsert by name; undeclared rulesets kept by default, `_undeclared: delete` opts into deletion |
 | Partial success policy | None | on-missing-permission: fail or warn, plus required-sections as a minimum-requirements floor |
 | Token | App installation token; its scope is invisible in the repo | A PAT you mint and scope yourself; permission errors name the exact missing permission |
-| Org-level shared config | Yes (org _settings repo with extends) | Yes: `mode: merge` folds shared layers into each repository's document, and multi-repo mode applies per-repo files (repos-dir), each repo's own settings.yml (repos input), or a defaults-file fallback for repositories without one; no hosted app needed |
+| Org-level shared config | Yes (org _settings repo with extends) | Yes: `mode: render` folds shared layers into each repository's document, and multi-repo mode applies per-repo files (repos-dir), each repo's own settings.yml (repos input), or a defaults-file fallback for repositories without one; no hosted app needed |
 | Call transparency | None | Every API call is traced as a debug line (method, path, payload, status, timing) when debug logging is on |
 
-The one Probot-family feature without a direct equivalent is suborg-level grouping (safe-settings' .github/suborgs layer); here the layers are settings files folded by `mode: merge` (see the [layering guide](../operate/layering.md)). Everything else in Probot's schema is supported, plus the rows above.
+The one Probot-family feature without a direct equivalent is suborg-level grouping (safe-settings' .github/suborgs layer); here the layers are settings files folded by `mode: render` (see the [layering guide](../operate/layering.md)). Everything else in Probot's schema is supported, plus the rows above.
 
 ## What carries over as-is
 
-Your existing settings.yml keeps working for `repository`, `labels`, `branches`, `collaborators`, `teams`, and `milestones`: their original Probot shapes remain compatible, including label renames via `new_name` and `protection: null` to remove branch protection. For the list sections among them the compatible shape is the plain array - the wrapped `{_undeclared, entries}` form is this action's own extension on top. This list is the parity claim the contract tests pin. The sections outside that list (`rulesets`, `autolinks`, `actions`, `workflows`, `pages`, `code_scanning_default_setup`, and the rest) are not covered by the parity guarantee; the check run below tells you whether such a section validates as-is.
+Your existing settings.yml keeps working for `repository`, `labels`, `branches`, `collaborators`, `teams`, and `milestones`: their original Probot shapes remain compatible, including label renames via `new_name` and `protection: null` to remove branch protection. For the list sections among them the compatible shape is the plain array - the wrapped form (`{_undeclared, entries}`, or `{_layering, entries}` on `branches`, whose wrapper takes no policy) is this action's own extension on top.
+
+This list is the parity claim the contract tests pin. The sections outside that list (`rulesets`, `autolinks`, `actions`, `workflows`, `pages`, `code_scanning_default_setup`, and the rest) are not covered by the parity guarantee; the check run below tells you whether such a section validates as-is.
 
 YAML anchors, aliases, and merge keys (`<<`) resolve as they did under the app's js-yaml parser, so a label list built from one `&base` entry and `<<: *base` variants keeps its meaning.
 
@@ -93,7 +95,7 @@ Re-run check. Once the report is clean, or shows only the drift you expect, swit
 
 The app's `extends` inheritance, where repositories pull shared settings from an org settings repository, maps to two mechanisms:
 
-- Composition is `mode: merge` layers: the shared file is the lowest layer, the repository's own file the highest, and a merge step writes the document the apply step runs. The [layering guide](../operate/layering.md) owns the rules and has the two-step workflow.
+- Composition is `mode: render` layers: the shared file is the lowest layer, the repository's own file the highest, and a render step writes the document the apply step runs. The [layering guide](../operate/layering.md) owns the rules and has the two-step workflow.
 - Delivery at org scale is multi-repo mode: one admin repository applies per-repo files (`repos-dir`) or each repository's own settings.yml (`repos`), with a `defaults-file` as the fallback for repositories that have no file. No hosted app is in the loop. The [multi-repo guide](../operate/multi-repo.md) owns those rules.
 
 ## At org scale: the shadow run

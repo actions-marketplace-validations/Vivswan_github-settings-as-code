@@ -1,11 +1,14 @@
 /**
- * `rulesets:` section: upsert by name with a full-payload PUT, because a partial PUT silently narrows a
- * ruleset. The list carries summaries, so each matched ruleset is read whole before the comparison.
+ * `rulesets:` section: upsert by name with a full-payload PUT. The write replaces the ruleset whole, so the
+ * comparison sweeps the live body for a non-empty value the entry omits (drift in check, a refused write in apply);
+ * target and enforcement are never omitted, since the slice fills them at parse.
+ * The list carries summaries, so each matched ruleset is read whole before the comparison.
  */
 
 import { z } from "zod";
 import { agree } from "../../text.js";
 import type { EndpointDecl } from "../contract/endpoints.js";
+import { keyedBy } from "../contract/module.js";
 import { exactName, type ListWrite, listSection } from "../shared/list-section.js";
 import { RulesetConfig } from "./schema.js";
 
@@ -29,9 +32,6 @@ export function normalizeRefName(value: string, target: string): string {
 
 export function normalizeRuleset(ruleset: RulesetConfig): RulesetConfig {
   const copy = structuredClone(ruleset);
-  copy.target = copy.target ?? "branch";
-  // The create endpoint requires enforcement; "active" is the useful default.
-  copy.enforcement = copy.enforcement ?? "active";
   const target = copy.target;
   const refName = copy.conditions?.ref_name;
   if (refName && target !== "push") {
@@ -42,7 +42,27 @@ export function normalizeRuleset(ruleset: RulesetConfig): RulesetConfig {
       refName.exclude = refName.exclude.map((v) => normalizeRefName(v, target));
     }
   }
+  if (copy.bypass_actors !== undefined) {
+    copy.bypass_actors = copy.bypass_actors.map(asStored);
+  }
   return copy;
+}
+
+/**
+ * An actor as GitHub stores it, on both operands of the comparison: the mode defaults to "always" (so an omitted
+ * mode is compared, not silently reset by the PUT), and an OrganizationAdmin actor's id, which GitHub ignores and
+ * answers as 1 or null, is 1.
+ */
+function asStored<A extends { actor_type?: unknown; actor_id?: unknown; bypass_mode?: unknown }>(
+  actor: A,
+): A {
+  // Assignment keeps a present key's position, so the line quoting the live actor reads in GitHub's order.
+  const stored = { ...actor };
+  stored.bypass_mode = actor.bypass_mode ?? "always";
+  if (actor.actor_type === "OrganizationAdmin") {
+    stored.actor_id = 1;
+  }
+  return stored;
 }
 
 /** The rule types a ruleset repeats; rules pair by type, so a repeat has no pairing. */
@@ -75,11 +95,26 @@ const LiveRuleset = z.looseObject({
   name: z.string(),
   source_type: z.string().optional(),
   rules: z.array(z.looseObject({ type: z.string() })).optional(),
+  // In GitHub's field order: the parsed shape sets the key order the drift line quotes a live actor in.
+  bypass_actors: z
+    .array(
+      z.looseObject({
+        actor_id: z.number().nullable().optional(),
+        actor_type: z.string().optional(),
+        bypass_mode: z.string().optional(),
+      }),
+    )
+    .optional(),
 });
 type LiveRuleset = z.infer<typeof LiveRuleset>;
 
-/** A live body repeating a rule type has no pairing either; GitHub keeps one rule per type, so this names a defect worth a look. */
-function pairableRuleset(live: LiveRuleset): LiveRuleset {
+/**
+ * The live body as the comparison reads it: its actors as stored (the same fold the declared side gets, so a live
+ * OrganizationAdmin id of null cannot loop against the declared 1), and its bypass_actors key kept absent when GitHub
+ * concealed it. A live body repeating a rule type has no pairing; GitHub keeps one rule per type, so that names a
+ * defect worth a look.
+ */
+function comparableRuleset(live: LiveRuleset): LiveRuleset {
   const repeated = repeatedRuleTypes(live.rules);
   if (repeated !== undefined) {
     throw new Error(
@@ -87,13 +122,16 @@ function pairableRuleset(live: LiveRuleset): LiveRuleset {
         "so its rules cannot be paired by type; delete the repeated rule on GitHub, then re-run",
     );
   }
-  return live;
+  return live.bypass_actors === undefined
+    ? live
+    : { ...live, bypass_actors: live.bypass_actors.map(asStored) };
 }
 
-// Rules pass through verbatim, so a typo'd rules[].type reaches GitHub unchanged and comes back as
-// a 422; the valid types live in the endpoint docs, not here, so they cannot go stale.
+// A rule type the vendored spec does not know passes through verbatim (schema.ts UnknownRule), so a
+// typo'd rules[].type reaches GitHub unchanged and comes back as a 422 naming it; a known type's
+// parameters were already checked at parse, so what is left for GitHub is what only the live repository can judge.
 const RULES_HINT =
-  'Usually this means a rules[].type GitHub does not recognize, or "parameters" that do not fit that rule type (rules pass through verbatim, so a typo reaches GitHub unchanged)';
+  'Usually this means a rules[].type GitHub does not recognize (a type the vendored spec does not know passes through verbatim, so a typo reaches GitHub unchanged), or "parameters" the live repository rejects for that rule type';
 
 const ENDPOINTS = {
   list: {
@@ -132,13 +170,14 @@ export const rulesetsSection = listSection({
   identity: { field: "name", fold: exactName },
   address: (live) => ({ ruleset_id: String(live.id) }),
   lens: {
-    // The full ruleset is the wire body (a partial PUT narrows a ruleset). The slice types rule
+    // The full ruleset is the wire body (the PUT replaces it whole). The slice types rule
     // parameters and bypass actors as unknown passthrough; the factory proves the body plain at the payload.
     toWrite: (ruleset) => ({ ...normalizeRuleset(ruleset) }) as ListWrite<"name">,
-    fromLive: (live) => pairableRuleset(live),
-    // Rules pair by type, as the layered merge does; every other list pairs by shape.
-    matchBy: { rules: "type" },
+    fromLive: (live) => comparableRuleset(live),
+    // Rules pair by type, as the layered merge does; an actor is one per (type, id) pair, with no single identity field.
+    matchBy: { rules: "type", bypass_actors: ["actor_type", "actor_id"] },
   },
+  replaces: true,
   // GitHub keeps one rule per type, and the comparison pairs rules by it, so a repeated type is a settings-file mistake.
   conflicts: {
     declared: (writes) =>
@@ -171,14 +210,5 @@ export const rulesetsSection = listSection({
           },
         ],
   prose: { undeclaredAction: "DELETE it" },
-  layering: {
-    combine: "merge",
-    nested: {
-      rules: {
-        keys: (rule) => (typeof rule.type === "string" ? [rule.type] : null),
-        keyField: "type",
-        combine: "replace",
-      },
-    },
-  },
+  layering: { nested: { rules: keyedBy("type") } },
 });

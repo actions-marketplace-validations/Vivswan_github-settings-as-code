@@ -7,9 +7,11 @@
 
 import { z } from "zod";
 import type { EndpointDecl } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   defaultUndeclaredPolicy,
+  keyedBy,
   loosen,
   ORG_PROBE,
   type SectionMeta,
@@ -104,18 +106,22 @@ async function probeTeamRole(
  * declared entries do); plan() and snapshot() both index through it.
  */
 function teamsBySlug(section: SectionMeta, live: readonly LiveTeam[]): Map<string, LiveTeam> {
-  return liveByIdentity(
-    section,
-    "team",
-    live,
-    (team) => team.slug.toLowerCase(),
-    (team) => liveIdentity(team.slug, { team_id: team.id }),
+  return raise(
+    liveByIdentity(
+      section,
+      "team",
+      live,
+      (team) => team.slug.toLowerCase(),
+      (team) => liveIdentity(team.slug, { team_id: team.id }),
+    ),
   );
 }
 
 export const teamsSection = {
   key: "teams",
   undeclaredDefault: "keep",
+  // The fold plan() passes to rejectDuplicates: slugs fold case-insensitively.
+  layering: keyedBy("name", { fold: (name) => name.toLowerCase() }),
   permission,
   // Teams exist only under an organization owner; the registry's owner gate (contract/owner.ts) probes the `org` role.
   ownerSensitivity: "org",
@@ -129,11 +135,13 @@ export const teamsSection = {
   },
   async plan(ctx, declared) {
     const { policy, entries: desired } = undeclaredPolicy(declared, defaultUndeclaredPolicy(this));
-    rejectDuplicates(
-      this,
-      desired,
-      (t) => t.name.toLowerCase(),
-      (t) => t.name,
+    raise(
+      rejectDuplicates(
+        this,
+        desired,
+        (t) => t.name.toLowerCase(),
+        (t) => t.name,
+      ),
     );
     const plan: SectionPlan<PlannedOp<typeof ENDPOINTS>> = { ops: [], notes: [], drift: [] };
     // The listing is read BEFORE the declared walk, so the undeclared teams are judged against the state the grants

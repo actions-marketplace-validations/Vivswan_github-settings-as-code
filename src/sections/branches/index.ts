@@ -11,11 +11,19 @@
 import { z } from "zod";
 import { subsetDiff } from "../../engine/diff.js";
 import { matchesRejection } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
-import { loosen, type SectionMeta, type SectionModule } from "../contract/module.js";
+import {
+  keyedBy,
+  listEntries,
+  loosen,
+  type SectionMeta,
+  type SectionModule,
+} from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
 import { plainData } from "../contract/plan.js";
 import { rejectDuplicates } from "../contract/requests.js";
+import { layeredList } from "../shared/schema-helpers.js";
 import { ENDPOINTS, MISSING_BRANCH } from "./endpoints.js";
 import {
   type BranchesContext,
@@ -39,6 +47,7 @@ import {
   WILDCARD_KEYS,
   wildcardSnapshot,
 } from "./graphql-rules.js";
+import { isGetOnlyKey } from "./keys.js";
 import { type BranchConfig, BranchesConfig, type BranchProtectionConfig } from "./schema.js";
 
 const REQUIRED_PROTECTION_KEYS = [
@@ -62,20 +71,22 @@ const STATUS_CHECK_ALIASES: Readonly<Record<string, string>> = {
 
 /**
  * Nothing the replacing PUT would need to preserve: GitHub's default fill under a declared block,
- * an empty list, or an actor holder with empty lists. Any other nested object is a control that is
- * ON by its presence.
+ * an empty list, or a review-side actor holder with empty lists (GitHub reads it as off and omits
+ * it). Any other nested object is a control that is ON by its presence, `restrictions` included:
+ * an all-empty one restricts pushes to nobody, and the GET omits the key only when unrestricted.
  */
-function isEmptySetting(value: unknown): boolean {
+function isEmptySetting(key: string, value: unknown): boolean {
   if (value === null || value === undefined || value === false || value === "" || value === 0) {
     return true;
   }
   if (Array.isArray(value)) {
     return value.length === 0;
   }
-  if (isPlainMapping(value)) {
+  if (isPlainMapping(value) && REVIEW_ACTOR_HOLDER_SET.has(key)) {
     const keys = Object.keys(value);
     return (
-      keys.length > 0 && keys.every((key) => ACTOR_LIST_KEYS.has(key) && isEmptySetting(value[key]))
+      keys.length > 0 &&
+      keys.every((inner) => ACTOR_LIST_KEYS.has(inner) && isEmptySetting(inner, value[inner]))
     );
   }
   return false;
@@ -105,7 +116,7 @@ function omittedLiveDrift(
     if (alias !== undefined && Object.hasOwn(declared, alias.slice(alias.lastIndexOf(".") + 1))) {
       continue;
     }
-    if (isEmptySetting(value)) {
+    if (isEmptySetting(key, value)) {
       continue;
     }
     drift.push(
@@ -167,11 +178,16 @@ export const branchesSection = {
   graphql: GRAPHQL,
   // The wildcard key sweep composes HERE, not in schema.ts: it reads the GraphQL translation tables,
   // which are this section's own machinery, and nothing outside them can reach a wildcard rule.
-  shape: loosen(BranchesConfig).superRefine((declared, refineCtx) => {
-    if (!Array.isArray(declared)) {
-      return;
-    }
-    declared.forEach((entry: BranchConfig, index) => {
+  shape: loosen(layeredList(BranchesConfig)).superRefine((declared, refineCtx) => {
+    // The routed shape parsed one of the two forms; under the wrapper an issue's path starts at `entries`.
+    const wrapped = !Array.isArray(declared);
+    const entries = listEntries(declared as BranchConfig[] | { entries: BranchConfig[] });
+    const at = (index: number, ...rest: string[]): (string | number)[] => [
+      ...(wrapped ? ["entries"] : []),
+      index,
+      ...rest,
+    ];
+    entries.forEach((entry: BranchConfig, index) => {
       if (!isWildcardPattern(entry.name) || entry.protection === null) {
         return;
       }
@@ -180,39 +196,27 @@ export const branchesSection = {
         if (!WILDCARD_KEY_SET.has(key)) {
           refineCtx.addIssue({
             code: "custom",
-            path: [index, "protection", key],
+            path: at(index, "protection", key),
             message: WILDCARD_KEY_ERROR(entry.name, key),
           });
         }
       }
       // The structured pairs translate NAMED sub-keys only, so an unknown sub-key would be silently
-      // lost; a non-object value is rejected too, since nothing downstream could translate it.
+      // lost; the schema already holds each pair to a mapping or null.
       const nested: Array<[string, Record<string, string>]> = [
         ["required_status_checks", GRAPHQL_STATUS_CHECK_TWINS],
         ["required_pull_request_reviews", GRAPHQL_REVIEW_TWINS],
       ];
       for (const [key, twins] of nested) {
         const value = protection[key];
-        if (value === null || value === undefined) {
-          continue;
-        }
-        if (typeof value !== "object" || Array.isArray(value)) {
-          refineCtx.addIssue({
-            code: "custom",
-            path: [index, "protection", key],
-            message:
-              `the wildcard entry "${entry.name}" declares protection.${key} as ` +
-              `${Array.isArray(value) ? "a list" : JSON.stringify(value)}, but on a wildcard ` +
-              `rule it must be a mapping of its sub-keys [${Object.keys(twins).join(", ")}], or ` +
-              `null to turn the control off`,
-          });
+        if (!isPlainMapping(value)) {
           continue;
         }
         for (const subKey of Object.keys(value)) {
           if (!(subKey in twins)) {
             refineCtx.addIssue({
               code: "custom",
-              path: [index, "protection", key, subKey],
+              path: at(index, "protection", key, subKey),
               message: WILDCARD_KEY_ERROR(entry.name, `${key}.${subKey}`),
             });
           }
@@ -220,20 +224,34 @@ export const branchesSection = {
       }
     });
   }),
+  // Branch names and patterns are verbatim keys, as plan() rejects duplicates. `protection: null` (no protection) and a
+  // null under it (a core control or required_deployments turned off) are values the entry schema types, never delete markers.
+  layering: keyedBy("name", {
+    nullValued: [
+      "protection",
+      "protection.required_deployments",
+      "protection.required_pull_request_reviews",
+      "protection.required_status_checks",
+      "protection.restrictions",
+    ],
+  }),
   async plan(ctx, desired): Promise<BranchesPlan> {
+    const branches = listEntries(desired);
     // Two entries for one branch or pattern would overwrite each other's write on every run.
-    rejectDuplicates(
-      this,
-      desired,
-      (b) => b.name,
-      (b) => b.name,
+    raise(
+      rejectDuplicates(
+        this,
+        branches,
+        (b) => b.name,
+        (b) => b.name,
+      ),
     );
     const plan: BranchesPlan = { ops: [], notes: [], drift: [] };
     // The first entry that needs the GraphQL surface starts the one rules read, ahead of every REST
     // probe; a pure-REST declaration never starts it, so no separate predicate gates the fetch.
     let graphqlRun: GraphqlRun | null = null;
     const entries: ClassifiedEntry[] = [];
-    for (const branch of desired) {
+    for (const branch of branches) {
       const protection: SplitProtection | null = branch.protection;
       if (isWildcardPattern(branch.name)) {
         graphqlRun ??= await startGraphqlRun(ctx);
@@ -246,7 +264,7 @@ export const branchesSection = {
       }
     }
     if (graphqlRun !== null) {
-      const declaredPatterns = new Set(desired.map((branch) => branch.name));
+      const declaredPatterns = new Set(branches.map((branch) => branch.name));
       for (const pattern of [...(graphqlRun.rules?.keys() ?? [])].sort()) {
         if (isWildcardPattern(pattern) && !declaredPatterns.has(pattern)) {
           plan.notes.push(
@@ -288,12 +306,14 @@ export const branchesSection = {
       query: { protected: "true" },
     });
     // Git refnames are exact, so the fold is the name itself.
-    liveByIdentity(
-      this,
-      "protected branch",
-      listed,
-      (branch) => branch.name,
-      (branch) => liveIdentity(branch.name),
+    raise(
+      liveByIdentity(
+        this,
+        "protected branch",
+        listed,
+        (branch) => branch.name,
+        (branch) => liveIdentity(branch.name),
+      ),
     );
     const rules = await fetchRulesForSnapshot(ctx);
     const entries: BranchConfig[] = [];
@@ -508,17 +528,10 @@ async function planLiteralEntry(
  * like. Exported so the e2e state tests can assert their protectionFromPut inverts this exact function.
  */
 export function flattenProtection(live: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(live)) {
-    if (GET_ONLY_KEYS.has(key) || isUrlKey(key)) {
-      continue;
-    }
-    out[key] = flattenValue(value);
-  }
+  const out = flattenValue(live) as Record<string, unknown>;
   const checks = out.required_status_checks;
   if (isPlainMapping(checks)) {
-    const { enforcement_level: _level, ...status } = checks;
-    out.required_status_checks = putStatusChecks(status);
+    out.required_status_checks = putStatusChecks(checks);
   }
   return out;
 }
@@ -530,7 +543,7 @@ export function flattenProtection(live: Record<string, unknown>): Record<string,
  * the PUT still requires `contexts` beside `checks`, so a body carrying only `checks` (a mock
  * storing a PUT verbatim) gets the names derived from it.
  */
-function putStatusChecks(status: Record<string, unknown>): Record<string, unknown> {
+function putStatusChecks<T extends Record<string, unknown>>(status: T): T {
   if (!Array.isArray(status.checks)) {
     return status;
   }
@@ -544,11 +557,6 @@ function putStatusChecks(status: Record<string, unknown>): Record<string, unknow
       );
   return { ...status, checks, contexts };
 }
-
-// GET-only metadata the PUT vocabulary has no word for (url keys drop generically).
-const GET_ONLY_KEYS: ReadonlySet<string> = new Set(["name", "enabled"]);
-
-const isUrlKey = (key: string): boolean => key === "url" || key.endsWith("_url");
 
 const ACTOR_NAME_KEYS = ["login", "slug"] as const;
 const ACTOR_LIST_KEYS = new Set(["users", "teams", "apps"]);
@@ -571,8 +579,9 @@ function foldActorNames(protection: Record<string, unknown>): Record<string, unk
 }
 
 // The two actor holders GitHub serves only when they name someone: an all-empty one is "no
-// restriction", and the GET omits the key.
+// restriction", and the GET omits the key. The top-level `restrictions` is NOT one of them.
 const REVIEW_ACTOR_HOLDERS = ["dismissal_restrictions", "bypass_pull_request_allowances"] as const;
+const REVIEW_ACTOR_HOLDER_SET: ReadonlySet<string> = new Set(REVIEW_ACTOR_HOLDERS);
 
 /**
  * A live review block without a holder reads as the all-empty holder, so a declared empty one is
@@ -622,8 +631,8 @@ function flattenValue(value: unknown): unknown {
         }
         return actor;
       });
-    } else if (isUrlKey(key)) {
-      // URLs never appear in the PUT shape.
+    } else if (isGetOnlyKey(key)) {
+      // The GET-only vocabulary at any depth (keys.ts); the schema refuses the same keys in a declaration.
     } else {
       out[key] = flattenValue(inner);
     }

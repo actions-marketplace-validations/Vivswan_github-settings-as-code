@@ -4,11 +4,46 @@ order: 130
 
 # Semantics
 
-The rules every section obeys, whatever it manages: what the engine compares, what it deletes, which errors can be softened, and what happens around a failure. The [Sections table](sections.md) says what each section does; this page is the model those behaviors share. Read it when you need to predict what an apply or a check will do before running it.
+The rules every section obeys, whatever it manages: what the file itself can get wrong, what the engine compares, what it deletes, which errors can be softened, and what happens around a failure. The [Sections table](sections.md) says what each section does; this page is the model those behaviors share. Read it when you need to predict what an apply or a check will do before running it.
 
-The engine is stateless and declared-keys-only: a key you do not declare is never touched or compared. There is no state file; resources are matched by their natural names. Removing a section from the file stops managing it - it does not revert anything.
+The engine is stateless and declared-keys-only: a key you do not declare is never touched or compared, except under the three replacing writes below, where an omitted live value is reported because the write would clear it.
+There is no state file; resources are matched by their natural names. Removing a section from the file stops managing it - it does not revert anything.
+
+Three writes carry the whole object, the ruleset PUT, the environment PUT, and the branch protection PUT, so a live value under a declared ruleset, environment, or protected branch that its entry leaves out would be removed by that write.
+
+Check reports each one as drift naming the key (`bypass_actors`, `conditions.ref_name.exclude`, `reviewers`, `required_status_checks`).
+
+For a ruleset or an environment, apply refuses that write: the entry fails with the same line and nothing of it is written, until the file says which is meant.
+
+Declare the key to keep the value, or declare it empty (`bypass_actors: []`, `reviewers: []`, `deployment_branch_policy: null`) to remove it on purpose. Empty values (an empty list, a zero, false, null) never count.
+A ruleset's `target` and `enforcement` never count either: an entry without them is parsed with `branch` and `active`, so a live value under either key is compared, not reported as omitted.
+
+The sweep stops where the settings schema stops naming keys, inside `rules[].parameters` and a bypass actor's own fields, because there it cannot tell a default GitHub filled from a value the file left out.
+A live `require_code_owner_review: true` beside a declared `pull_request` rule reads clean, and the PUT resets it.
 
 Apply is convergent: re-running preserves the declared state (some sections diff first and skip converged writes, others send idempotent full-payload writes), and a check right after an apply reports clean.
+
+## What the parse refuses
+
+Anything the settings file alone proves wrong is refused when the file is parsed, before any section reads or writes the repository, with an error naming the key and the fix. That covers a field GitHub reports but cannot set, a value outside its enum, two keys that contradict each other, and an unknown key inside a closed shape.
+
+Under `private-repos: redact` the multi-repo flow reads and validates the shared `defaults-file` first when one is given, then resolves the visibility of every target but the workflow's own repository, before it reads any target's settings file. Then it reads each target's file: a remote target's from that repository, a `repos-dir` target's from the local directory. Those are the flow's own reads; no section has run for that target.
+
+The field GitHub reports but cannot set is the case that motivated the rule:
+
+| | `repository.has_downloads: false` in the file |
+| --- | --- |
+| Before | The GET reports `has_downloads`, the PATCH cannot set it, so every check saw drift and every apply re-sent it without converging. |
+| Now | The parse refuses the file with an error naming `repository.has_downloads` and telling you to remove the key. No section reads or writes the repository. |
+
+An unknown key has two fates, decided by the shape it sits in:
+
+| Shape | Unknown key | What you see |
+| --- | --- | --- |
+| Closed: the write carries only the fields the shape names, so an extra key has nowhere to go | refused at parse | the error names the key and the shape it sits in |
+| Open passthrough: extra fields ride into the write verbatim, so a field GitHub ships tomorrow works today | kept and sent | on the sections that already print it, a check-time note when GitHub does not echo the key: if GitHub ignores it, every apply re-sends it without converging |
+
+The [forward compatibility page](forward-compatibility.md#the-closed-sections) lists which sections and nested shapes are closed.
 
 ## What happens to undeclared resources
 
@@ -28,6 +63,8 @@ Rate limits (429 and secondary limits) and transient 5xx or network failures are
 
 ## The preflight barrier
 
-Under `on-missing-permission: fail`, every declared section is probed read-only before ANY write; if a section is inaccessible, nothing is applied at all (per repository in multi-repo mode; earlier targets in the same run are already done). The API has no transactions; a read-but-not-write token can still fail mid-apply, and a section whose reads need no grant at all (`custom_properties` - its values read is Metadata-gated) surfaces a missing write grant only at its first write. Re-running after fixing it converges because applies are idempotent.
+Under `on-missing-permission: fail`, every declared section is probed read-only before ANY write. If a section is inaccessible, nothing is applied at all (per repository in multi-repo mode; earlier targets in the same run are already done).
+
+The API has no transactions. A read-but-not-write token can still fail mid-apply, and a section whose reads need no grant at all (`custom_properties` - its values read is Metadata-gated) surfaces a missing write grant only at its first write. Re-running after fixing it converges because applies are idempotent.
 
 See [COVERAGE.md](https://github.com/Vivswan/github-settings-as-code/blob/main/COVERAGE.md) for the full inventory: everything supported, every repo-scoped gap, and the user-scoped surface that is out of scope by design.

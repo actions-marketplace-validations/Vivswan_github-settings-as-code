@@ -1,17 +1,24 @@
 import { z } from "zod";
-import { subsetDiff } from "../../engine/diff.js";
+import { omittedDeltas, refuseOmitted, renderDelta, subsetDiff } from "../../engine/diff.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   type DeclaredSecretValue,
+  type KeyedListLayering,
+  keyedBy,
+  listEntries,
   loosen,
   missingDrift,
   type SectionModule,
+  secretValuesOf,
 } from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
 import { hasDrift, plainData } from "../contract/plan.js";
 import { rejectDuplicates } from "../contract/requests.js";
-import { listSecretValues } from "../shared/secrets-engine.js";
-import { projectOntoSchema } from "../shared/snapshot-helpers.js";
+import { layeredList } from "../shared/schema-helpers.js";
+import { listSecretValues, secretKey } from "../shared/secrets-engine.js";
+import { projectOntoSchema, replaceSweep } from "../shared/snapshot-helpers.js";
+import { variableKey } from "../shared/variables-engine.js";
 import { ENDPOINTS } from "./endpoints.js";
 import { NESTED_KEYS, planNested, splitEntry } from "./nested.js";
 import {
@@ -66,6 +73,13 @@ const permission: SectionPermission = { repo: ["environments"] };
 const NESTED_OVERRIDES_CAVEAT =
   'declared "deployment_branch_policies" and "deployment_protection_rules" keys additionally need "Actions" (read) and "Administration" (read and write)';
 
+/** A reviewer is a `type` and a numeric `id`; users and teams number from separate spaces, so the pair is the key. */
+const REVIEWER_LAYERING: KeyedListLayering = {
+  keyField: "id",
+  keyKind: "numeric",
+  keys: (entry) => (typeof entry.id === "number" ? [`${String(entry.type)}:${entry.id}`] : null),
+};
+
 export const environmentsSection = {
   key: "environments",
   undeclaredDefault: "untouched",
@@ -73,20 +87,31 @@ export const environmentsSection = {
   grantCaveat: NESTED_OVERRIDES_CAVEAT,
   endpoints: ENDPOINTS,
   graphql: GRAPHQL_OPS,
-  shape: loosen(EnvironmentsConfig),
+  shape: loosen(layeredList(EnvironmentsConfig)),
+  /**
+   * Environment names fold as plan() probes them (case-insensitive). The nested lists union by the key each
+   * planner reconciles by: variable and secret names uppercased as GitHub stores them, branch policies by their
+   * pattern, protection rules by App slug, reviewers by type and id. `deployment_branch_policy: null` is the entry's
+   * own "no restriction" value, never a delete marker.
+   */
+  layering: keyedBy("name", {
+    fold: (name) => name.toLowerCase(),
+    nullValued: ["deployment_branch_policy"],
+    nested: {
+      variables: keyedBy("name", { fold: variableKey }),
+      secrets: keyedBy("name", { fold: secretKey }),
+      deployment_branch_policies: keyedBy("name"),
+      deployment_protection_rules: keyedBy("app"),
+      reviewers: REVIEWER_LAYERING,
+    },
+  }),
   /**
    * Labels carry the environment: sibling environments can declare same-named secrets.
    * A malformed container contributes nothing rather than throwing, so the actionable error
    * always comes from shape validation.
    */
   secretValues(declared: unknown): DeclaredSecretValue[] {
-    if (!Array.isArray(declared)) {
-      return [];
-    }
-    return declared.flatMap((entry) => {
-      if (typeof entry !== "object" || entry === null) {
-        return [];
-      }
+    return secretValuesOf(declared, (entry) => {
       const env = entry as EnvironmentConfig;
       const where =
         typeof env.name === "string" ? `environment "${env.name}"` : "an unnamed environment";
@@ -97,16 +122,19 @@ export const environmentsSection = {
     });
   },
   async plan(ctx, desired) {
-    rejectDuplicates(
-      this,
-      desired,
-      (env) => env.name.toLowerCase(),
-      (env) => env.name,
+    const environments = listEntries(desired);
+    raise(
+      rejectDuplicates(
+        this,
+        environments,
+        (env) => env.name.toLowerCase(),
+        (env) => env.name,
+      ),
     );
     const plan: EnvironmentsPlan = { ops: [], notes: [], drift: [] };
     /** Each entry's declared pin state, in file order (order IS the pin order). */
     const pins: PinDeclaration[] = [];
-    for (const env of desired) {
+    for (const env of environments) {
       const { settings, nested, routed } = splitEntry(env);
       const name = env.name;
       const params = { environment_name: name };
@@ -115,10 +143,11 @@ export const environmentsSection = {
         describe: `environment "${name}"`,
       });
       const live = "missing" in probe ? undefined : probe.data;
-      const drift =
+      const label = `environments[${name}]`;
+      const { drift, omitted } =
         live === undefined
-          ? [missingDrift(`environments[${name}]`)]
-          : subsetDiff(settings, flattenEnvironment(live), `environments[${name}]`);
+          ? { drift: [missingDrift(label)], omitted: [] }
+          : environmentDrift(label, settings, flattenEnvironment(live));
       // The pin mutations' node id, off the probe or a created environment's PUT response. A probed
       // body is validated only when a mutation needs it.
       const probedNodeId = live === undefined ? undefined : { node_id: live.node_id };
@@ -139,6 +168,7 @@ export const environmentsSection = {
           role: "update",
           params,
           payload: plainData(settings),
+          before: refuseOmitted(label, omitted),
           drift,
           change: `applied environment "${name}"`,
           describe: `upserting environment "${name}"`,
@@ -174,12 +204,14 @@ export const environmentsSection = {
       return { value: undefined, notes: [] };
     }
     // Environment names are case-insensitive on GitHub, the fold plan() probes and pins by.
-    liveByIdentity(
-      this,
-      "environment",
-      listed,
-      (live) => live.name.toLowerCase(),
-      (live) => liveIdentity(live.name, { environment_id: live.id }),
+    raise(
+      liveByIdentity(
+        this,
+        "environment",
+        listed,
+        (live) => live.name.toLowerCase(),
+        (live) => liveIdentity(live.name, { environment_id: live.id }),
+      ),
     );
     const notes: string[] = [];
     const entries: EnvironmentConfig[] = [];
@@ -194,6 +226,23 @@ export const environmentsSection = {
     return { value: pinned.entries, notes };
   },
 } satisfies SectionModule<"environments", typeof ENDPOINTS, typeof GRAPHQL_OPS>;
+
+/**
+ * The PUT replaces the environment's settings whole (an omitted `reviewers` clears the reviewers rule), so a
+ * non-empty live setting the entry omits is drift too, and the lines it makes (`omitted`) are what apply refuses
+ * the write over. The live body is split the way the entry was, so only the PUT's own keys take part in that sweep.
+ */
+function environmentDrift(
+  label: string,
+  settings: Record<string, unknown>,
+  live: Record<string, unknown>,
+): { drift: string[]; omitted: string[] } {
+  const liveSettings = splitEntry(projectOntoSchema(EnvironmentConfig, live)).settings;
+  const omitted = omittedDeltas(settings, liveSettings, {
+    sweep: replaceSweep(EnvironmentConfig),
+  }).map((delta) => renderDelta(label, delta));
+  return { drift: [...subsetDiff(settings, live, label), ...omitted], omitted };
+}
 
 /**
  * GET nests wait_timer / prevent_self_review / reviewers inside protection_rules[]; translated back

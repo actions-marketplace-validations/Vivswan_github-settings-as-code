@@ -23,6 +23,7 @@ import {
   type GraphqlHandlerResult,
   integrationBody,
   type Json,
+  type MockResponse,
   noContent,
   ok,
   rejected,
@@ -33,6 +34,7 @@ import {
 } from "../../../test/e2e/mock/support.js";
 import { MISSING_BRANCH } from "./endpoints.js";
 import { classicViewOfRule, RuleNode } from "./graphql-rules.js";
+import { BOOLEAN_CONTROL_SET, NULLABLE_CONTROLS } from "./keys.js";
 
 /**
  * GitHub's fnmatch (Ruby's, FNM_PATHNAME) for classic rule patterns: `*` and `?` stop at a slash,
@@ -144,9 +146,12 @@ const isMapping = (value: unknown): value is Json =>
 
 /**
  * The actor holders of a PUT body as GitHub reads them back: logins and slugs in their canonical
- * lowercase, and a review-side holder naming nobody dropped, since GitHub serves
+ * lowercase, a list the review-side holders omit served empty (the PUT takes each of theirs as
+ * optional), and a review-side holder naming nobody dropped, since GitHub serves
  * dismissal_restrictions and bypass_pull_request_allowances only when they name someone.
- * `restrictions` stays whole: an all-empty one restricts pushes to nobody.
+ * `restrictions` stays whole: an all-empty one restricts pushes to nobody, a users or teams list it
+ * omits never reaches here (missingRestrictionListResponse answers the 422 first), and an omitted
+ * apps is served empty.
  */
 function actorsAsGitHubReadsBack(payload: Json): Json {
   const canonical = (holder: Json): ActorHolder => {
@@ -178,6 +183,61 @@ function actorsAsGitHubReadsBack(payload: Json): Json {
     out.required_pull_request_reviews = nested;
   }
   return out;
+}
+
+/**
+ * The boolean controls the protection PUT takes: the GET-wrapped ones minus required_signatures,
+ * which is its own sub-resource. GitHub 422s a non-boolean there, the {url, enabled} wrapper a
+ * copied GET response carries included; null passes only under the NULLABLE_CONTROLS.
+ */
+const PUT_BOOLEAN_CONTROLS = [...BOOLEAN_CONTROL_SET].filter(
+  (key) => key !== "required_signatures",
+);
+
+/** GitHub's "Validation Error Simple" to a PUT body off the protection schema; the validator skips only the body check. */
+function validationFailed(error: string): MockResponse {
+  return {
+    status: 422,
+    body: {
+      message: "Validation Failed",
+      errors: [`Invalid request.\n\n${error}`],
+      documentation_url:
+        "https://docs.github.com/rest/branches/branch-protection#update-branch-protection",
+    },
+    requestOffSpec: true,
+  };
+}
+
+/** The first boolean control whose value the PUT schema refuses. */
+function invalidBooleanControlResponse(payload: Json): MockResponse | null {
+  for (const key of PUT_BOOLEAN_CONTROLS) {
+    if (!Object.hasOwn(payload, key)) {
+      continue;
+    }
+    const value = payload[key];
+    const nullable = NULLABLE_CONTROLS.has(key);
+    if (typeof value === "boolean" || (value === null && nullable)) {
+      continue;
+    }
+    const expected = nullable ? "a boolean or null" : "a boolean";
+    return validationFailed(
+      `For 'properties/${key}', ${JSON.stringify(value)} is not ${expected}.`,
+    );
+  }
+  return null;
+}
+
+/** The PUT schema requires users and teams under restrictions (apps is optional); GitHub names the first list not supplied. */
+const REQUIRED_RESTRICTION_LISTS = ["users", "teams"] as const;
+
+function missingRestrictionListResponse(payload: Json): MockResponse | null {
+  if (!isMapping(payload.restrictions)) {
+    return null;
+  }
+  const missing = REQUIRED_RESTRICTION_LISTS.find(
+    (list) => !Object.hasOwn(payload.restrictions as Json, list),
+  );
+  return missing === undefined ? null : validationFailed(`"${missing}" wasn't supplied.`);
 }
 
 export const branchesMockHandlers: SectionRestHandlers<"branches"> = {
@@ -223,7 +283,13 @@ export const branchesMockHandlers: SectionRestHandlers<"branches"> = {
     if (!state.branches.includes(branch)) {
       return rejected(MISSING_BRANCH);
     }
-    const stored = protectionFromPut(actorsAsGitHubReadsBack(asObject(body)));
+    const payload = asObject(body);
+    const invalid =
+      invalidBooleanControlResponse(payload) ?? missingRestrictionListResponse(payload);
+    if (invalid !== null) {
+      return invalid;
+    }
+    const stored = protectionFromPut(actorsAsGitHubReadsBack(payload));
     // required_signatures is its own sub-resource and absent from the PUT's request schema. Whether
     // GitHub's PUT PRESERVES an existing requirement is undocumented; the mock carries it across as
     // the conservative reading, and the docs tell users to DECLARE the toggle, which pins the state

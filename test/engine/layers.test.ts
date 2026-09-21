@@ -5,6 +5,7 @@ import { validateSettingsDoc } from "../../src/engine/orchestrate.js";
 import { SectionSelection } from "../../src/engine/section-selection.js";
 import { silentIo } from "../../src/io.js";
 import { describeProblem, type LayerProblem } from "../../src/problem.js";
+import { LIST_SECTIONS, type ListSection } from "../../src/schema.js";
 import { planContext } from "../../src/sections/contract/plan.js";
 import { labelsSection } from "../../src/sections/labels/index.js";
 import { MockApi } from "../mock-api.js";
@@ -25,7 +26,7 @@ function layer(name: string, doc: unknown): Layer {
   return { name, doc: deepFreeze(doc) };
 }
 
-function merge(layers: Layer[], layering: Layering = "merge") {
+function merge(layers: Layer[], layering: Layering = "deep") {
   return mergeLayers(layers, { layering }).match(
     (folded) => folded,
     (problem) => ({ code: problem.code, error: describeProblem(problem) }),
@@ -41,7 +42,13 @@ const MAIN_RULESET = {
     { type: "deletion" },
     {
       type: "pull_request",
-      parameters: { required_approving_review_count: 1, dismiss_stale_reviews_on_push: true },
+      parameters: {
+        required_approving_review_count: 1,
+        dismiss_stale_reviews_on_push: true,
+        require_code_owner_review: false,
+        require_last_push_approval: false,
+        required_review_thread_resolution: false,
+      },
     },
   ],
 };
@@ -145,33 +152,48 @@ describe("mergeLayers: the mapping dialect", () => {
     });
   });
 
-  test("arrays outside the keyed sections replace wholesale, whatever the run layering", () => {
-    const layers = [
-      layer("fleet", {
-        autolinks: [{ key_prefix: "F-", url_template: "https://f/<num>" }],
-        branches: [{ name: "main", protection: { enforce_admins: true } }],
-        repository: { topics: ["fleet", "shared"] },
-      }),
-      layer("repo", {
-        autolinks: [{ key_prefix: "R-", url_template: "https://r/<num>" }],
-        branches: [{ name: "release", protection: null }],
-        repository: { topics: ["mine"] },
-      }),
-    ];
-    const expected = {
-      settings: {
-        autolinks: {
-          _undeclared: "delete",
-          entries: [{ key_prefix: "R-", url_template: "https://r/<num>" }],
+  test.each<[Layering, Record<string, unknown>[]]>([
+    [
+      "deep",
+      [
+        { key_prefix: "F-", url_template: "https://f/<num>" },
+        { key_prefix: "R-", url_template: "https://r/<num>" },
+      ],
+    ],
+    [
+      "shallow",
+      [
+        { key_prefix: "F-", url_template: "https://f/<num>" },
+        { key_prefix: "R-", url_template: "https://r/<num>" },
+      ],
+    ],
+    ["replace", [{ key_prefix: "R-", url_template: "https://r/<num>" }]],
+  ])(
+    "lists outside the list sections replace wholesale under %s, while a list section's entries follow the directive",
+    (layering, autolinks) => {
+      // A scalar list and a mapping list inside a mapping section: neither is a list section, so neither unions.
+      const layers = [
+        layer("fleet", {
+          autolinks: [{ key_prefix: "F-", url_template: "https://f/<num>" }],
+          check_suite_preferences: { auto_trigger_checks: [{ app_id: 1, setting: true }] },
+          repository: { topics: ["fleet", "shared"] },
+        }),
+        layer("repo", {
+          autolinks: [{ key_prefix: "R-", url_template: "https://r/<num>" }],
+          check_suite_preferences: { auto_trigger_checks: [{ app_id: 2, setting: false }] },
+          repository: { topics: ["mine"] },
+        }),
+      ];
+      expect(merge(layers, layering)).toEqual({
+        settings: {
+          autolinks: { _undeclared: "delete", entries: autolinks },
+          check_suite_preferences: { auto_trigger_checks: [{ app_id: 2, setting: false }] },
+          repository: { topics: ["mine"] },
         },
-        branches: [{ name: "release", protection: null }],
-        repository: { topics: ["mine"] },
-      },
-      notices: [],
-    };
-    expect(merge(layers, "merge")).toEqual(expected);
-    expect(merge(layers, "replace")).toEqual(expected);
-  });
+        notices: [],
+      });
+    },
+  );
 
   test("a nested key called labels or rulesets below the top level is plain data", () => {
     const result = merge([
@@ -242,46 +264,44 @@ describe("mergeLayers: the mapping dialect", () => {
 });
 
 describe("mergeLayers: keyed sections", () => {
-  test("labels union by name: a same-name entry is replaced wholesale, both sides' extras keep their order", () => {
-    const result = merge([
-      layer("fleet", {
-        labels: [
-          { name: "bug", color: "d73a4a", description: "Fleet bug" },
-          { name: "docs", color: "0075ca", description: "Fleet docs" },
+  test.each<[Layering, Record<string, unknown>]>([
+    ["deep", { name: "docs", color: "ffffff", description: "Fleet docs" }],
+    ["shallow", { name: "docs", color: "ffffff" }],
+  ])(
+    "labels union by name under %s: the same-name entry merges field by field or is swapped, both sides' extras keep their order",
+    (layering, docs) => {
+      const result = merge(
+        [
+          layer("fleet", {
+            labels: [
+              { name: "bug", color: "d73a4a", description: "Fleet bug" },
+              { name: "docs", color: "0075ca", description: "Fleet docs" },
+            ],
+          }),
+          layer("repo", {
+            labels: [
+              { name: "docs", color: "ffffff" },
+              { name: "infra", color: "111111" },
+            ],
+          }),
         ],
-      }),
-      layer("repo", {
-        labels: [
-          { name: "docs", color: "ffffff" },
-          { name: "infra", color: "111111" },
-        ],
-      }),
-    ]);
-    expect(result).toEqual({
-      settings: {
-        labels: {
-          _undeclared: "delete",
-          entries: [
-            { name: "bug", color: "d73a4a", description: "Fleet bug" },
-            { name: "docs", color: "ffffff" },
-            { name: "infra", color: "111111" },
-          ],
+        layering,
+      );
+      expect(result).toEqual({
+        settings: {
+          labels: {
+            _undeclared: "delete",
+            entries: [
+              { name: "bug", color: "d73a4a", description: "Fleet bug" },
+              docs,
+              { name: "infra", color: "111111" },
+            ],
+          },
         },
-      },
-      notices: [],
-    });
-  });
-
-  test("label names match case-insensitively and the higher spelling wins", () => {
-    const result = merge([
-      layer("fleet", { labels: [{ name: "Bug", color: "d73a4a" }] }),
-      layer("repo", { labels: [{ name: "bug", color: "ffffff" }] }),
-    ]);
-    expect(result).toEqual({
-      settings: { labels: { _undeclared: "delete", entries: [{ name: "bug", color: "ffffff" }] } },
-      notices: [],
-    });
-  });
+        notices: [],
+      });
+    },
+  );
 
   /** The labels planner over an empty repository rejects two entries claiming one label, so a merged document it plans is one apply accepts. */
   async function planLabels(entries: readonly Record<string, unknown>[]) {
@@ -293,9 +313,17 @@ describe("mergeLayers: keyed sections", () => {
     return plan.ops.map((op) => op.describe);
   }
 
-  test.each([
+  test.each<
     [
-      "the plain label above the rename",
+      string,
+      Layering,
+      { lower: Record<string, unknown>[]; higher: Record<string, unknown>[] },
+      Record<string, unknown>[],
+    ]
+  >([
+    [
+      "the plain label above the rename, swapped",
+      "shallow",
       {
         lower: [{ name: "bug", new_name: "defect" }],
         higher: [{ name: "defect", color: "ffffff" }],
@@ -303,17 +331,39 @@ describe("mergeLayers: keyed sections", () => {
       [{ name: "defect", color: "ffffff" }],
     ],
     [
-      "the rename above the plain label",
+      "the rename above the plain label, swapped",
+      "shallow",
       {
         lower: [{ name: "defect", color: "ffffff" }],
         higher: [{ name: "bug", new_name: "defect" }],
       },
       [{ name: "bug", new_name: "defect" }],
     ],
+    [
+      "the plain label above the rename, merged: the lower rename target rides along as a self-rename",
+      "deep",
+      {
+        lower: [{ name: "bug", new_name: "defect" }],
+        higher: [{ name: "defect", color: "ffffff" }],
+      },
+      [{ name: "defect", new_name: "defect", color: "ffffff" }],
+    ],
+    [
+      "the rename above the plain label, merged: the lower color rides along",
+      "deep",
+      {
+        lower: [{ name: "defect", color: "ffffff" }],
+        higher: [{ name: "bug", new_name: "defect" }],
+      },
+      [{ name: "bug", color: "ffffff", new_name: "defect" }],
+    ],
   ])(
-    "a label renaming into a name another layer declares is one label, the higher entry (%s)",
-    async (_order, { lower, higher }, entries) => {
-      const result = merge([layer("fleet", { labels: lower }), layer("repo", { labels: higher })]);
+    "a label renaming into a name another layer declares is one label the planner creates once (%s)",
+    async (_case, layering, { lower, higher }, entries) => {
+      const result = merge(
+        [layer("fleet", { labels: lower }), layer("repo", { labels: higher })],
+        layering,
+      );
       expect(result).toEqual({
         settings: { labels: { _undeclared: "delete", entries } },
         notices: [],
@@ -322,16 +372,27 @@ describe("mergeLayers: keyed sections", () => {
     },
   );
 
-  test("a higher entry claiming two lower labels supersedes both: the merged document is one entry", async () => {
-    const result = merge([
-      layer("fleet", { labels: [{ name: "defect" }, { name: "bug" }] }),
-      layer("repo", { labels: [{ name: "Bug", new_name: "Defect" }] }),
-    ]);
+  test("a higher entry claiming two lower labels supersedes both as written, under deep too: neither lower field rides along, whichever came first", async () => {
     const entries = [{ name: "Bug", new_name: "Defect" }];
-    expect(result).toEqual({
-      settings: { labels: { _undeclared: "delete", entries } },
-      notices: [],
-    });
+    for (const lower of [
+      [
+        { name: "defect", color: "111111" },
+        { name: "bug", description: "lower" },
+      ],
+      [
+        { name: "bug", description: "lower" },
+        { name: "defect", color: "111111" },
+      ],
+    ]) {
+      for (const layering of ["deep", "shallow"] as const) {
+        expect(
+          merge([layer("fleet", { labels: lower }), layer("repo", { labels: entries })], layering),
+        ).toEqual({
+          settings: { labels: { _undeclared: "delete", entries } },
+          notices: [],
+        });
+      }
+    }
     expect(await planLabels(entries)).toEqual(['creating label "Defect"']);
   });
 
@@ -339,17 +400,20 @@ describe("mergeLayers: keyed sections", () => {
     ["rename first", [{ name: "bug", new_name: "defect" }, { name: "docs" }]],
     ["rename last", [{ name: "docs" }, { name: "bug", new_name: "defect" }]],
   ])(
-    "the result does not depend on the higher entries' order (%s): a lower rename two higher entries claim between them is superseded by both",
+    "a lower rename two higher entries claim between them is superseded by both as written, under deep too (%s), so the planner never meets two entries claiming one name",
     async (_order, higher) => {
-      const result = merge([
+      // Merged field by field, the lower's new_name would ride into both higher entries and the planner would refuse the document.
+      const layers = [
         layer("fleet", { labels: [{ name: "bug" }, { name: "docs", new_name: "defect" }] }),
         layer("repo", { labels: higher }),
-      ]);
+      ];
       const entries = [{ name: "bug", new_name: "defect" }, { name: "docs" }];
-      expect(result).toEqual({
-        settings: { labels: { _undeclared: "delete", entries } },
-        notices: [],
-      });
+      for (const layering of ["deep", "shallow"] as const) {
+        expect(merge(layers, layering)).toEqual({
+          settings: { labels: { _undeclared: "delete", entries } },
+          notices: [],
+        });
+      }
       expect(await planLabels(entries)).toEqual([
         'creating label "defect"',
         'creating label "docs"',
@@ -383,7 +447,7 @@ describe("mergeLayers: keyed sections", () => {
     });
   });
 
-  test("a higher layer adds a rule type and replaces a same-type rule in place, wholesale", () => {
+  test("under deep a higher layer adds a rule type and merges a same-type rule field by field, its parameters included", () => {
     const result = merge([
       layer("fleet", { rulesets: [MAIN_RULESET] }),
       layer("repo", {
@@ -407,13 +471,37 @@ describe("mergeLayers: keyed sections", () => {
               ...MAIN_RULESET,
               rules: [
                 { type: "deletion" },
-                { type: "pull_request", parameters: { required_approving_review_count: 2 } },
+                {
+                  type: "pull_request",
+                  parameters: {
+                    required_approving_review_count: 2,
+                    dismiss_stale_reviews_on_push: true,
+                    require_code_owner_review: false,
+                    require_last_push_approval: false,
+                    required_review_thread_resolution: false,
+                  },
+                },
                 { type: "non_fast_forward" },
               ],
             },
           ],
         },
       },
+      notices: [],
+    });
+  });
+
+  test("under shallow the same-name ruleset is swapped whole: the lower conditions and rules are gone with it", () => {
+    const higher = {
+      name: "main",
+      rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }],
+    };
+    const result = merge(
+      [layer("fleet", { rulesets: [MAIN_RULESET] }), layer("repo", { rulesets: [higher] })],
+      "shallow",
+    );
+    expect(result).toEqual({
+      settings: { rulesets: { _undeclared: "keep", entries: [higher] } },
       notices: [],
     });
   });
@@ -449,7 +537,8 @@ describe("mergeLayers: the undeclared knob across layers", () => {
   });
 
   test.each([
-    ["merge", { _undeclared: "keep", entries: [{ name: "fleet" }, { name: "mine" }] }],
+    ["deep", { _undeclared: "keep", entries: [{ name: "fleet" }, { name: "mine" }] }],
+    ["shallow", { _undeclared: "keep", entries: [{ name: "fleet" }, { name: "mine" }] }],
     ["replace", { _undeclared: "keep", entries: [{ name: "mine" }] }],
   ] as const)(
     "a plain array inherits the lower wrapper's policy under the %s run default",
@@ -495,7 +584,7 @@ describe("mergeLayers: the undeclared knob across layers", () => {
     expect(result).toEqual({
       settings: {
         labels: { _undeclared: "delete", entries: [{ name: "fleet" }, { name: "mine" }] },
-        milestones: { _undeclared: "keep", entries: [{ title: "v1" }] },
+        milestones: { _undeclared: "keep", entries: [{ title: "v0" }, { title: "v1" }] },
       },
       notices: [],
     });
@@ -558,8 +647,9 @@ describe("mergeLayers: the _layering directive", () => {
   const fleet = layer("fleet", { labels: [{ name: "fleet" }], rulesets: [{ name: "fleet" }] });
 
   test.each([
-    ["merge", "replace", [{ name: "mine" }]],
-    ["replace", "merge", [{ name: "fleet" }, { name: "mine" }]],
+    ["deep", "replace", [{ name: "mine" }]],
+    ["replace", "deep", [{ name: "fleet" }, { name: "mine" }]],
+    ["replace", "shallow", [{ name: "fleet" }, { name: "mine" }]],
   ] as const)(
     "under a %s run, a wrapper's _layering: %s overrides the run for its section alone",
     (run, directive, entries) => {
@@ -590,13 +680,13 @@ describe("mergeLayers: the _layering directive", () => {
     });
   });
 
-  test("a file-level _layering: replace, with one section's wrapper back to merge; the result carries no directive", () => {
+  test("a file-level _layering: replace, with one section's wrapper back to deep; the result carries no directive", () => {
     const result = merge([
       fleet,
       layer("repo", {
         _layering: "replace",
         labels: [{ name: "mine" }],
-        rulesets: { _layering: "merge", entries: [{ name: "mine" }] },
+        rulesets: { _layering: "deep", entries: [{ name: "mine" }] },
       }),
     ]);
     expect(result).toEqual({
@@ -605,6 +695,345 @@ describe("mergeLayers: the _layering directive", () => {
         rulesets: { _undeclared: "keep", entries: [{ name: "fleet" }, { name: "mine" }] },
       },
       notices: [],
+    });
+  });
+});
+
+/**
+ * Two layers sharing ONE key per list section, spelled as the section's planner folds it (case for labels,
+ * collaborators, teams, and environments; case for the uppercased secret and variable names; a workflow's bare file
+ * name against its .github/workflows/ path; verbatim elsewhere), with a lower-only field so the field merge is
+ * visible. Typed over every list section, so a new one fails here until it has a row.
+ */
+const SHARED_KEY_LAYERS: {
+  [K in ListSection]: {
+    lower: Record<string, unknown>;
+    /** A second lower entry under another key: it survives a union and goes with the list under replace. */
+    other: Record<string, unknown>;
+    higher: Record<string, unknown>;
+    deep: Record<string, unknown>;
+  };
+} = {
+  labels: {
+    lower: { name: "Bug", color: "111111" },
+    other: { name: "docs", color: "222222" },
+    higher: { name: "bug", description: "mine" },
+    deep: { name: "bug", color: "111111", description: "mine" },
+  },
+  rulesets: {
+    lower: { name: "main", target: "branch" },
+    other: { name: "tags", target: "tag" },
+    higher: { name: "main", enforcement: "active" },
+    deep: { name: "main", target: "branch", enforcement: "active" },
+  },
+  environments: {
+    lower: { name: "Prod", wait_timer: 5 },
+    other: { name: "staging" },
+    higher: { name: "prod", prevent_self_review: true },
+    deep: { name: "prod", wait_timer: 5, prevent_self_review: true },
+  },
+  branches: {
+    lower: { name: "main", protection: { enforce_admins: true } },
+    other: { name: "release", protection: null },
+    higher: { name: "main", protection: { required_signatures: true } },
+    deep: { name: "main", protection: { enforce_admins: true, required_signatures: true } },
+  },
+  workflows: {
+    lower: { path: "ci.yml", state: "active" },
+    other: { path: "nightly.yml", state: "disabled" },
+    higher: { path: ".github/workflows/ci.yml", state: "disabled" },
+    deep: { path: ".github/workflows/ci.yml", state: "disabled" },
+  },
+  autolinks: {
+    lower: { key_prefix: "J-", url_template: "https://j/<num>" },
+    other: { key_prefix: "K-", url_template: "https://k/<num>" },
+    higher: { key_prefix: "J-", is_alphanumeric: false },
+    deep: { key_prefix: "J-", url_template: "https://j/<num>", is_alphanumeric: false },
+  },
+  actions_secrets: {
+    lower: { name: "MY_SECRET", value: "$FLEET" },
+    other: { name: "OTHER", value: "$OTHER" },
+    higher: { name: "my_secret", value: "$MINE" },
+    deep: { name: "my_secret", value: "$MINE" },
+  },
+  dependabot_secrets: {
+    lower: { name: "MY_SECRET", value: "$FLEET" },
+    other: { name: "OTHER", value: "$OTHER" },
+    higher: { name: "my_secret", value: "$MINE" },
+    deep: { name: "my_secret", value: "$MINE" },
+  },
+  codespaces_secrets: {
+    lower: { name: "MY_SECRET", value: "$FLEET" },
+    other: { name: "OTHER", value: "$OTHER" },
+    higher: { name: "my_secret", value: "$MINE" },
+    deep: { name: "my_secret", value: "$MINE" },
+  },
+  agents_secrets: {
+    lower: { name: "MY_SECRET", value: "$FLEET" },
+    other: { name: "OTHER", value: "$OTHER" },
+    higher: { name: "my_secret", value: "$MINE" },
+    deep: { name: "my_secret", value: "$MINE" },
+  },
+  collaborators: {
+    lower: { username: "Octocat", permission: "push" },
+    other: { username: "hubot", permission: "pull" },
+    higher: { username: "octocat" },
+    deep: { username: "octocat", permission: "push" },
+  },
+  teams: {
+    lower: { name: "Prod", permission: "push" },
+    other: { name: "docs", permission: "pull" },
+    higher: { name: "prod" },
+    deep: { name: "prod", permission: "push" },
+  },
+  milestones: {
+    lower: { title: "v1", description: "first" },
+    other: { title: "v2" },
+    higher: { title: "v1", state: "closed" },
+    deep: { title: "v1", description: "first", state: "closed" },
+  },
+  actions_variables: {
+    lower: { name: "MY_VAR", value: "fleet" },
+    other: { name: "OTHER", value: "other" },
+    higher: { name: "my_var", value: "mine" },
+    deep: { name: "my_var", value: "mine" },
+  },
+  agents_variables: {
+    lower: { name: "MY_VAR", value: "fleet" },
+    other: { name: "OTHER", value: "other" },
+    higher: { name: "my_var", value: "mine" },
+    deep: { name: "my_var", value: "mine" },
+  },
+  webhooks: {
+    lower: {
+      config: { url: "https://hooks.example.com/a", content_type: "json" },
+      events: ["push"],
+    },
+    other: { config: { url: "https://hooks.example.com/b" } },
+    higher: { config: { url: "https://hooks.example.com/a" }, active: false },
+    deep: {
+      config: { url: "https://hooks.example.com/a", content_type: "json" },
+      events: ["push"],
+      active: false,
+    },
+  },
+  custom_properties: {
+    lower: { property_name: "team", value: "fleet" },
+    other: { property_name: "tier", value: "gold" },
+    higher: { property_name: "team", value: "mine" },
+    deep: { property_name: "team", value: "mine" },
+  },
+  deploy_keys: {
+    lower: { title: "ci", key: "ssh-ed25519 AAAA" },
+    other: { title: "deploy", key: "ssh-ed25519 BBBB" },
+    higher: { title: "ci", read_only: false },
+    deep: { title: "ci", key: "ssh-ed25519 AAAA", read_only: false },
+  },
+  secret_scanning_custom_patterns: {
+    lower: { name: "token", pattern: "tok_[a-z]+" },
+    other: { name: "key", pattern: "key_[a-z]+" },
+    higher: { name: "token", push_protection: true },
+    deep: { name: "token", pattern: "tok_[a-z]+", push_protection: true },
+  },
+};
+
+describe("mergeLayers: every list section layers by the key its planner folds", () => {
+  /** The folded entries of one section: a knobbed one's `entries` (the resolved knob set aside), a plain list itself. */
+  function entriesOf(layers: Layer[], layering: Layering, key: ListSection): unknown {
+    const result = merge(layers, layering);
+    if ("error" in result) {
+      throw new Error(result.error);
+    }
+    const section = (result.settings as Record<string, { entries: unknown } | unknown[]>)[key];
+    return Array.isArray(section) ? section : section?.entries;
+  }
+
+  test.each([...LIST_SECTIONS])(
+    "%s: a shared key spelled two ways folds to one entry under shallow and deep, and the higher list wins under replace",
+    (key) => {
+      const { lower, other, higher, deep } = SHARED_KEY_LAYERS[key];
+      const layers = [
+        layer("fleet", { [key]: [lower, other] }),
+        layer("repo", { [key]: [higher] }),
+      ];
+      expect(entriesOf(layers, "shallow", key)).toEqual([higher, other]);
+      expect(entriesOf(layers, "deep", key)).toEqual([deep, other]);
+      expect(entriesOf(layers, "replace", key)).toEqual([higher]);
+    },
+  );
+
+  test.each([...LIST_SECTIONS])("%s: an empty higher list adds nothing under deep", (key) => {
+    const { lower, other } = SHARED_KEY_LAYERS[key];
+    const layers = [layer("fleet", { [key]: [lower, other] }), layer("repo", { [key]: [] })];
+    expect(entriesOf(layers, "deep", key)).toEqual([lower, other]);
+  });
+});
+
+describe("mergeLayers: the plain-list sections", () => {
+  const PROD = {
+    name: "prod",
+    wait_timer: 5,
+    variables: [
+      { name: "REGION", value: "eu" },
+      { name: "LOG_LEVEL", value: "info" },
+    ],
+    secrets: { _undeclared: "keep", entries: [{ name: "TOKEN", value: "$A" }] },
+    deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+    deployment_branch_policies: [{ name: "release/*" }],
+    deployment_protection_rules: [{ app: "gate" }],
+    reviewers: [
+      { type: "User", id: 1 },
+      { type: "Team", id: 1 },
+    ],
+  };
+
+  test.each<[Layering, unknown]>([
+    ["replace", [{ name: "qa" }]],
+    ["shallow", [{ name: "prod", wait_timer: 5 }, { name: "qa" }]],
+    ["deep", [{ name: "prod", wait_timer: 5 }, { name: "qa" }]],
+  ])(
+    "a plain-list section folds under its wrapper's _layering: %s and comes out as the bare list, the directive consumed",
+    (directive, environments) => {
+      const result = merge([
+        layer("fleet", { environments: [{ name: "prod", wait_timer: 5 }] }),
+        layer("repo", { environments: { _layering: directive, entries: [{ name: "qa" }] } }),
+      ]);
+      expect(result).toEqual({ settings: { environments }, notices: [] });
+    },
+  );
+
+  test("a bare {entries} wrapper on a plain-list section folds like the plain list, under the file's directive", () => {
+    const result = merge([
+      layer("fleet", { workflows: [{ path: "ci.yml", state: "active" }] }),
+      layer("repo", {
+        _layering: "replace",
+        workflows: { entries: [{ path: "nightly.yml", state: "disabled" }] },
+      }),
+    ]);
+    expect(result).toEqual({
+      settings: { workflows: [{ path: "nightly.yml", state: "disabled" }] },
+      notices: [],
+    });
+  });
+
+  test("under deep an environment's nested lists union by their own keys, in either form, with the lower wrapper's policy inherited", () => {
+    const result = merge([
+      layer("fleet", { environments: [PROD] }),
+      layer("repo", {
+        environments: [
+          {
+            name: "Prod",
+            variables: [
+              { name: "region", value: "us" },
+              { name: "TIMEOUT", value: "30" },
+            ],
+            secrets: [{ name: "token", value: "$B" }],
+            deployment_branch_policies: [{ name: "release/*", type: "tag" }, { name: "hotfix/*" }],
+            deployment_protection_rules: { entries: [{ app: "gate" }, { app: "scan" }] },
+            reviewers: [
+              { type: "Team", id: 1 },
+              { type: "User", id: 2 },
+            ],
+          },
+        ],
+      }),
+    ]);
+    expect(result).toEqual({
+      settings: {
+        environments: [
+          {
+            name: "Prod",
+            wait_timer: 5,
+            variables: [
+              { name: "region", value: "us" },
+              { name: "LOG_LEVEL", value: "info" },
+              { name: "TIMEOUT", value: "30" },
+            ],
+            secrets: { _undeclared: "keep", entries: [{ name: "token", value: "$B" }] },
+            deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+            deployment_branch_policies: [{ name: "release/*", type: "tag" }, { name: "hotfix/*" }],
+            deployment_protection_rules: { entries: [{ app: "gate" }, { app: "scan" }] },
+            reviewers: [
+              { type: "User", id: 1 },
+              { type: "Team", id: 1 },
+              { type: "User", id: 2 },
+            ],
+          },
+        ],
+      },
+      notices: [],
+    });
+  });
+
+  test("a higher nested wrapper's explicit _undeclared wins over a lower bare list, and the wrapper form is kept", () => {
+    const result = merge([
+      layer("fleet", { environments: [{ name: "prod", variables: [{ name: "A", value: "1" }] }] }),
+      layer("repo", {
+        environments: [
+          {
+            name: "prod",
+            variables: { _undeclared: "delete", entries: [{ name: "B", value: "2" }] },
+          },
+        ],
+      }),
+    ]);
+    expect(result).toEqual({
+      settings: {
+        environments: [
+          {
+            name: "prod",
+            variables: {
+              _undeclared: "delete",
+              entries: [
+                { name: "A", value: "1" },
+                { name: "B", value: "2" },
+              ],
+            },
+          },
+        ],
+      },
+      notices: [],
+    });
+  });
+
+  test("under shallow the same-name environment is swapped whole, its nested lists with it", () => {
+    const higher = { name: "prod", variables: [{ name: "TIMEOUT", value: "30" }] };
+    const result = merge(
+      [layer("fleet", { environments: [PROD] }), layer("repo", { environments: [higher] })],
+      "shallow",
+    );
+    expect(result).toEqual({ settings: { environments: [higher] }, notices: [] });
+  });
+
+  test("a null at a plain-list entry's nullable path is the value under deep; a null elsewhere in the entry deletes with a notice", () => {
+    const result = merge([
+      layer("fleet", {
+        branches: [
+          {
+            name: "main",
+            protection: { enforce_admins: true, required_deployments: { environments: ["prod"] } },
+          },
+          { name: "release/*", protection: { required_signatures: true } },
+        ],
+        environments: [PROD],
+      }),
+      layer("repo", {
+        branches: [
+          { name: "main", protection: { required_deployments: null } },
+          { name: "release/*", protection: null },
+        ],
+        environments: [{ name: "prod", deployment_branch_policy: null, wait_timer: null }],
+      }),
+    ]);
+    expect(result).toEqual({
+      settings: {
+        branches: [
+          { name: "main", protection: { enforce_admins: true, required_deployments: null } },
+          { name: "release/*", protection: null },
+        ],
+        environments: [{ ...PROD, deployment_branch_policy: null, wait_timer: undefined }],
+      },
+      notices: [{ layer: "repo", path: "environments[0].wait_timer" }],
     });
   });
 });
@@ -662,6 +1091,68 @@ describe("mergeLayers: layer-boundary refusals", () => {
       'layer "repo": labels must be a list of mappings or an {_undeclared, entries} wrapper; got a string',
     ],
     [
+      "a scalar where a plain list belongs, named with the wrapper it does take",
+      { environments: "oops" },
+      "layer-wrong-shape",
+      'layer "repo": environments must be a list of mappings or an {_layering, entries} wrapper; got a string',
+    ],
+    [
+      "two environments under one name, spelled two ways",
+      { environments: [{ name: "Prod" }, { name: "prod" }] },
+      "layer-duplicate-key",
+      'layer "repo": environments[0] and environments[1] both claim one name; each name belongs to one entry within a layer',
+    ],
+    [
+      "a nameless environment variable, under the nested wrapper form",
+      { environments: [{ name: "prod", variables: { entries: [{ value: "x" }] } }] },
+      "layer-no-key",
+      'layer "repo": environments[0].variables[0] carries no string "name", which every entry needs to layer by',
+    ],
+    [
+      "two environment secrets under one uppercased name",
+      {
+        environments: [
+          {
+            name: "prod",
+            secrets: [
+              { name: "token", value: "$A" },
+              { name: "TOKEN", value: "$B" },
+            ],
+          },
+        ],
+      },
+      "layer-duplicate-key",
+      'layer "repo": environments[0].secrets[0] and environments[0].secrets[1] both claim one name; each name belongs to one entry within a layer',
+    ],
+    [
+      "a reviewer whose id is not a number",
+      { environments: [{ name: "prod", reviewers: [{ type: "User", id: "1" }] }] },
+      "layer-no-key",
+      'layer "repo": environments[0].reviewers[0] carries no numeric "id", which every entry needs to layer by',
+    ],
+    [
+      "a workflow named twice, by its bare name and its path",
+      {
+        workflows: [
+          { path: "ci.yml", state: "active" },
+          { path: ".github/workflows/ci.yml", state: "disabled" },
+        ],
+      },
+      "layer-duplicate-key",
+      'layer "repo": workflows[0] and workflows[1] both claim one path; each path belongs to one entry within a layer',
+    ],
+    [
+      "a branch protected twice",
+      {
+        branches: [
+          { name: "main", protection: null },
+          { name: "main", protection: null },
+        ],
+      },
+      "layer-duplicate-key",
+      'layer "repo": branches[0] and branches[1] both claim one name; each name belongs to one entry within a layer',
+    ],
+    [
       "a wrapper without entries",
       { labels: { _undeclared: "keep" } },
       "layer-wrong-shape",
@@ -674,51 +1165,46 @@ describe("mergeLayers: layer-boundary refusals", () => {
       'layer "repo": milestones must be a list of mappings or an {_undeclared, entries} wrapper; got a Date value',
     ],
     [
-      "a non-mapping entry in a section without a layering key",
+      "a non-mapping milestone entry",
       { milestones: [{ title: "v1" }, "v2"] },
       "layer-wrong-shape",
       'layer "repo": milestones[1] must be a mapping; got a string',
     ],
     [
-      "an invalid top-level directive",
-      { _layering: "union", labels: [{ name: "mine" }] },
+      "a titleless milestone",
+      { milestones: [{ title: "v1" }, { description: "no title" }] },
+      "layer-no-key",
+      'layer "repo": milestones[1] carries no string "title", which every entry needs to layer by',
+    ],
+    [
+      "the retired top-level directive, an unknown value like any other",
+      { _layering: "merge", labels: [{ name: "mine" }] },
       "layer-bad-directive",
-      'layer "repo": _layering must be "merge" or "replace"; got a string that is neither',
+      'layer "repo": _layering must be one of "replace", "shallow", "deep"; got a string that is none of them',
     ],
     [
       "an invalid wrapper directive",
       { labels: { _layering: "union", entries: [{ name: "mine" }] } },
       "layer-bad-directive",
-      'layer "repo": labels._layering must be "merge" or "replace"; got a string that is neither',
+      'layer "repo": labels._layering must be one of "replace", "shallow", "deep"; got a string that is none of them',
     ],
     [
       "a non-string wrapper directive",
       { labels: { _layering: true, entries: [{ name: "mine" }] } },
       "layer-bad-directive",
-      'layer "repo": labels._layering must be "merge" or "replace"; got a boolean',
-    ],
-    [
-      "a wrapper merge directive on a section without a layering key",
-      { milestones: { _layering: "merge", entries: [{ title: "v1" }] } },
-      "layer-no-layering-key",
-      'layer "repo": milestones has no layering key, so it cannot be layered by "merge"; declare _layering: replace or drop the directive',
-    ],
-    [
-      "a file-level merge directive reaching a section without a layering key",
-      { _layering: "merge", milestones: [{ title: "v1" }] },
-      "layer-no-layering-key",
-      'layer "repo": milestones has no layering key, so it cannot be layered by "merge"; declare _layering: replace or drop the directive',
+      'layer "repo": labels._layering must be one of "replace", "shallow", "deep"; got a boolean',
     ],
   ])("%s is refused naming the layer", (_case, doc, code, error) => {
-    expect(merge([fleet, layer("repo", doc)])).toEqual({ code, error });
-    expect(merge([fleet, layer("repo", doc)], "replace")).toEqual({ code, error });
+    for (const layering of ["deep", "shallow", "replace"] as const) {
+      expect(merge([fleet, layer("repo", doc)], layering)).toEqual({ code, error });
+    }
   });
 
-  test("a section without a layering key merges under the run default without complaint", () => {
+  test("every knobbed section unions by its key under the run default, milestones by title", () => {
     expect(merge([fleet, layer("repo", { milestones: [{ title: "v1" }] })])).toEqual({
       settings: {
         labels: { _undeclared: "delete", entries: [{ name: "fleet" }] },
-        milestones: { _undeclared: "keep", entries: [{ title: "v1" }] },
+        milestones: { _undeclared: "keep", entries: [{ title: "v0" }, { title: "v1" }] },
       },
       notices: [],
     });
@@ -752,16 +1238,13 @@ describe("mergeLayers: layer-boundary refusals", () => {
         "a directive that is a marker",
         { labels: { _layering: M, entries: [{ name: M }] } },
         "layer-bad-directive",
-        'layer "repo": labels._layering must be "merge" or "replace"; got a string that is neither',
+        'layer "repo": labels._layering must be one of "replace", "shallow", "deep"; got a string that is none of them',
       ],
     ];
     const kinded: [string, unknown][] = [
       ["a top-level directive that is a marker", { _layering: M, labels: [{ name: M }] }],
-      [
-        "a merge directive on a section without a layering key",
-        { milestones: { _layering: "merge", entries: [{ title: M }] } },
-      ],
       ["an entry without its key", { labels: [{ color: M, [M]: M }] }],
+      ["a milestone without its key", { milestones: [{ description: M }] }],
       ["two entries claiming one key", { labels: [{ name: M }, { name: M.toLowerCase() }] }],
       ["a cycle", { repository: cyclic }],
     ];
@@ -835,12 +1318,22 @@ describe("mergeLayers: cyclic documents", () => {
 });
 
 describe("stripNulls", () => {
-  test("drops the nulls the merge reads as markers and keeps the nulls it copies as data", () => {
+  test("drops the nulls the merge reads as markers under deep and keeps the nulls it copies as data", () => {
     const doc = deepFreeze({
       a: null,
       b: { c: null, d: 1, e: { f: null } },
       list: [null, { g: null }],
-      branches: [null, { name: "release", protection: null }],
+      branches: [null, { name: "release", protection: null, extra: null }],
+      environments: [
+        {
+          name: "prod",
+          wait_timer: null,
+          deployment_branch_policy: null,
+          variables: { _undeclared: null, entries: [{ name: "A", value: null }] },
+          secrets: [{ name: "B", value: null }],
+        },
+      ],
+      workflows: { _layering: "shallow", entries: [{ path: "ci.yml", state: null }] },
       labels: { _undeclared: null, entries: [{ name: "bug", description: null }] },
       milestones: { _undeclared: null, entries: [{ title: "v1", due_on: null }] },
       rulesets: [
@@ -855,18 +1348,27 @@ describe("stripNulls", () => {
       pages: null,
       zero: 0,
     });
-    expect(stripNulls(doc)).toEqual({
+    expect(stripNulls(doc, "deep")).toEqual({
       b: { d: 1, e: {} },
       list: [null, { g: null }],
       branches: [null, { name: "release", protection: null }],
-      labels: { entries: [{ name: "bug", description: null }] },
-      milestones: { entries: [{ title: "v1", due_on: null }] },
+      environments: [
+        {
+          name: "prod",
+          deployment_branch_policy: null,
+          variables: { entries: [{ name: "A" }] },
+          secrets: [{ name: "B" }],
+        },
+      ],
+      workflows: { _layering: "shallow", entries: [{ path: "ci.yml", state: null }] },
+      labels: { entries: [{ name: "bug" }] },
+      milestones: { entries: [{ title: "v1" }] },
       rulesets: [
         null,
         {
           name: "main",
           conditions: { ref_name: { exclude: [] } },
-          rules: [null, { type: "pull_request", parameters: null }],
+          rules: [null, { type: "pull_request" }],
         },
       ],
       pages: null,
@@ -878,7 +1380,7 @@ describe("stripNulls", () => {
     const doc = deepFreeze({
       rulesets: { _undeclared: "keep", entries: [{ name: "main", bypass_actors: null }] },
     });
-    expect(stripNulls(doc)).toEqual({
+    expect(stripNulls(doc, "deep")).toEqual({
       rulesets: { _undeclared: "keep", entries: [{ name: "main" }] },
     });
   });
@@ -890,12 +1392,32 @@ describe("stripNulls", () => {
     "a wrapper aliased under a non-section key %s the section is stripped by the position it sits in, not the one first met",
     (_order, compose) => {
       const shared = { entries: [{ name: "main", bypass_actors: null }] };
-      expect(stripNulls(deepFreeze(compose(shared)))).toEqual({
+      expect(stripNulls(deepFreeze(compose(shared)), "deep")).toEqual({
         _template: { entries: [{ name: "main", bypass_actors: null }] },
         rulesets: { entries: [{ name: "main" }] },
       });
     },
   );
+
+  test("a null at a null-valued entry path is the value under deep, in the per-layer view and the fold alike; a null elsewhere in the entry is still a marker", () => {
+    // custom_properties' `value: null` unsets the property, so a lone layer saying it validates and a higher one writes it over the lower value with no notice.
+    const lower = { custom_properties: [{ property_name: "pilot", value: "true", note: "lower" }] };
+    const higher = deepFreeze({
+      custom_properties: [{ property_name: "pilot", value: null, note: null }],
+    });
+    expect(stripNulls(higher, "deep")).toEqual({
+      custom_properties: [{ property_name: "pilot", value: null }],
+    });
+    expect(merge([layer("fleet", lower), layer("repo", higher)])).toEqual({
+      settings: {
+        custom_properties: {
+          _undeclared: "keep",
+          entries: [{ property_name: "pilot", value: null }],
+        },
+      },
+      notices: [{ layer: "repo", path: "custom_properties[0].note" }],
+    });
+  });
 
   test("the merge agrees: a lower layer declaring every stripped key is deleted with a notice, the kept nulls survive as data or as the section value", () => {
     const fleet = layer("fleet", {
@@ -930,14 +1452,14 @@ describe("stripNulls", () => {
     expect(merge([fleet, repo])).toEqual({
       settings: {
         b: { e: {} },
-        labels: { _undeclared: "delete", entries: [{ name: "bug", description: null }] },
+        labels: { _undeclared: "delete", entries: [{ name: "bug" }] },
         rulesets: {
           _undeclared: "keep",
           entries: [
             {
               name: "main",
               conditions: { ref_name: { exclude: [] } },
-              rules: [{ type: "pull_request", parameters: null }],
+              rules: [{ type: "pull_request" }],
             },
           ],
         },
@@ -949,8 +1471,10 @@ describe("stripNulls", () => {
         { layer: "repo", path: "b.c" },
         { layer: "repo", path: "b.e.f" },
         { layer: "repo", path: "labels._undeclared" },
+        { layer: "repo", path: "labels[0].description" },
         { layer: "repo", path: "rulesets[0].bypass_actors" },
         { layer: "repo", path: "rulesets[0].conditions.ref_name.include" },
+        { layer: "repo", path: "rulesets[0].rules[0].parameters" },
       ],
     });
   });
@@ -968,7 +1492,9 @@ describe("stripNulls", () => {
         issues: [expect.stringContaining("rulesets")],
       }),
     );
-    expect(validate(stripNulls(upper))).toEqual(ok({ rulesets: [{ name: "main" }] }));
+    expect(validate(stripNulls(upper, "deep"))).toEqual(
+      ok({ rulesets: [{ name: "main", target: "branch", enforcement: "active" }] }),
+    );
     const merged = merge([layer("fleet", lower), layer("repo", upper)]);
     expect(merged).toEqual({
       settings: { rulesets: { _undeclared: "keep", entries: [MAIN_RULESET] } },
@@ -984,7 +1510,7 @@ describe("stripNulls", () => {
 
   test("a key named __proto__ survives as an own property", () => {
     const proto = "__proto__";
-    const out = stripNulls(JSON.parse('{"__proto__": {"a": null, "b": 1}}')) as Record<
+    const out = stripNulls(JSON.parse('{"__proto__": {"a": null, "b": 1}}'), "deep") as Record<
       string,
       unknown
     >;
@@ -994,7 +1520,7 @@ describe("stripNulls", () => {
 
   test("a non-mapping document comes back as a clone", () => {
     const list = deepFreeze([{ a: null }]);
-    const out = stripNulls(list);
+    const out = stripNulls(list, "deep");
     expect(out).toEqual([{ a: null }]);
     expect(out).not.toBe(list);
   });
@@ -1003,7 +1529,7 @@ describe("stripNulls", () => {
     const doc = deepFreeze(cyclicMapping());
     const repository: Record<string, unknown> = { description: "x" };
     repository.self = repository;
-    const out = stripNulls(doc);
+    const out = stripNulls(doc, "deep");
     expect(out).toEqual({ repository });
     expect(out).not.toBe(doc);
   });

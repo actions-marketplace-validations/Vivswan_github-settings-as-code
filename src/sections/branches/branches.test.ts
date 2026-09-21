@@ -30,7 +30,12 @@ import {
   pathSegments,
 } from "../contract/endpoints.js";
 import { PermissionDenied } from "../contract/errors.js";
-import { type ExplicitKeys, ROUTED_KEYS, type RoutedKey } from "./graphql-rules.js";
+import {
+  type ExplicitKeys,
+  type RestCarriedKey,
+  ROUTED_KEYS,
+  type RoutedKey,
+} from "./graphql-rules.js";
 import {
   branchesSection,
   type ClassifiedEntry,
@@ -40,7 +45,8 @@ import {
 import { branchesMockGraphqlHandlers, branchesMockHandlers, wildcardMatches } from "./mock.js";
 import type { BranchProtectionConfig } from "./schema.js";
 
-type Desired = Parameters<typeof branchesSection.plan>[1];
+/** The bare-list form of the section's value; the tests never hand plan() the `{_layering, entries}` wrapper. */
+type Desired = Extract<Parameters<typeof branchesSection.plan>[1], readonly unknown[]>;
 
 const plan = (api: GitHubClient, desired: Desired) =>
   branchesSection.plan(planContext(branchesSection, api, REPO), desired);
@@ -313,6 +319,18 @@ describe("branches", () => {
       { enforce_admins: true },
       "allow_deletions",
       { enforce_admins: true, allow_deletions: true },
+    ],
+    [
+      // GitHub's GET omits restrictions when the branch is unrestricted and serves the three lists,
+      // empty or not, when it is restricted; only the review-side holders read all-empty as off.
+      "an all-empty restrictions holder (nobody may push)",
+      { enforce_admins: { enabled: true }, restrictions: { users: [], teams: [], apps: [] } },
+      { enforce_admins: true },
+      "restrictions",
+      {
+        enforce_admins: true,
+        restrictions: { users: [] as string[], teams: [] as string[], apps: [] as string[] },
+      },
     ],
     [
       "a nested review setting",
@@ -1266,26 +1284,6 @@ describe("branches wildcard entries", () => {
     expect(messages.some((m) => m.includes("bare user login"))).toBe(true);
   });
 
-  test("a scalar structured key on a wildcard entry fails the shape, not apply", () => {
-    // Without this rejection the value passes the looseObject and crashes translateWildcardProtection mid-plan with a raw TypeError.
-    for (const bad of [
-      { required_status_checks: true },
-      { required_pull_request_reviews: 5 },
-      { required_status_checks: ["ci"] },
-    ]) {
-      const parsed = branchesSection.shape.safeParse([{ name: "release/*", protection: bad }]);
-      expect(parsed.success).toBe(false);
-      const messages = parsed.success ? [] : parsed.error.issues.map((issue) => issue.message);
-      expect(messages.some((m) => m.includes("must be a mapping of its sub-keys"))).toBe(true);
-    }
-    // The same scalar on a LITERAL entry stays a passthrough (GitHub is the authority on the REST payload).
-    expect(
-      branchesSection.shape.safeParse([
-        { name: "main", protection: { required_status_checks: true } },
-      ]).success,
-    ).toBe(true);
-  });
-
   test("case-insensitive duplicates in the routed lists fail upfront", () => {
     const actors = branchesSection.shape.safeParse([
       { name: "main", protection: { force_push_bypassers: ["octocat", "OctoCat"] } },
@@ -1473,13 +1471,17 @@ describe("branches plan contract", () => {
     ).toEqual(["routed", "routed", "literal", "literal"]);
   });
 
-  test("ROUTED_KEYS covers every key the schema spells out beside the signatures toggle", () => {
+  test("every key the schema spells out is routed, REST-carried, or the signatures toggle", () => {
     // Compile-time only: the tripwire in graphql-rules.ts fires through this same alias, so a tuple missing a key is shown failing here, beside
     // the complete tuple that passes.
     type Explicit = ExplicitKeys<BranchProtectionConfig>;
-    type _Complete = MustBeNever<Exclude<Explicit, RoutedKey | "required_signatures">>;
-    // @ts-expect-error a tuple that forgot required_deployments leaves that schema key uncovered
-    type _Short = MustBeNever<Exclude<Explicit, "force_push_bypassers" | "required_signatures">>;
+    type _Complete = MustBeNever<
+      Exclude<Explicit, RoutedKey | RestCarriedKey | "required_signatures">
+    >;
+    type _Short = MustBeNever<
+      // @ts-expect-error a tuple that forgot required_deployments leaves that schema key uncovered
+      Exclude<Explicit, "force_push_bypassers" | RestCarriedKey | "required_signatures">
+    >;
     expect(ROUTED_KEYS).toEqual(["force_push_bypassers", "required_deployments"]);
   });
 });
@@ -1590,7 +1592,7 @@ describe("branches snapshot", () => {
       expected: { strict: true, contexts: ["ci"] },
     },
   ])("required_status_checks: $case", ({ checks, expected }) => {
-    expect(protectionSnapshot({ required_status_checks: checks })).toEqual({
+    expect<unknown>(protectionSnapshot({ required_status_checks: checks })).toEqual({
       required_status_checks: expected,
     });
   });
@@ -1859,6 +1861,68 @@ describe("branches snapshot", () => {
         apps: [{ slug: "deploy-gate" }],
       },
     });
+  });
+
+  test.each([
+    [
+      "the GET wrapper under a boolean control",
+      { enforce_admins: { url: "https://api.github.com/x/enforce_admins", enabled: true } },
+      `For 'properties/enforce_admins', {"url":"https://api.github.com/x/enforce_admins","enabled":true} is not a boolean or null.`,
+    ],
+    [
+      "a quoted boolean under a boolean control",
+      { enforce_admins: "true" },
+      `For 'properties/enforce_admins', "true" is not a boolean or null.`,
+    ],
+    // Only enforce_admins and allow_force_pushes are nullable in the PUT schema; null elsewhere is a 422.
+    [
+      "null under a non-nullable control",
+      { allow_deletions: null },
+      `For 'properties/allow_deletions', null is not a boolean.`,
+    ],
+    // The PUT schema requires users and teams under restrictions; GitHub names the first list not supplied.
+    [
+      "restrictions without its teams list",
+      { restrictions: { users: [] } },
+      `"teams" wasn't supplied.`,
+    ],
+  ])(
+    "the mock answers GitHub's 422 to a PUT carrying %s, and stores nothing",
+    async (_what, fragment, error) => {
+      const api = registryFake({ branches: ["main"] });
+      const put = await api.tryRequest("PUT", "/repos/o/r/branches/main/protection", {
+        required_status_checks: null,
+        required_pull_request_reviews: null,
+        restrictions: null,
+        ...fragment,
+      });
+      expect("error" in put ? [put.error.status, JSON.parse(put.error.body)] : put).toEqual([
+        422,
+        {
+          message: "Validation Failed",
+          errors: [`Invalid request.\n\n${error}`],
+          documentation_url:
+            "https://docs.github.com/rest/branches/branch-protection#update-branch-protection",
+        },
+      ]);
+      const served = await api.tryRequest("GET", "/repos/o/r/branches/main/protection");
+      expect("error" in served && served.error.status).toBe(404);
+    },
+  );
+
+  test("the mock takes null as the off spelling on the two controls the PUT schema marks nullable", async () => {
+    const api = registryFake({ branches: ["main"] });
+    const put = await api.tryRequest("PUT", "/repos/o/r/branches/main/protection", {
+      enforce_admins: null,
+      allow_force_pushes: null,
+      required_status_checks: null,
+      required_pull_request_reviews: null,
+      restrictions: null,
+    });
+    expect("data" in put).toBe(true);
+    const served = await api.tryRequest("GET", "/repos/o/r/branches/main/protection");
+    // An unset control has no key in GitHub's GET shape, so the read-back carries neither.
+    expect("data" in served ? served.data : served).toEqual({});
   });
 
   test("the mock serves a wildcard rule's protection only under an EXISTING matching branch, signatures included", async () => {

@@ -2,14 +2,20 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { describeOptOut } from "../../src/engine/layers.js";
+import { describeOptOut, stripNulls } from "../../src/engine/layers.js";
 import { validateSettingsDoc } from "../../src/engine/orchestrate.js";
 import { SectionSelection } from "../../src/engine/section-selection.js";
 import { silentIo } from "../../src/io.js";
 import { describeProblem } from "../../src/problem.js";
 import { SECTION_KEYS, type SectionKey } from "../../src/schema.js";
 import { allEndpoints, sectionShape } from "../../src/sections/registry.js";
-import { type LiveWitnessKind, UNDECLARED_KEY } from "./gen-support.js";
+import {
+  entriesOf,
+  type Json,
+  LAYERING_DIRECTIVES,
+  type LiveWitnessKind,
+  UNDECLARED_KEY,
+} from "./gen-support.js";
 import {
   ARTIFACT_TEST_RECIPIENT,
   canariesOf,
@@ -23,6 +29,7 @@ import {
   INVALID_SETTINGS_CASES,
   MERGE_FEATURES,
   MERGE_REFUSAL_KINDS,
+  markerNullsDropped,
   mergeFeaturesOf,
   NON_MAPPING_YAML,
   ORG_GATED_SECTIONS,
@@ -32,6 +39,7 @@ import {
   WITNESS_KINDS,
   WITNESS_SECTIONS,
 } from "./generators.js";
+import { grantablePermission } from "./mock/state.js";
 import { predictDiscovery, predictMerge } from "./oracle.js";
 import { Rng } from "./prng.js";
 import { collectYmlFiles, MASK_KEYS, parseScenario } from "./schema.js";
@@ -548,6 +556,32 @@ describe("genScenario", () => {
     expect(seen["extra-undeclared"]).toBeGreaterThan(0);
   });
 
+  test("a personal account's collaborators declare only what its repository grants; an organization's keep maintain", () => {
+    // The runtime cannot refuse triage or maintain at parse (the owner is unknown until the repository read), so the
+    // generator holds the line the mock's grant check draws, or a fully-granted apply on a personal account 422s.
+    let personal = 0;
+    let organizationMaintain = 0;
+    for (let i = 0; i < 300; i++) {
+      const { scenario, meta } = genScenario(new Rng(i));
+      if (scenario.settings?.collaborators === undefined) {
+        continue;
+      }
+      const entries = entriesOf(scenario.settings.collaborators);
+      if (meta.ownerKind === "user") {
+        personal++;
+        for (const entry of entries) {
+          expect(grantablePermission("user", entry), `seed ${i}: ${JSON.stringify(entry)}`).toBe(
+            true,
+          );
+        }
+      } else if (entries.some((entry) => entry.permission === "maintain")) {
+        organizationMaintain++;
+      }
+    }
+    expect(personal).toBeGreaterThan(0);
+    expect(organizationMaintain).toBeGreaterThan(0);
+  });
+
   test("declared branches and workflows are present in live_state so they converge", () => {
     // A wildcard entry is a RULE (creatable through GraphQL), never a git branch; a required-deployment environment
     // must exist live, or the mock's silent-drop mimicry fails a fully-granted apply.
@@ -1001,11 +1035,11 @@ describe("dead-corner knobs", () => {
 describe("genMergeScenario", () => {
   const SEEDS = Array.from({ length: 300 }, (_, i) => i);
 
-  test("produces schema-valid mode: merge scenarios whose layers the runner files in meta order", () => {
+  test("produces schema-valid mode: render scenarios whose layers the runner files in meta order", () => {
     for (const seed of SEEDS) {
       const { scenario, meta } = genMergeScenario(new Rng(seed));
       expect(() => parseScenario(scenario, `seed-${seed}`)).not.toThrow();
-      expect(scenario.inputs?.mode).toBe("merge");
+      expect(scenario.inputs?.mode).toBe("render");
       expect(meta.layers.length).toBeGreaterThanOrEqual(2);
       expect(meta.layers.length).toBeLessThanOrEqual(5);
       // The runner writes settings_layers[i] as layer-i.yml and settings as settings.yml, the names the action's refusals and notices carry.
@@ -1018,7 +1052,7 @@ describe("genMergeScenario", () => {
         name: "settings.yml",
         doc: scenario.settings as Record<string, unknown>,
       });
-      expect(meta.layering).toBe(scenario.inputs?.layering ?? "merge");
+      expect(meta.layering).toBe(scenario.inputs?.layering ?? "deep");
     }
   });
 
@@ -1089,7 +1123,7 @@ describe("genMergeScenario", () => {
 
   test("forces construct their eligibility: a pinned run layering, or the named refusal", () => {
     for (let seed = 0; seed < 60; seed++) {
-      for (const layering of ["merge", "replace"] as const) {
+      for (const layering of LAYERING_DIRECTIVES) {
         const { scenario, meta } = genMergeScenario(new Rng(seed), {
           force: { kind: "valid", layering },
         });
@@ -1127,6 +1161,45 @@ describe("genMergeScenario", () => {
   test("is deterministic for a seed", () => {
     const draw = () => JSON.stringify(genMergeScenario(new Rng(77)));
     expect(draw()).toBe(draw());
+  });
+});
+
+describe("markerNullsDropped (the harness's per-layer view)", () => {
+  test("agrees with the engine's stripNulls on every null placement a layer can spell", () => {
+    // The harness's view decides which generated layers are valid on their own; a placement it judges differently from
+    // the engine would either hide a fold the run refuses or refuse a layer the run accepts.
+    const doc: Json = {
+      pages: null,
+      interaction_limits: null,
+      actions: null,
+      repository: { description: null, has_wiki: false },
+      labels: {
+        _undeclared: null,
+        _layering: "deep",
+        entries: [{ name: "bug", description: null }],
+      },
+      // No wrapper directive: this one follows the run, so shallow and replace copy its entries as written and still drop the null knob.
+      rulesets: { _undeclared: null, entries: [{ name: "main", bypass_actors: null }] },
+      milestones: { _layering: "shallow", entries: [{ title: "v1", due_on: null }] },
+      environments: [
+        {
+          name: "prod",
+          wait_timer: null,
+          deployment_branch_policy: null,
+          variables: { _undeclared: null, entries: [{ name: "A", value: null }] },
+          secrets: [{ name: "B", value: null }],
+        },
+      ],
+      branches: [{ name: "main", protection: null, extra: null }],
+      custom_properties: [{ property_name: "team", value: null, note: null }],
+      // An own __proto__ key, as a YAML file can spell it: a document field, not the entry's prototype.
+      ...(JSON.parse('{"actions": {"__proto__": {"a": null, "b": 1}}}') as Json),
+    };
+    for (const run of LAYERING_DIRECTIVES) {
+      const view = markerNullsDropped(doc, run);
+      expect(view, run).toEqual(stripNulls(doc, run) as Json);
+      expect(Object.hasOwn(view.actions as object, "__proto__"), run).toBe(true);
+    }
   });
 });
 
@@ -1192,8 +1265,8 @@ describe("mergeFeaturesOf (the axes read off a finished stack)", () => {
       name: i === docs.length - 1 ? "settings.yml" : `layer-${i}.yml`,
       doc,
     }));
-    const always: string[] = ["override", "run-layering-merge"];
-    expect(mergeFeaturesOf(layers, "merge", false)).toEqual(
+    const always: string[] = ["override", "run-layering-deep"];
+    expect(mergeFeaturesOf(layers, "deep", false)).toEqual(
       MERGE_FEATURES.filter((feature) => always.includes(feature) || expected.includes(feature)),
     );
   });
@@ -1240,9 +1313,9 @@ describe("mergeFeaturesOf (a top-level null read the way the fold writes it)", (
       name: i === docs.length - 1 ? "settings.yml" : `layer-${i}.yml`,
       doc,
     }));
-    expect(mergeFeaturesOf(layers, "merge", false)).toEqual(
+    expect(mergeFeaturesOf(layers, "deep", false)).toEqual(
       MERGE_FEATURES.filter(
-        (feature) => feature === "run-layering-merge" || expected.includes(feature),
+        (feature) => feature === "run-layering-deep" || expected.includes(feature),
       ),
     );
   });
@@ -1252,7 +1325,7 @@ describe("merge oracle against the curated merge scenarios", () => {
   // The hand-written scenarios pin what the dialect means; the oracle's own fold must reproduce every pinned document
   // exactly, or the fuzz would be checking the engine against a mirror of itself.
   const files = collectYmlFiles(join(import.meta.dir, "scenarios")).filter((file) =>
-    basename(file).startsWith("merge-"),
+    basename(file).startsWith("render-"),
   );
 
   test("the corpus carries the three curated merge scenarios", () => {
@@ -1260,12 +1333,12 @@ describe("merge oracle against the curated merge scenarios", () => {
   });
 
   test.each(files.map((file) => [basename(file), file]))(
-    "%s: the oracle's fold reproduces expect.merged",
+    "%s: the oracle's fold reproduces expect.rendered",
     (_name, file) => {
       const scenario = parseScenario(parseYaml(readFileSync(file, "utf8")), file);
       // Without a pinned document this comparison is vacuous; the corpus count above cannot tell.
-      if (scenario.expect.merged === undefined) {
-        throw new Error(`${file}: a curated merge scenario must pin expect.merged`);
+      if (scenario.expect.rendered === undefined) {
+        throw new Error(`${file}: a curated render scenario must pin expect.rendered`);
       }
       const layers = [
         ...(scenario.settings_layers ?? []).map((doc, i) => ({ name: `layer-${i}.yml`, doc })),
@@ -1273,12 +1346,12 @@ describe("merge oracle against the curated merge scenarios", () => {
       ];
       const prediction = predictMerge({
         layers,
-        layering: scenario.inputs?.layering ?? "merge",
+        layering: scenario.inputs?.layering ?? "deep",
         features: [],
       });
       expect(prediction.kind).toBe("merged");
       if (prediction.kind === "merged") {
-        expect(prediction.merged).toEqual(scenario.expect.merged);
+        expect(prediction.merged).toEqual(scenario.expect.rendered);
         // Every notice the fold predicts is one the scenario pins on stdout, in the action's words (the e2e run itself
         // catches the converse, a pinned line the engine never prints).
         for (const notice of prediction.notices) {

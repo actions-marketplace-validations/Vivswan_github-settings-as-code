@@ -24,7 +24,7 @@ const FRAGMENT_KINDS = [
   "defaults_file",
   "settings_layers[<i>]",
   "expect.snapshot",
-  "expect.merged",
+  "expect.rendered",
   "repos.<slug>.settings",
   "repos.<slug>.expect.snapshot",
 ] as const;
@@ -107,17 +107,17 @@ function scenarioDocs(): CorpusDoc[] {
     };
     push("settings", `${name} settings`, scenario.settings);
     push("defaults_file", `${name} defaults_file`, scenario.defaults_file);
-    // Every merge layer is a settings file the run reads, and the pinned merged document is what
-    // mode: merge writes for a later run to read, so both validators must accept each of them.
+    // Every layer is a settings file the run reads, and the pinned rendered document is what
+    // mode: render writes for a later run to read, so both validators must accept each of them.
     const layers = scenario.settings_layers as unknown[] | undefined;
     for (const [i, layer] of (layers ?? []).entries()) {
       push("settings_layers[<i>]", `${name} settings_layers[${i}]`, layer);
     }
     // A pinned snapshot document is what mode: snapshot writes for a later
     // apply to read, so both validators must accept it like any settings file.
-    const expected = scenario.expect as { snapshot?: unknown; merged?: unknown } | undefined;
+    const expected = scenario.expect as { snapshot?: unknown; rendered?: unknown } | undefined;
     push("expect.snapshot", `${name} expect.snapshot`, expected?.snapshot);
-    push("expect.merged", `${name} expect.merged`, expected?.merged);
+    push("expect.rendered", `${name} expect.rendered`, expected?.rendered);
     const repos = scenario.repos as
       | Record<string, { settings?: unknown; expect?: { snapshot?: unknown } }>
       | undefined;
@@ -170,12 +170,26 @@ const KNOWN_DIVERGENCES: Record<string, string> = {
     "schema-looser: the allowed_actions/selected_actions contradiction is a superRefine (cross-field), rejected at runtime upfront",
   "actions-selected-contradiction-rejected-check.yml settings":
     "schema-looser: same contradiction, check mode",
+  "actions-retention-reported-field-rejected.yml settings":
+    "schema-looser: the reported-only field sweep (a key the GET returns and the PUT does not take) is a superRefine " +
+    "over open passthrough objects, rejected at runtime upfront",
   "collaborators-unknown-key-rejected.yml settings":
     "schema-looser: collaborators is a closedSurface section; the shape stays open for passthrough parity and validateSectionShapes rejects the typo key",
   "environment-pins-cap-rejected.yml settings":
     "schema-looser: the at-most-10 pinned entries cap is a superRefine counting pinned: true across the array, which JSON Schema cannot count",
   "branches-wildcard-untranslatable-key-rejected.yml settings":
     "schema-looser: the wildcard-entry key sweep is a superRefine over the section's GraphQL translation tables (branches.ts); protection stays an open passthrough mapping in the schema",
+  "secret-scanning-patterns-uncompilable-regex-rejected.yml settings":
+    "schema-looser: the regex fields' syntax check is a superRefine that first translates the PCRE-only forms Hyperscan accepts (compilable-form.ts), which no JSON Schema keyword does; " +
+    "`format: regex` would be a flagless new RegExp that also rejects a `\\Z` anchor after another character, refusing a delimiter Hyperscan holds, so the fields stay plain strings in the schema",
+  "branches-get-response-copied-rejected.yml settings":
+    "schema-looser: the GET-only key sweep is a recursive superRefine over the passthrough protection mapping (branches/schema.ts), which JSON Schema cannot express; the published schema types the two structured controls but forbids no key",
+  "repository-get-only-key-rejected.yml settings":
+    "schema-looser: the GET-only key refusal is a superRefine over the repository passthrough mapping, which stays open in the schema for the PATCH fields GitHub adds later",
+  "code-scanning-default-setup-get-only-key-rejected.yml settings":
+    "schema-looser: the GET-only schedule/updated_at refusal is a superRefine reading the passthrough record (setup-schema.ts); the shape stays open for passthrough parity",
+  "code-quality-setup-runner-label-without-labeled-rejected.yml settings":
+    "schema-looser: the runner_type/runner_label pairing is a cross-field superRefine (setup-schema.ts), rejected at runtime upfront",
 };
 
 describe("published schema agrees with the runtime over the corpus", () => {

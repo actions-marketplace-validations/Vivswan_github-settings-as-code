@@ -6,11 +6,21 @@
  */
 
 import { z } from "zod";
-import { type Delta, deltas, phantomNote, renderDelta } from "../../engine/diff.js";
+import {
+  type Delta,
+  deltas,
+  type MatchKey,
+  omittedDeltas,
+  phantomNote,
+  phantomPaths,
+  refuseOmitted,
+  renderDelta,
+} from "../../engine/diff.js";
 import { snapshotSecretReference } from "../../engine/secrets.js";
 import type { SettingsFile, UndeclaredPolicySection } from "../../schema.js";
 import type { UndeclaredPolicy, UndeclaredPolicyList } from "../../types.js";
 import type { EndpointDecl, PathParams, Route } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity, plural } from "../contract/live.js";
 import {
   cannotVerifyNote,
@@ -47,6 +57,7 @@ import {
   knobbedSnapshot,
   leftOutOfSnapshot,
   projectOntoSchema,
+  replaceSweep,
   unreadableSecretNote,
 } from "./snapshot-helpers.js";
 
@@ -314,8 +325,15 @@ interface ListSectionDeclFields<
      */
     readonly fromLive: (live: Live) => ListComparable<F>;
     /** Per entry field holding a list, the item key to pair by (see DeltaOptions.matchBy); `{}` when none does. */
-    readonly matchBy: Readonly<Partial<Record<keyof Entry<K> & string, string>>>;
+    readonly matchBy: Readonly<Partial<Record<keyof Entry<K> & string, MatchKey>>>;
   };
+  /**
+   * Whether the update body replaces the live item whole (a ruleset's PUT) or sets named fields only (a PATCH).
+   * Under `true` a non-empty live value under a key of the entry slice that the entry omits is drift, and apply
+   * refuses the write. Every declaration says which, so a replace-style section cannot inherit the declared-keys
+   * comparison by leaving it out.
+   */
+  readonly replaces: boolean;
   /**
    * The body recreating a drifted item of a resource GitHub cannot edit (no update role), when the
    * write alone would drop a live field the file leaves undeclared (a deploy key's read_only).
@@ -359,10 +377,11 @@ interface ListSectionDeclFields<
     readonly undeclaredDrift?: DriftWording;
   };
   /**
-   * Omitted, the list always replaces. The pairing itself is derived from `identity`, the very claims the
-   * planner's duplicate check reads, so the merge and the planner cannot disagree about which entries are one.
+   * The pairing itself is derived from `identity`, the very claims the planner's duplicate check reads, so the
+   * merge and the planner cannot disagree about which entries are one; a declaration adds only the nested keyed
+   * lists and the null-valued paths.
    */
-  readonly layering?: Pick<KeyedListLayering, "combine" | "nested">;
+  readonly layering?: Pick<KeyedListLayering, "nested" | "nullValued">;
 }
 
 /** The module listSection() mints: SectionModule<K, Ends> at the registry, plus its declaration. */
@@ -380,7 +399,7 @@ export interface ListSectionModule<
   readonly endpoints: Ends;
   readonly shape: z.ZodType;
   readonly secretValues?: (declared: Declared<K>) => DeclaredSecretValue[];
-  readonly layering?: KeyedListLayering;
+  readonly layering: KeyedListLayering;
   readonly plan: (
     ctx: PlanContext<Ends, GraphqlDict, K>,
     desired: Declared<K>,
@@ -411,8 +430,9 @@ interface ErasedDecl<Key extends string> {
   readonly lens: {
     readonly toWrite: (entry: object) => ListWrite<string>;
     readonly fromLive: (live: object) => ListComparable<string>;
-    readonly matchBy: Readonly<Record<string, string>>;
+    readonly matchBy: Readonly<Record<string, MatchKey>>;
   };
+  readonly replaces: boolean;
   readonly mapping?: string;
   readonly recreate?: (live: object, write: ListWrite<string>) => ListWrite<string>;
   readonly conflicts?: {
@@ -706,6 +726,7 @@ async function planList<Key extends string>(
   const { fold } = identity;
   const update = updateRole(endpoints);
   const remedies = update === undefined ? RECREATE_REMEDIES : UPDATE_REMEDIES;
+  const sweep = decl.replaces ? replaceSweep(decl.entry) : undefined;
   const defaultPolicy = defaultUndeclaredPolicy(section);
   const { policy, entries } = undeclaredPolicy(declared, defaultPolicy);
 
@@ -721,11 +742,13 @@ async function planList<Key extends string>(
     return { write, name, claims };
   });
   // Every identity an entry claims must be its alone: two entries resolving to one resource would fight on every run.
-  rejectDuplicates(
-    section,
-    writes.flatMap((w) => w.claims.map((claim) => ({ claim, name: w.name }))),
-    (c) => c.claim,
-    (c) => c.name,
+  raise(
+    rejectDuplicates(
+      section,
+      writes.flatMap((w) => w.claims.map((claim) => ({ claim, name: w.name }))),
+      (c) => c.claim,
+      (c) => c.name,
+    ),
   );
 
   const declaredConflicts = decl.conflicts?.declared?.(writes.map((w) => w.write)) ?? [];
@@ -742,12 +765,14 @@ async function planList<Key extends string>(
     return { item, comparable, name, key: fold(name) };
   });
   // The guard runs before the section's own live conflicts: a duplicated live pair makes every other judgment a guess.
-  const liveByKey = liveByIdentity(
-    section,
-    noun,
-    liveItems,
-    (item) => item.key,
-    (item) => liveIdentity(item.name, decl.address(item.item)),
+  const liveByKey = raise(
+    liveByIdentity(
+      section,
+      noun,
+      liveItems,
+      (item) => item.key,
+      (item) => liveIdentity(item.name, decl.address(item.item)),
+    ),
   );
   const liveConflicts =
     decl.conflicts?.live?.(
@@ -793,14 +818,18 @@ async function planList<Key extends string>(
     const body = await readItem(decl, ctx, existing.item);
     const compared = comparison(decl, label, write, body, lens.fromLive(body));
     plan.notes.push(...compared.notes);
-    const found = deltas(compared.write, compared.live, { matchBy: lens.matchBy });
+    const found = [
+      ...deltas(compared.write, compared.live, { matchBy: lens.matchBy }),
+      ...(sweep === undefined
+        ? []
+        : omittedDeltas(compared.write, projectOntoSchema(decl.entry, compared.live), {
+            matchBy: lens.matchBy,
+            sweep,
+          })),
+    ];
     const render = (delta: Delta): string =>
       renderEntryDelta(key, identity.field, { want: name, live: existing.name }, delta, remedies);
-    const phantom = found.flatMap((delta) =>
-      delta.kind === "phantom" && delta.path.length === 1 && typeof delta.path[0] === "string"
-        ? [delta.path[0]]
-        : [],
-    );
+    const phantom = phantomPaths(found);
     if (phantom.length > 0) {
       plan.notes.push(phantomNote(label, phantom, noun, remedies.phantom));
     }
@@ -880,6 +909,10 @@ async function planList<Key extends string>(
           ? plainData(updateBody(decl, general))
           : (exec: ExecTools) =>
               resolvedWrite(exec, updateBody(decl, general) as ListWrite<string>, generalSecrets),
+      before: refuseOmitted(
+        label,
+        found.flatMap((delta) => (delta.kind === "omitted" ? [render(delta)] : [])),
+      ),
       describe: `updating ${noun} "${name}"`,
       drift: facetOr(
         generalSecrets.length === 0 ? null : secretFacet(decl, label, generalSecrets),
@@ -945,12 +978,14 @@ async function snapshotList(
     const name = nameOf(lens.fromLive(item), identity.field);
     return { item, name, key: identity.fold(name) };
   });
-  liveByIdentity(
-    section,
-    noun,
-    items,
-    (item) => item.key,
-    (item) => liveIdentity(item.name, decl.address(item.item)),
+  raise(
+    liveByIdentity(
+      section,
+      noun,
+      items,
+      (item) => item.key,
+      (item) => liveIdentity(item.name, decl.address(item.item)),
+    ),
   );
   const entries: object[] = [];
   for (const { item, name } of items) {
@@ -1024,16 +1059,12 @@ export function listSection<
     ...(decl.secrets === undefined
       ? {}
       : { secretValues: (declared: Declared<K>) => secretValuesFor(erased, declared) }),
-    ...(decl.layering === undefined
-      ? {}
-      : {
-          layering: {
-            keys: (entry) => identityClaims(erased.identity, entry),
-            keyField: decl.identity.field,
-            combine: decl.layering.combine,
-            ...(decl.layering.nested === undefined ? {} : { nested: decl.layering.nested }),
-          },
-        }),
+    layering: {
+      keys: (entry) => identityClaims(erased.identity, entry),
+      keyField: decl.identity.field,
+      ...(decl.layering?.nested === undefined ? {} : { nested: decl.layering.nested }),
+      ...(decl.layering?.nullValued === undefined ? {} : { nullValued: decl.layering.nullValued }),
+    },
     plan: (ctx, desired) =>
       planList(
         erased,

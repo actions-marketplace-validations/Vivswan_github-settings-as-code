@@ -4,10 +4,12 @@ import { z } from "zod";
 import { subsetDiff } from "../../engine/diff.js";
 import type { MustBeNever } from "../../types.js";
 import { repoVariables } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { type GraphqlOpDecl, graphqlOp } from "../contract/graphql.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import type { ExecTools, Late, PlanContext, PlannedOp, SectionPlan } from "../contract/plan.js";
 import type { ENDPOINTS } from "./endpoints.js";
+import type { BooleanControl } from "./keys.js";
 import { type BranchConfig, type BranchProtectionConfig, parseBypassActor } from "./schema.js";
 
 // --- The classic-to-GraphQL vocabulary -------------------------------------
@@ -26,7 +28,7 @@ export const GRAPHQL_BOOLEAN_TWINS = {
   lock_branch: "lockBranch",
   allow_fork_syncing: "lockAllowsFetchAndMerge",
   required_signatures: "requiresCommitSignatures",
-} as const;
+} as const satisfies Record<BooleanControl, string>;
 
 export const GRAPHQL_REVIEW_TWINS = {
   required_approving_review_count: "requiredApprovingReviewCount",
@@ -59,11 +61,17 @@ export type ExplicitKeys<T> = keyof {
 };
 
 /**
- * Every key the schema spells out is a routed key or the signatures toggle (its own REST sub-endpoint);
- * a new explicit key fails here until it is sorted into ROUTED_KEYS or named as REST-carried.
+ * Every key the schema spells out is a routed key, the signatures toggle (its own REST sub-endpoint),
+ * or a REST-carried control the schema types for its parse-time rules; a new explicit key fails here
+ * until it is sorted into ROUTED_KEYS or named as REST-carried.
  */
+export type RestCarriedKey =
+  | "required_status_checks"
+  | "required_pull_request_reviews"
+  | "restrictions";
+
 type _RoutedKeysCoverSchema = MustBeNever<
-  Exclude<ExplicitKeys<BranchProtectionConfig>, RoutedKey | "required_signatures">
+  Exclude<ExplicitKeys<BranchProtectionConfig>, RoutedKey | RestCarriedKey | "required_signatures">
 >;
 
 export const WILDCARD_KEYS = [
@@ -391,12 +399,14 @@ function indexRules(ctx: BranchesContext, rules: readonly RuleNode[]): Map<strin
       );
     }
   }
-  return liveByIdentity(
-    { key: ctx.section },
-    "protection rule",
-    rules,
-    (rule) => rule.pattern,
-    (rule) => liveIdentity(rule.pattern, { rule_id: rule.id }),
+  return raise(
+    liveByIdentity(
+      { key: ctx.section },
+      "protection rule",
+      rules,
+      (rule) => rule.pattern,
+      (rule) => liveIdentity(rule.pattern, { rule_id: rule.id }),
+    ),
   );
 }
 

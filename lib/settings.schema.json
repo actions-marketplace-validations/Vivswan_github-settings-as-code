@@ -20,10 +20,31 @@
             "selected"
           ]
         },
+        "sha_pinning_required": {
+          "description": "Whether actions must be pinned to a full-length commit SHA.",
+          "type": "boolean"
+        },
         "selected_actions": {
-          "description": "PUT /repos/{r}/actions/permissions/selected-actions (allowed_actions: selected)",
+          "description": "PUT /repos/{r}/actions/permissions/selected-actions (allowed_actions: selected): the allowlist, e.g. { github_owned_allowed: true, patterns_allowed: [octocat/*] }. Only the three documented keys are accepted, so a misspelled one is refused instead of re-sent on every run.",
           "type": "object",
-          "additionalProperties": {}
+          "properties": {
+            "github_owned_allowed": {
+              "description": "Whether actions in GitHub's own organizations (such as actions/*) may run.",
+              "type": "boolean"
+            },
+            "verified_allowed": {
+              "description": "Whether actions by GitHub Marketplace verified creators may run.",
+              "type": "boolean"
+            },
+            "patterns_allowed": {
+              "description": "Patterns naming the actions and reusable workflows allowed to run, e.g. octocat/hello-world@v2 or octocat/*; GitHub applies them to public repositories only.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
         },
         "default_workflow_permissions": {
           "description": "PUT /repos/{r}/actions/permissions/workflow: the default GITHUB_TOKEN grant.",
@@ -47,12 +68,13 @@
           ]
         },
         "artifact_and_log_retention": {
-          "description": "PUT /repos/{r}/actions/permissions/artifact-and-log-retention: how many days artifacts and workflow logs are kept, e.g. { days: 90 }. The body passes through verbatim, so future fields GitHub adds work unchanged.",
+          "description": "PUT /repos/{r}/actions/permissions/artifact-and-log-retention: how many days artifacts and workflow logs are kept, e.g. { days: 90 }. The body passes through verbatim, so future fields GitHub adds work unchanged; maximum_allowed_days, which the GET reports and the PUT does not take, is refused.",
           "type": "object",
           "properties": {
             "days": {
-              "description": "How many days artifacts and workflow logs are kept.",
-              "type": "number"
+              "description": "How many days artifacts and workflow logs are kept; a whole number of days within the plan's maximum.",
+              "type": "integer",
+              "exclusiveMinimum": 0
             }
           },
           "required": [
@@ -65,46 +87,76 @@
           "properties": {
             "max_cache_retention_days": {
               "description": "How many days an unused cache entry is kept before GitHub evicts it.",
-              "type": "number"
+              "type": "integer",
+              "exclusiveMinimum": 0
             },
             "max_cache_size_gb": {
               "description": "The total cache storage the repository may use, in GB.",
-              "type": "number"
+              "type": "integer",
+              "exclusiveMinimum": 0
             }
           },
           "additionalProperties": false
         },
         "oidc_customization_sub": {
-          "description": "PUT /repos/{r}/actions/oidc/customization/sub: the OIDC subject claim template for this repository's workflow tokens, e.g. { use_default: false, include_claim_keys: [repo, context] } (keys must be unique). Claim-key ORDER defines the subject format, so check mode compares a declared list positionally; an omitted list on a custom template opts into the organization template and is not compared. use_immutable_subject switches the whole subject to the stable repository-ID-based format; omitted, the organization setting or the repository's creation date decides, and only a declared value is compared. Unlike the rest of this section, these endpoints need the \"Actions\" PAT permission rather than Administration.",
-          "type": "object",
-          "properties": {
-            "use_default": {
-              "description": "Use GitHub's default subject claim format instead of a custom template.",
-              "type": "boolean"
+          "description": "PUT /repos/{r}/actions/oidc/customization/sub: the OIDC subject claim template for this repository's workflow tokens, e.g. { use_default: false, include_claim_keys: [repo, context] } (keys are unique and hold only letters, digits, and underscores; a list under use_default: true is refused, since GitHub ignores it). Claim-key ORDER defines the subject format, so check mode compares a declared list positionally; an omitted list on a custom template opts into the organization template and is not compared. sub_claim_prefix, which the GET reports and the PUT does not take, is refused. use_immutable_subject switches the whole subject to the stable repository-ID-based format; omitted, the organization setting or the repository's creation date decides, and only a declared value is compared. Unlike the rest of this section, these endpoints need the \"Actions\" PAT permission rather than Administration.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "use_default": {
+                  "description": "true: GitHub's default subject claim format; this variant carries no claim-key list.",
+                  "type": "boolean",
+                  "const": true
+                },
+                "use_immutable_subject": {
+                  "description": "Switch the whole subject to the stable repository-ID-based format.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "use_default"
+              ]
             },
-            "include_claim_keys": {
-              "description": "The claim keys the custom subject joins, in order (e.g. repo, context); the order defines the subject format.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "use_immutable_subject": {
-              "description": "Switch the whole subject to the stable repository-ID-based format.",
-              "type": "boolean"
+            {
+              "type": "object",
+              "properties": {
+                "use_default": {
+                  "description": "false: a custom template, joined from include_claim_keys.",
+                  "type": "boolean",
+                  "const": false
+                },
+                "include_claim_keys": {
+                  "description": "The claim keys the custom subject joins, in order (e.g. repo, context); the order defines the subject format.",
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_]+$"
+                  }
+                },
+                "use_immutable_subject": {
+                  "description": "Switch the whole subject to the stable repository-ID-based format.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "use_default"
+              ]
             }
-          },
-          "required": [
-            "use_default"
           ]
         },
         "fork_pr_contributor_approval": {
-          "description": "PUT /repos/{r}/actions/permissions/fork-pr-contributor-approval: when workflows triggered by fork pull requests need a maintainer's approval before they run, e.g. { approval_policy: first_time_contributors }. The policies GitHub accepts today are first_time_contributors_new_to_github, first_time_contributors, and all_external_contributors. The body passes through verbatim, so future fields GitHub adds work unchanged.",
+          "description": "PUT /repos/{r}/actions/permissions/fork-pr-contributor-approval: when workflows triggered by fork pull requests need a maintainer's approval before they run, e.g. { approval_policy: first_time_contributors }. The policies GitHub accepts are first_time_contributors_new_to_github, first_time_contributors, and all_external_contributors; any other value is refused when the file is parsed. The body passes through verbatim, so future fields GitHub adds work unchanged.",
           "type": "object",
           "properties": {
             "approval_policy": {
               "description": "Which fork contributors need a maintainer's approval before their workflows run: first_time_contributors_new_to_github, first_time_contributors, or all_external_contributors.",
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "first_time_contributors_new_to_github",
+                "first_time_contributors",
+                "all_external_contributors"
+              ]
             }
           },
           "required": [
@@ -112,7 +164,7 @@
           ]
         },
         "fork_pr_workflows_private_repos": {
-          "description": "PUT /repos/{r}/actions/permissions/fork-pr-workflows-private-repos: whether pull requests from forks may run workflows on this private repository, and what those workflows receive. All four toggles are required: GitHub does not document whether the PUT preserves or resets an omitted toggle, so the file declares the complete policy - which is also the posture that leaves no toggle unwatched. The body passes through verbatim, so future fields GitHub adds work unchanged.",
+          "description": "PUT /repos/{r}/actions/permissions/fork-pr-workflows-private-repos: whether pull requests from forks may run workflows on this private repository, and what those workflows receive. Only run_workflows_from_fork_pull_requests is required, as in the request body; GitHub does not document whether the PUT preserves or resets an omitted toggle, so declaring all four is the posture that leaves no toggle unwatched. The body passes through verbatim, so future fields GitHub adds work unchanged.",
           "type": "object",
           "properties": {
             "run_workflows_from_fork_pull_requests": {
@@ -133,10 +185,7 @@
             }
           },
           "required": [
-            "run_workflows_from_fork_pull_requests",
-            "send_write_tokens_to_workflows",
-            "send_secrets_and_variables",
-            "require_approval_for_fork_pr_workflows"
+            "run_workflows_from_fork_pull_requests"
           ]
         }
       }
@@ -224,8 +273,9 @@
       "type": "object",
       "properties": {
         "app_id": {
-          "description": "The id of the GitHub App the preference applies to.",
-          "type": "integer"
+          "description": "The id of the GitHub App the preference applies to: a positive integer (the App's settings page shows it), declared once. 0, fractions, and a repeated app_id fail at parse time; GitHub has no app 0, rejects fractions, and would keep whichever duplicate it reads last with nothing to read it back.",
+          "type": "integer",
+          "exclusiveMinimum": 0
         },
         "setting": {
           "description": "Whether pushes automatically create check suites for this app; GitHub defaults each app to true.",
@@ -287,9 +337,188 @@
       ]
     },
     "BranchProtectionConfig": {
-      "description": "The protection PUT payload, passed through verbatim except its routed keys.",
+      "description": "The protection PUT payload, passed through verbatim except its routed keys. What the file alone shows wrong is refused upfront, naming the fix: the GET-only keys a copied GET response carries (`name`, `enabled`, `enforcement_level`, `url` and `*_url`, at any depth), a status-check requirement without `strict` or a check list, and a review count outside 0-6.",
       "type": "object",
       "properties": {
+        "required_status_checks": {
+          "description": "Require status checks to pass before merging; `null` turns the requirement off. A mapping carries `strict` and one of `contexts` or `checks`, since GitHub's protection PUT rejects the requirement without either.",
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "strict": {
+                  "description": "Whether the branch must also be up to date with its base before merging; `false` requires only the checks to pass.",
+                  "type": "boolean"
+                },
+                "contexts": {
+                  "description": "The required checks by name; `[]` keeps the requirement on while requiring none.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "checks": {
+                  "description": "The required checks as {context, app_id} pairs, the PUT's second spelling of the list; the names are derived into `contexts` for the PUT when the file declares only `checks`. GitHub's PUT takes no other field in an item, so any other key is refused upfront, named, with the fix.",
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "context": {
+                        "description": "The name of the required check.",
+                        "type": "string"
+                      },
+                      "app_id": {
+                        "description": "The id of the GitHub App that must report the check. `-1` lets any App report it (`null`, GitHub's read-back spelling of the same, is sent as `-1`); an omitted id pins whichever App reported it last.",
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "context"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "strict"
+              ],
+              "additionalProperties": {},
+              "anyOf": [
+                {
+                  "required": [
+                    "contexts"
+                  ]
+                },
+                {
+                  "required": [
+                    "checks"
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "required_pull_request_reviews": {
+          "description": "Require pull request reviews before merging; `null` turns the requirement off. Every review setting beside the count and the two actor holders (`dismiss_stale_reviews`, `require_code_owner_reviews`, ...) passes through to the PUT.",
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "required_approving_review_count": {
+                  "description": "Approving reviews required before merging: 1 to 6, or 0 to require no approvals. GitHub accepts no other value, so the file is refused upfront instead of the PUT failing at apply.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 6
+                },
+                "dismissal_restrictions": {
+                  "description": "Who may dismiss pull request reviews, as `users`, `teams`, and `apps` lists of login/slug strings, each list optional; an empty mapping lets anyone with push access dismiss. GitHub's GET expands each actor into an object, which the PUT rejects, so a copied one is refused naming the string to write.",
+                  "type": "object",
+                  "properties": {
+                    "users": {
+                      "description": "User logins (\"octocat\").",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "teams": {
+                      "description": "Team slugs (\"platform-team\").",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "apps": {
+                      "description": "GitHub App slugs (\"deploy-gate\").",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "additionalProperties": {}
+                },
+                "bypass_pull_request_allowances": {
+                  "description": "Who may push without a pull request review, as `users`, `teams`, and `apps` lists of login/slug strings, each list optional. GitHub's GET expands each actor into an object, which the PUT rejects, so a copied one is refused naming the string to write.",
+                  "type": "object",
+                  "properties": {
+                    "users": {
+                      "description": "User logins (\"octocat\").",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "teams": {
+                      "description": "Team slugs (\"platform-team\").",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "apps": {
+                      "description": "GitHub App slugs (\"deploy-gate\").",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "additionalProperties": {}
+                }
+              },
+              "additionalProperties": {}
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "restrictions": {
+          "description": "Who may push to the branch, as `users`, `teams`, and `apps` lists of login/slug strings; the PUT requires `users` and `teams` (`[]` when none) and takes `apps` as optional, so a mapping missing either is refused upfront. An all-empty mapping lets nobody push, `null` lifts the restriction, and a copied GET actor object is refused naming the string to write. Literal branches only; wildcard rules point at the rulesets section.",
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "users": {
+                  "description": "User logins (\"octocat\"); required, `[]` when none.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "teams": {
+                  "description": "Team slugs (\"platform-team\"); required, `[]` when none.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "apps": {
+                  "description": "GitHub App slugs (\"deploy-gate\"); optional.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "users",
+                "teams"
+              ],
+              "additionalProperties": {}
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "required_signatures": {
           "description": "Require signed commits on the branch. On a literal branch this is a routed key the protection PUT silently drops, so it is applied through the POST/DELETE .../protection/required_signatures sub-endpoint: when it drifts, and again after any protection PUT (GitHub does not document whether the PUT preserves an existing requirement), so declare the toggle on any branch that carries one - a declared value is pinned either way. On a wildcard rule it rides the GraphQL rule mutation like every other key.",
           "type": "boolean"
@@ -328,12 +557,50 @@
       },
       "additionalProperties": {}
     },
+    "BypassActorConfig": {
+      "description": "One actor that may bypass the ruleset. Integration, RepositoryRole, Team, and User need their numeric actor_id; DeployKey takes none (null); OrganizationAdmin ignores it.",
+      "type": "object",
+      "properties": {
+        "actor_id": {
+          "description": "The id GitHub assigns the app, role, team, or user. Required for Integration, RepositoryRole, Team, and User; refused for DeployKey (write null or omit it); ignored for OrganizationAdmin.",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "actor_type": {
+          "description": "Integration, OrganizationAdmin, RepositoryRole, Team, DeployKey, or User, as GitHub spells them.",
+          "type": "string",
+          "enum": [
+            "Integration",
+            "OrganizationAdmin",
+            "RepositoryRole",
+            "Team",
+            "DeployKey",
+            "User"
+          ]
+        },
+        "bypass_mode": {
+          "description": "\"always\" (the default), \"pull_request\" (bypass only through a pull request; branch rulesets only, and never for a DeployKey), or \"exempt\" (rules are not run for the actor).",
+          "type": "string",
+          "enum": [
+            "always",
+            "pull_request",
+            "exempt"
+          ]
+        }
+      },
+      "required": [
+        "actor_type"
+      ],
+      "additionalProperties": {}
+    },
     "CheckSuitePreferencesConfig": {
       "description": "PATCH /repos/{r}/check-suites/preferences, sent verbatim. Write-only upstream: GitHub exposes no read endpoint for these preferences, so check mode cannot verify them and apply re-asserts the declared preferences on every run.",
       "type": "object",
       "properties": {
         "auto_trigger_checks": {
-          "description": "Per-app toggles for whether pushes automatically create check suites.",
+          "description": "Per-app toggles for whether pushes automatically create check suites, one entry per app_id.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/AutoTriggerCheckConfig"
@@ -360,10 +627,18 @@
           ]
         },
         "languages": {
-          "description": "Languages to analyze, compared as a set; GitHub auto-detects when omitted.",
+          "description": "Languages to analyze, in the PATCH's vocabulary (the GET's \"rust\" cannot be declared and stays as detected), compared as a set; GitHub auto-detects when omitted.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "csharp",
+              "go",
+              "java-kotlin",
+              "javascript-typescript",
+              "python",
+              "ruby"
+            ]
           }
         },
         "runner_type": {
@@ -375,7 +650,7 @@
           ]
         },
         "runner_label": {
-          "description": "Runner label when runner_type is \"labeled\"; null clears it.",
+          "description": "Runner label: a string needs runner_type: \"labeled\" and is refused under any other; null clears it under runner_type: \"standard\" or none.",
           "type": [
             "string",
             "null"
@@ -412,10 +687,21 @@
           ]
         },
         "languages": {
-          "description": "Languages to scan, compared as a set; GitHub auto-detects when omitted.",
+          "description": "Languages to scan, in the PATCH's vocabulary (\"javascript-typescript\", never the GET's separate \"javascript\" and \"typescript\"), compared as a set; GitHub auto-detects when omitted.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "actions",
+              "c-cpp",
+              "csharp",
+              "go",
+              "java-kotlin",
+              "javascript-typescript",
+              "python",
+              "ruby",
+              "swift"
+            ]
           }
         },
         "runner_type": {
@@ -427,7 +713,7 @@
           ]
         },
         "runner_label": {
-          "description": "Runner label when runner_type is \"labeled\"; null clears it.",
+          "description": "Runner label: a string needs runner_type: \"labeled\" and is refused under any other; null clears it under runner_type: \"standard\" or none.",
           "type": [
             "string",
             "null"
@@ -442,6 +728,43 @@
           ]
         }
       }
+    },
+    "CodeScanningToolConfig": {
+      "description": "One tool that must provide code scanning results.",
+      "type": "object",
+      "properties": {
+        "alerts_threshold": {
+          "description": "The alert severity that blocks the update: none, errors, errors_and_warnings, or all.",
+          "type": "string",
+          "enum": [
+            "none",
+            "errors",
+            "errors_and_warnings",
+            "all"
+          ]
+        },
+        "security_alerts_threshold": {
+          "description": "The security severity that blocks the update: none, critical, high_or_higher, medium_or_higher, or all.",
+          "type": "string",
+          "enum": [
+            "none",
+            "critical",
+            "high_or_higher",
+            "medium_or_higher",
+            "all"
+          ]
+        },
+        "tool": {
+          "description": "The code scanning tool's name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "alerts_threshold",
+        "security_alerts_threshold",
+        "tool"
+      ],
+      "additionalProperties": {}
     },
     "CodespacesSecretConfig": {
       "description": "One repository Codespaces secret, matched by case-insensitive name (GitHub stores secret names uppercase). Keys other than name and value are rejected: the API body is built from the sealed value alone, so an extra key would silently do nothing.",
@@ -545,8 +868,9 @@
           "type": "string"
         },
         "key": {
-          "description": "The PUBLIC key material, e.g. \"ssh-ed25519 AAAAC3... comment\". Public by nature, so it is safe in a committed file. Compared as algorithm + blob with the trailing comment ignored (GitHub may strip or rewrite comments on storage); keys are immutable upstream, so a changed key is applied as delete plus recreate.",
-          "type": "string"
+          "description": "The PUBLIC key as one line, \"<algorithm> <base64> [comment]\" (the .pub file), the algorithm one of ssh-ed25519, ssh-rsa, ecdsa-sha2-nistp256/384/521, sk-ssh-ed25519@openssh.com, sk-ecdsa-sha2-nistp256@openssh.com (GitHub dropped DSA in 2022). Anything else, a line break included, is refused when the settings file is read; a private key is named, never echoed. Compared as algorithm + blob, comment ignored; immutable upstream, so a changed key is delete plus recreate.",
+          "type": "string",
+          "pattern": "^[ \\t]*(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519@openssh\\.com|sk-ecdsa-sha2-nistp256@openssh\\.com)[ \\t]+((?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=))(?:[ \\t][^\\r\\n]*)?$"
         },
         "read_only": {
           "description": "Whether the key is restricted to read-only access; GitHub defaults to false (read/write).",
@@ -917,6 +1241,84 @@
         "name"
       ]
     },
+    "LayeredList<BranchConfig>": {
+      "description": "The wrapped form of a list section that applies no undeclared policy (environments, branches, workflows): the plain array beside `{_layering, entries}`. The wrapper exists for the render directive alone, so the rendered document always holds the plain array, and with `_layering` omitted it behaves exactly like the plain array. Its keys are strict: anything besides `_layering` and `entries` (there is no `_undeclared` here, since the section keeps every live resource it does not declare) is rejected upfront as a typo.",
+      "type": "object",
+      "properties": {
+        "_layering": {
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (an environment's name, a branch name or pattern, a workflow path). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, the entry's nested lists (an environment's variables, secrets, branch policies, protection rules, and reviewers, each by its own key) unioning the same way. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, and the rendered document never carries it.",
+          "type": "string",
+          "enum": [
+            "replace",
+            "shallow",
+            "deep"
+          ]
+        },
+        "entries": {
+          "description": "The declared entries, exactly as the plain array form lists them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/BranchConfig"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "additionalProperties": false
+    },
+    "LayeredList<EnvironmentConfig>": {
+      "description": "The wrapped form of a list section that applies no undeclared policy (environments, branches, workflows): the plain array beside `{_layering, entries}`. The wrapper exists for the render directive alone, so the rendered document always holds the plain array, and with `_layering` omitted it behaves exactly like the plain array. Its keys are strict: anything besides `_layering` and `entries` (there is no `_undeclared` here, since the section keeps every live resource it does not declare) is rejected upfront as a typo.",
+      "type": "object",
+      "properties": {
+        "_layering": {
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (an environment's name, a branch name or pattern, a workflow path). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, the entry's nested lists (an environment's variables, secrets, branch policies, protection rules, and reviewers, each by its own key) unioning the same way. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, and the rendered document never carries it.",
+          "type": "string",
+          "enum": [
+            "replace",
+            "shallow",
+            "deep"
+          ]
+        },
+        "entries": {
+          "description": "The declared entries, exactly as the plain array form lists them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/EnvironmentConfig"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "additionalProperties": false
+    },
+    "LayeredList<WorkflowConfig>": {
+      "description": "The wrapped form of a list section that applies no undeclared policy (environments, branches, workflows): the plain array beside `{_layering, entries}`. The wrapper exists for the render directive alone, so the rendered document always holds the plain array, and with `_layering` omitted it behaves exactly like the plain array. Its keys are strict: anything besides `_layering` and `entries` (there is no `_undeclared` here, since the section keeps every live resource it does not declare) is rejected upfront as a typo.",
+      "type": "object",
+      "properties": {
+        "_layering": {
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (an environment's name, a branch name or pattern, a workflow path). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, the entry's nested lists (an environment's variables, secrets, branch policies, protection rules, and reviewers, each by its own key) unioning the same way. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, and the rendered document never carries it.",
+          "type": "string",
+          "enum": [
+            "replace",
+            "shallow",
+            "deep"
+          ]
+        },
+        "entries": {
+          "description": "The declared entries, exactly as the plain array form lists them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorkflowConfig"
+          }
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "additionalProperties": false
+    },
     "MilestoneConfig": {
       "description": "One milestone, matched by title.",
       "type": "object",
@@ -1044,20 +1446,198 @@
         ]
       }
     },
-    "RepositoryConfig": {
-      "description": "The `repository:` section. Every field not documented here is sent verbatim to PATCH /repos/{r} (Probot parity), so current and future repo fields work unchanged; the keys below route to their own endpoints instead. Only declared keys are ever applied or compared.",
+    "PatternRuleParameters": {
+      "description": "The pattern and operator the five *_pattern rule types share.",
       "type": "object",
       "properties": {
-        "topics": {
-          "description": "Repository topics, replaced wholesale via PUT /repos/{r}/topics; a comma-separated string or a list, lowercased and deduped.",
+        "name": {
+          "description": "How the rule appears when configuring it.",
+          "type": "string"
+        },
+        "negate": {
+          "description": "Whether the rule fails when the pattern matches.",
+          "type": "boolean"
+        },
+        "operator": {
+          "description": "starts_with, ends_with, contains, or regex, in that spelling.",
+          "type": "string",
+          "enum": [
+            "starts_with",
+            "ends_with",
+            "contains",
+            "regex"
+          ]
+        },
+        "pattern": {
+          "description": "The pattern to match.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "operator",
+        "pattern"
+      ],
+      "additionalProperties": {}
+    },
+    "RepositoryConfig": {
+      "description": "The `repository:` section, where only declared keys are ever applied or compared. A field not documented here is sent verbatim to PATCH /repos/{r}, so a field GitHub adds later works unchanged; the keys below carry GitHub's types (a toggle is true or false, never null or quoted) or route to their own endpoints. GET-only fields (ids, urls, counts, has_downloads, has_pages, custom_properties) are refused, since they would drift on every run.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "A short description of the repository; null clears it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "homepage": {
+          "description": "A URL with more information about the repository; null clears it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "private": {
+          "description": "Make the repository private (true) or public (false).",
+          "type": "boolean"
+        },
+        "visibility": {
+          "description": "public, private, or internal (Enterprise); a free string, since the spec omits internal.",
+          "type": "string"
+        },
+        "security_and_analysis": {
+          "description": "The security_and_analysis object of PATCH /repos/{r}: GitHub Advanced Security, secret scanning, push protection, and the other nested feature toggles.",
           "anyOf": [
             {
-              "type": "string"
+              "$ref": "#/definitions/SecurityAndAnalysisConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "has_issues": {
+          "description": "Enable issues (true) or disable them (false).",
+          "type": "boolean"
+        },
+        "has_projects": {
+          "description": "Enable projects (true) or disable them (false); an organization that disabled repository projects rejects true.",
+          "type": "boolean"
+        },
+        "has_wiki": {
+          "description": "Enable the wiki (true) or disable it (false).",
+          "type": "boolean"
+        },
+        "has_discussions": {
+          "description": "Enable discussions (true) or disable them (false); accepted by the PATCH though the descriptor omits it.",
+          "type": "boolean"
+        },
+        "has_pull_requests": {
+          "description": "Allow pull requests (true) or prevent them (false).",
+          "type": "boolean"
+        },
+        "pull_request_creation_policy": {
+          "description": "Who may create pull requests: \"all\" (everyone) or \"collaborators_only\".",
+          "type": "string",
+          "enum": [
+            "all",
+            "collaborators_only"
+          ]
+        },
+        "is_template": {
+          "description": "Offer the repository as a template (true) or not (false).",
+          "type": "boolean"
+        },
+        "default_branch": {
+          "description": "The default branch; an existing branch name.",
+          "type": "string"
+        },
+        "allow_squash_merge": {
+          "description": "Allow squash-merging pull requests (true) or not (false).",
+          "type": "boolean"
+        },
+        "allow_merge_commit": {
+          "description": "Allow merge commits on pull requests (true) or not (false).",
+          "type": "boolean"
+        },
+        "allow_rebase_merge": {
+          "description": "Allow rebase-merging pull requests (true) or not (false).",
+          "type": "boolean"
+        },
+        "allow_auto_merge": {
+          "description": "Allow auto-merge on pull requests (true) or not (false).",
+          "type": "boolean"
+        },
+        "delete_branch_on_merge": {
+          "description": "Delete head branches when pull requests merge (true) or keep them (false).",
+          "type": "boolean"
+        },
+        "allow_update_branch": {
+          "description": "Offer to update a pull request branch behind its base (true) or not (false).",
+          "type": "boolean"
+        },
+        "use_squash_pr_title_as_default": {
+          "description": "Deprecated by GitHub in favor of squash_merge_commit_title: use the PR title as the squash commit title (true) or not (false).",
+          "type": "boolean"
+        },
+        "squash_merge_commit_title": {
+          "description": "The default title of a squash merge commit: PR_TITLE or COMMIT_OR_PR_TITLE. Required beside squash_merge_commit_message; legal pairs are PR_TITLE with PR_BODY, BLANK, or COMMIT_MESSAGES, and COMMIT_OR_PR_TITLE with COMMIT_MESSAGES.",
+          "type": "string",
+          "enum": [
+            "PR_TITLE",
+            "COMMIT_OR_PR_TITLE"
+          ]
+        },
+        "squash_merge_commit_message": {
+          "description": "The default message of a squash merge commit: PR_BODY, BLANK, or COMMIT_MESSAGES. Needs squash_merge_commit_title declared beside it, in one of the legal pairs.",
+          "type": "string",
+          "enum": [
+            "PR_BODY",
+            "BLANK",
+            "COMMIT_MESSAGES"
+          ]
+        },
+        "merge_commit_title": {
+          "description": "The default title of a merge commit: PR_TITLE or MERGE_MESSAGE. Required beside merge_commit_message.",
+          "type": "string",
+          "enum": [
+            "PR_TITLE",
+            "MERGE_MESSAGE"
+          ]
+        },
+        "merge_commit_message": {
+          "description": "The default message of a merge commit: PR_BODY, PR_TITLE, or BLANK. Needs merge_commit_title declared beside it.",
+          "type": "string",
+          "enum": [
+            "PR_BODY",
+            "BLANK",
+            "PR_TITLE"
+          ]
+        },
+        "archived": {
+          "description": "Archive the repository (true) or unarchive it (false).",
+          "type": "boolean"
+        },
+        "allow_forking": {
+          "description": "Allow private forks (true) or not (false).",
+          "type": "boolean"
+        },
+        "web_commit_signoff_required": {
+          "description": "Require contributors to sign off on web-based commits (true) or not (false).",
+          "type": "boolean"
+        },
+        "topics": {
+          "description": "Repository topics, replaced wholesale via PUT /repos/{r}/topics; a comma-separated string or a list, lowercased and deduped. Each topic is 1 to 50 letters, digits, and hyphens, starting with a letter or digit (uppercase is lowercased on the wire); at most 20 distinct topics. An empty entry is refused; an empty list removes every topic.",
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^\\s*[A-Za-z0-9][A-Za-z0-9-]{0,49}\\s*(,\\s*[A-Za-z0-9][A-Za-z0-9-]{0,49}\\s*)*$"
             },
             {
               "type": "array",
               "items": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,49}$"
               }
             }
           ]
@@ -1097,7 +1677,927 @@
       },
       "additionalProperties": {
         "description": "Everything else passes through to PATCH /repos/{r} verbatim."
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "squash_merge_commit_message"
+            ]
+          },
+          "then": {
+            "required": [
+              "squash_merge_commit_title"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "squash_merge_commit_title"
+            ],
+            "properties": {
+              "squash_merge_commit_title": {
+                "const": "PR_TITLE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "squash_merge_commit_message": {
+                "enum": [
+                  "PR_BODY",
+                  "BLANK",
+                  "COMMIT_MESSAGES"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "squash_merge_commit_title"
+            ],
+            "properties": {
+              "squash_merge_commit_title": {
+                "const": "COMMIT_OR_PR_TITLE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "squash_merge_commit_message": {
+                "enum": [
+                  "COMMIT_MESSAGES"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "merge_commit_message"
+            ]
+          },
+          "then": {
+            "required": [
+              "merge_commit_title"
+            ]
+          }
+        }
+      ]
+    },
+    "RequiredReviewerConfig": {
+      "description": "A team and the file patterns whose changes it must approve.",
+      "type": "object",
+      "properties": {
+        "file_patterns": {
+          "description": "fnmatch patterns of the files the team must review.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "minimum_approvals": {
+          "description": "Approvals required from the team; zero adds the team as a reviewer without requiring approval.",
+          "type": "integer"
+        },
+        "reviewer": {
+          "description": "The reviewing team.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "The team's id.",
+              "type": "integer"
+            },
+            "type": {
+              "description": "Always \"Team\".",
+              "type": "string",
+              "const": "Team"
+            }
+          },
+          "required": [
+            "id",
+            "type"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "file_patterns",
+        "minimum_approvals",
+        "reviewer"
+      ],
+      "additionalProperties": {}
+    },
+    "ReviewDismissalActorConfig": {
+      "description": "One actor allowed to dismiss pull request reviews.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The actor's id.",
+          "type": "integer"
+        },
+        "type": {
+          "description": "User, Team, IntegrationInstallation, or RepositoryRole.",
+          "type": "string",
+          "enum": [
+            "User",
+            "Team",
+            "IntegrationInstallation",
+            "RepositoryRole"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<branch_name_pattern>": {
+      "description": "Branch names must match (or not match) a pattern.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "branch_name_pattern"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PatternRuleParameters"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<code_scanning>": {
+      "description": "Named code scanning tools must report before the ref is updated.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "code_scanning"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "code_scanning_tools": {
+              "description": "The tools that must provide results.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/CodeScanningToolConfig"
+              }
+            }
+          },
+          "required": [
+            "code_scanning_tools"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<commit_author_email_pattern>": {
+      "description": "Commit author emails must match (or not match) a pattern.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "commit_author_email_pattern"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PatternRuleParameters"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<commit_message_pattern>": {
+      "description": "Commit messages must match (or not match) a pattern.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "commit_message_pattern"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PatternRuleParameters"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<committer_email_pattern>": {
+      "description": "Committer emails must match (or not match) a pattern.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "committer_email_pattern"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PatternRuleParameters"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<copilot_code_review>": {
+      "description": "Copilot code review is requested on new pull requests automatically.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "copilot_code_review"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "review_draft_pull_requests": {
+              "description": "Whether drafts are reviewed before they are marked ready.",
+              "type": "boolean"
+            },
+            "review_on_push": {
+              "description": "Whether each new push is reviewed.",
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<creation>": {
+      "description": "Only actors with bypass permission may create matching refs.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "creation"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<deletion>": {
+      "description": "Only actors with bypass permission may delete matching refs.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "deletion"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<file_extension_restriction>": {
+      "description": "Commits adding files with the listed extensions are refused.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "file_extension_restriction"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "restricted_file_extensions": {
+              "description": "The file extensions refused.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "restricted_file_extensions"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<file_path_restriction>": {
+      "description": "Commits touching the listed paths are refused.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "file_path_restriction"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "restricted_file_paths": {
+              "description": "The file and folder paths refused.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "restricted_file_paths"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<license_compliance_scanning>": {
+      "description": "Added or changed dependencies must comply with the organization's license policy.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "license_compliance_scanning"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<max_file_path_length>": {
+      "description": "Commits with file paths over the length cap are refused.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "max_file_path_length"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "max_file_path_length": {
+              "description": "The most characters a file path may have (1 to 32767).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32767
+            }
+          },
+          "required": [
+            "max_file_path_length"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<max_file_size>": {
+      "description": "Commits with a file over the size cap are refused.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "max_file_size"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "max_file_size": {
+              "description": "The largest file allowed, in megabytes (1 to 100); Git LFS objects are exempt.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            }
+          },
+          "required": [
+            "max_file_size"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<merge_queue>": {
+      "description": "Merges into matching branches go through a merge queue.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "merge_queue"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "check_response_timeout_minutes": {
+              "description": "Minutes a required status check may take before it counts as failed (1 to 360).",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 360
+            },
+            "grouping_strategy": {
+              "description": "ALLGREEN (every PR's merge commit must pass all required checks) or HEADGREEN (only the head of the merge group must), in GitHub's upper-case spelling.",
+              "type": "string",
+              "enum": [
+                "ALLGREEN",
+                "HEADGREEN"
+              ]
+            },
+            "max_entries_to_build": {
+              "description": "Cap on queued pull requests building at the same time (0 to 100).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "max_entries_to_merge": {
+              "description": "Cap on pull requests merged as one group (0 to 100).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "merge_method": {
+              "description": "MERGE, SQUASH, or REBASE, in GitHub's upper-case spelling (the lower-case pull_request allowed_merge_methods spelling is refused here).",
+              "type": "string",
+              "enum": [
+                "MERGE",
+                "SQUASH",
+                "REBASE"
+              ]
+            },
+            "min_entries_to_merge": {
+              "description": "Minimum pull requests merged as one group (0 to 100).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "min_entries_to_merge_wait_minutes": {
+              "description": "Minutes the queue waits for the minimum group size before merging a smaller group (0 to 360).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 360
+            }
+          },
+          "required": [
+            "check_response_timeout_minutes",
+            "grouping_strategy",
+            "max_entries_to_build",
+            "max_entries_to_merge",
+            "merge_method",
+            "min_entries_to_merge",
+            "min_entries_to_merge_wait_minutes"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<non_fast_forward>": {
+      "description": "No force pushes to matching refs.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "non_fast_forward"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<pull_request>": {
+      "description": "Changes reach matching branches through a pull request only.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "pull_request"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "allowed_merge_methods": {
+              "description": "The merge methods allowed, lower-case merge, squash, rebase (the upper-case merge_queue spelling is refused here); at least one.",
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "merge",
+                  "squash",
+                  "rebase"
+                ]
+              }
+            },
+            "dismiss_stale_reviews_on_push": {
+              "description": "Whether a new reviewable push dismisses earlier approvals.",
+              "type": "boolean"
+            },
+            "dismissal_restriction": {
+              "description": "Who may dismiss pull request reviews.",
+              "type": "object",
+              "properties": {
+                "allowed_actors": {
+                  "description": "The people, teams, or apps allowed to dismiss reviews.",
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/definitions/ReviewDismissalActorConfig"
+                  }
+                },
+                "enabled": {
+                  "description": "Whether review dismissal is restricted to the listed actors.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "enabled"
+              ],
+              "additionalProperties": {}
+            },
+            "require_code_owner_review": {
+              "description": "Whether files with a code owner need that owner's approving review.",
+              "type": "boolean"
+            },
+            "require_last_push_approval": {
+              "description": "Whether the most recent reviewable push must be approved by someone other than its pusher.",
+              "type": "boolean"
+            },
+            "required_approving_review_count": {
+              "description": "Approving reviews required (0 to 10).",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 10
+            },
+            "required_review_thread_resolution": {
+              "description": "Whether every review conversation must be resolved before merging.",
+              "type": "boolean"
+            },
+            "required_reviewers": {
+              "description": "Teams that must review changes to given file patterns (GitHub marks this beta).",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/RequiredReviewerConfig"
+              }
+            }
+          },
+          "required": [
+            "dismiss_stale_reviews_on_push",
+            "require_code_owner_review",
+            "require_last_push_approval",
+            "required_approving_review_count",
+            "required_review_thread_resolution"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<required_deployments>": {
+      "description": "Named environments must deploy successfully before a push lands.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "required_deployments"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "required_deployment_environments": {
+              "description": "The environment names that must be deployed to first.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "required_deployment_environments"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<required_linear_history>": {
+      "description": "No merge commits may be pushed to matching refs.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "required_linear_history"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<required_signatures>": {
+      "description": "Commits pushed to matching refs must carry verified signatures.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "required_signatures"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<required_status_checks>": {
+      "description": "Named status checks must pass before the ref is updated.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "required_status_checks"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "do_not_enforce_on_create": {
+              "description": "Whether a new ref may be created even when a check would otherwise block it.",
+              "type": "boolean"
+            },
+            "required_status_checks": {
+              "description": "The checks that must pass.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/StatusCheckConfig"
+              }
+            },
+            "strict_required_status_checks_policy": {
+              "description": "Whether a pull request must be tested against the latest target commit.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "required_status_checks",
+            "strict_required_status_checks_policy"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<tag_name_pattern>": {
+      "description": "Tag names must match (or not match) a pattern.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "tag_name_pattern"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PatternRuleParameters"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<update>": {
+      "description": "Only actors with bypass permission may update matching refs.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "update"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "update_allows_fetch_and_merge": {
+              "description": "Whether the branch may still pull changes from its upstream repository.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "update_allows_fetch_and_merge"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "Rule<workflows>": {
+      "description": "Named workflows must pass before changes merge into matching branches.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it.",
+          "type": "string",
+          "const": "workflows"
+        },
+        "parameters": {
+          "description": "The rule's parameters, typed as the spec types them; a field GitHub adds later passes through.",
+          "type": "object",
+          "properties": {
+            "do_not_enforce_on_create": {
+              "description": "Whether a new ref may be created even when a workflow would otherwise block it.",
+              "type": "boolean"
+            },
+            "workflows": {
+              "description": "The workflow files that must pass.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/WorkflowFileConfig"
+              }
+            }
+          },
+          "required": [
+            "workflows"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
+    },
+    "RuleConfig": {
+      "description": "One rule of the ruleset: a type the spec knows, with its parameters typed, or any other type, passed through as written.",
+      "anyOf": [
+        {
+          "oneOf": [
+            {
+              "$ref": "#/definitions/Rule%3Ccreation%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cupdate%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cdeletion%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Crequired_linear_history%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cmerge_queue%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Crequired_deployments%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Crequired_signatures%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cpull_request%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Crequired_status_checks%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cnon_fast_forward%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Ccommit_message_pattern%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Ccommit_author_email_pattern%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Ccommitter_email_pattern%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cbranch_name_pattern%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Ctag_name_pattern%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cworkflows%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Ccode_scanning%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Ccopilot_code_review%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Clicense_compliance_scanning%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cfile_path_restriction%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cmax_file_path_length%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cfile_extension_restriction%3E"
+            },
+            {
+              "$ref": "#/definitions/Rule%3Cmax_file_size%3E"
+            }
+          ]
+        },
+        {
+          "$ref": "#/definitions/UnknownRule"
+        }
+      ]
     },
     "RulesetConfig": {
       "description": "One repository ruleset, matched to the live repo by name.",
@@ -1108,7 +2608,8 @@
           "type": "string"
         },
         "target": {
-          "description": "What the ruleset applies to; defaults to \"branch\" upstream.",
+          "description": "What the ruleset applies to. Omitted, it is \"branch\", the default GitHub documents, so a live branch ruleset is not drift under an entry without the key.",
+          "default": "branch",
           "type": "string",
           "enum": [
             "branch",
@@ -1117,8 +2618,14 @@
           ]
         },
         "enforcement": {
-          "description": "\"active\", \"evaluate\", or \"disabled\". Created rulesets default to \"active\".",
-          "type": "string"
+          "description": "\"active\", \"evaluate\", or \"disabled\", in that spelling (\"enabled\" and \"Active\" are refused at parse). Omitted, it is \"active\" (GitHub requires a value on create; this is the one chosen), so a live active ruleset is not drift under an entry without the key.",
+          "default": "active",
+          "type": "string",
+          "enum": [
+            "active",
+            "evaluate",
+            "disabled"
+          ]
         },
         "conditions": {
           "description": "Which refs the ruleset covers.",
@@ -1129,17 +2636,19 @@
               "type": "object",
               "properties": {
                 "include": {
-                  "description": "Ref patterns the ruleset targets (fnmatch; ~DEFAULT_BRANCH and ~ALL are accepted).",
+                  "description": "Ref patterns the ruleset targets (fnmatch). The tokens ~DEFAULT_BRANCH and ~ALL are accepted as written; any other value carrying \"~\", or one of \"^\", \":\", \"\\\\\", space, \"..\", \"@{\", or a control character, is refused at parse: git refuses these in a ref name and a ruleset pattern has no use for them. \"*\", \"?\", and \"[\" are pattern syntax and pass.",
                   "type": "array",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "pattern": "^(?:~ALL|~DEFAULT_BRANCH|(?:(?![~^:\\\\ \\x00-\\x1f\\x7f]|\\.\\.|@\\{)[\\s\\S])*)$"
                   }
                 },
                 "exclude": {
-                  "description": "Ref patterns excluded from the ruleset.",
+                  "description": "Ref patterns excluded from the ruleset; the same character rules apply.",
                   "type": "array",
                   "items": {
-                    "type": "string"
+                    "type": "string",
+                    "pattern": "^(?:~ALL|~DEFAULT_BRANCH|(?:(?![~^:\\\\ \\x00-\\x1f\\x7f]|\\.\\.|@\\{)[\\s\\S])*)$"
                   }
                 }
               }
@@ -1147,32 +2656,17 @@
           }
         },
         "rules": {
-          "description": "Rule list, passed through verbatim (future rule types included).",
+          "description": "Rule list. A rule type the vendored spec knows has its parameters checked at parse; a type it does not know passes through verbatim, so a rule type GitHub ships tomorrow works today.",
           "type": "array",
           "items": {
-            "type": "object",
-            "properties": {
-              "type": {
-                "description": "The rule type, as the rulesets API names it (e.g. pull_request, required_status_checks).",
-                "type": "string"
-              },
-              "parameters": {
-                "description": "The rule's parameters, passed through verbatim as the API documents them for its type.",
-                "type": "object",
-                "additionalProperties": {}
-              }
-            },
-            "required": [
-              "type"
-            ]
+            "$ref": "#/definitions/RuleConfig"
           }
         },
         "bypass_actors": {
-          "description": "Who may bypass the ruleset, passed through verbatim. GitHub returns it only to a token with write access to the ruleset, so a token without Administration write cannot judge drift on it (check mode notes this instead of reporting drift).",
+          "description": "Who may bypass the ruleset; each actor is one (actor_type, actor_id) pair, bypass_mode defaulting to always. An entry without the key leaves a live bypass list as drift and apply refuses the PUT; `[]` clears it on purpose. GitHub returns it only to a token with write access to the ruleset, so without Administration write check mode notes it instead of judging drift.",
           "type": "array",
           "items": {
-            "type": "object",
-            "additionalProperties": {}
+            "$ref": "#/definitions/BypassActorConfig"
           }
         }
       },
@@ -1189,28 +2683,28 @@
           "type": "string"
         },
         "pattern": {
-          "description": "The regular expression the secret format must match.",
+          "description": "The regular expression the secret format must match. Like every regex field here it passes a syntax check at parse, or the file is refused naming the field: the PCRE-only forms Hyperscan accepts (`(?P<name>`, `(?#comment)`, `\\x{HH}`, `(?i)`, atomic and possessive forms, `\\Q...\\E`) are translated, then the result must compile as a flagless JavaScript RegExp. GitHub can still refuse at apply what Hyperscan alone refuses (lookbehind, backreferences, option modifiers).",
           "type": "string"
         },
         "start_delimiter": {
-          "description": "Regular expression for the characters that must come before the secret. An empty string is rejected: a delimiter cannot be cleared through the update call - remove the pattern and redeclare it without the field instead.",
+          "description": "Regular expression for the characters that must come before the secret; it passes the syntax check, like `pattern`. An empty string is rejected: a delimiter cannot be cleared through the update call - remove the pattern and redeclare it without the field instead.",
           "type": "string",
           "minLength": 1
         },
         "end_delimiter": {
-          "description": "Regular expression for the characters that must come after the secret. An empty string is rejected, like start_delimiter.",
+          "description": "Regular expression for the characters that must come after the secret; it passes the syntax check, like `pattern`. An empty string is rejected, like start_delimiter.",
           "type": "string",
           "minLength": 1
         },
         "must_match": {
-          "description": "Additional regular expressions a match must also satisfy, compared in order.",
+          "description": "Additional regular expressions a match must also satisfy, compared in order; each passes the syntax check, like `pattern`.",
           "type": "array",
           "items": {
             "type": "string"
           }
         },
         "must_not_match": {
-          "description": "Regular expressions a match must NOT satisfy, compared in order.",
+          "description": "Regular expressions a match must NOT satisfy, compared in order; each passes the syntax check, like `pattern`.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1221,6 +2715,141 @@
         "name",
         "pattern"
       ]
+    },
+    "SecurityAndAnalysisConfig": {
+      "description": "The nested security_and_analysis object, closed to the sub-keys the PATCH accepts (GitHub rejects any other with a 422). Each feature is {status: enabled/disabled}. dependabot_security_updates is not one of them: declare enable_automated_security_fixes instead.",
+      "type": "object",
+      "properties": {
+        "advanced_security": {
+          "description": "GitHub Advanced Security.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "code_security": {
+          "description": "GitHub Code Security.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning": {
+          "description": "Secret scanning.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning_push_protection": {
+          "description": "Secret scanning push protection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning_ai_detection": {
+          "description": "AI detection of generic secrets.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning_non_provider_patterns": {
+          "description": "Non-provider secret patterns.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning_delegated_alert_dismissal": {
+          "description": "Delegated dismissal of secret scanning alerts.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning_delegated_bypass": {
+          "description": "Delegated bypass of push protection; the reviewers live in secret_scanning_delegated_bypass_options.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        },
+        "secret_scanning_delegated_bypass_options": {
+          "description": "Who reviews push protection bypass requests; honored only while secret_scanning_delegated_bypass is enabled.",
+          "type": "object",
+          "properties": {
+            "reviewers": {
+              "description": "The bypass reviewers; left out, the existing set is unchanged.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "reviewer_id": {
+                    "description": "The id of the team or role selected as a reviewer.",
+                    "type": "integer"
+                  },
+                  "reviewer_type": {
+                    "description": "TEAM or ROLE.",
+                    "type": "string",
+                    "enum": [
+                      "TEAM",
+                      "ROLE"
+                    ]
+                  },
+                  "mode": {
+                    "description": "ALWAYS (the default: every bypass needs review) or EXEMPT (this reviewer's own pushes skip it).",
+                    "type": "string",
+                    "enum": [
+                      "ALWAYS",
+                      "EXEMPT"
+                    ]
+                  }
+                },
+                "required": [
+                  "reviewer_id",
+                  "reviewer_type"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "secret_scanning_validity_checks": {
+          "description": "Validity checks for detected secrets (documented in the GHEC flavor of the spec).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecurityFeatureToggle"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SecurityFeatureToggle": {
+      "description": "One security_and_analysis feature.",
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "\"enabled\" or \"disabled\".",
+          "type": "string",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "SettingsFile": {
       "description": "One settings.yml document: every top-level section is optional.",
@@ -1264,17 +2893,31 @@
         },
         "branches": {
           "description": "Classic branch protection per branch.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/BranchConfig"
-          }
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/BranchConfig"
+              }
+            },
+            {
+              "$ref": "#/definitions/LayeredList%3CBranchConfig%3E"
+            }
+          ]
         },
         "environments": {
           "description": "Deployment environments, upserted by name.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/EnvironmentConfig"
-          }
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/EnvironmentConfig"
+              }
+            },
+            {
+              "$ref": "#/definitions/LayeredList%3CEnvironmentConfig%3E"
+            }
+          ]
         },
         "autolinks": {
           "description": "Autolink references; undeclared ones are DELETED by default (the wrapped form can set `_undeclared: keep`).",
@@ -1356,10 +2999,17 @@
         },
         "workflows": {
           "description": "Per-workflow enable/disable state; undeclared workflows are untouched.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/WorkflowConfig"
-          }
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/WorkflowConfig"
+              }
+            },
+            {
+              "$ref": "#/definitions/LayeredList%3CWorkflowConfig%3E"
+            }
+          ]
         },
         "check_suite_preferences": {
           "description": "Check suite preferences: per-GitHub-App `auto_trigger_checks` toggles controlling whether pushes automatically create check suites. Write-only upstream (GitHub exposes no read endpoint), so check mode cannot verify them and apply re-asserts the declared preferences on every run. The token owner must be a repository administrator.",
@@ -1534,14 +3184,33 @@
           ]
         },
         "_layering": {
-          "description": "mode: merge only: a layer-level default for how this document's keyed list sections (labels, rulesets) combine with the layers below it, overriding the run's layering input; a section's own wrapper-level `_layering` overrides it again. `merge` reaches every section of this document that takes the `{_undeclared, entries}` wrapper, and only the keyed ones accept it, so a document declaring `merge` with a section whose entries have no layering identity (milestones, autolinks) is refused unless that section's wrapper says `_layering: replace`. Consumed by the merge, never applied: the merged document carries no `_layering`, and apply and check ignore it like any `_` key.",
+          "description": "mode: render only: a layer-level default for how this document's list sections combine with the layers below it, overriding the run's layering input; a section's own wrapper-level `_layering` overrides it again. `replace` lets each of this document's lists win wholesale; `shallow` unions the entries by the section's key and swaps a same-key entry for this document's; `deep` unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. Consumed by the render, never applied: the rendered document carries no `_layering`, and apply and check ignore it like any `_` key.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       }
+    },
+    "StatusCheckConfig": {
+      "description": "One required status check.",
+      "type": "object",
+      "properties": {
+        "context": {
+          "description": "The status check context name that must be present on the commit.",
+          "type": "string"
+        },
+        "integration_id": {
+          "description": "The GitHub App the check must come from, when pinned.",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "context"
+      ],
+      "additionalProperties": {}
     },
     "TeamConfig": {
       "description": "One org team's access to the repository, matched by team slug. Keys other than name and permission are rejected (a misspelled \"permission\" would otherwise silently grant the default role).",
@@ -1590,11 +3259,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1623,11 +3293,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1656,11 +3327,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1689,11 +3361,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1722,11 +3395,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1755,11 +3429,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1788,11 +3463,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1821,11 +3497,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1854,11 +3531,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -1887,11 +3565,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2020,11 +3699,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2053,11 +3733,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2086,11 +3767,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2119,11 +3801,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2152,11 +3835,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2185,11 +3869,12 @@
           }
         },
         "_layering": {
-          "description": "A merge-time directive: how this section combines with the layers BELOW it in a layered merge. \"replace\" lets this layer's list win. \"merge\" unions the entries by identity and is accepted only on a section whose entries have one (labels by name, rulesets by name with their rules by type); on any other section it is refused, so declare \"replace\" or omit the key. Omitted, the run's layering applies. It has no effect on a single document, the merged document never carries it, and a list nested inside a section entry does not take it (a higher layer replaces such a list wholesale).",
+          "description": "A render-time directive: how this section combines with the layers BELOW it in a layered merge, by the section's key (a label's name, a secret's name, a webhook's URL, ...). \"replace\" lets this layer's list win wholesale; \"shallow\" unions the entries by key and swaps a same-key entry for this layer's; \"deep\" unions by key and merges a same-key pair field by field, a nested keyed list (a ruleset's rules, by type) unioning the same way. To clear a list, write \"replace\" with an empty list: under \"shallow\" and \"deep\" an empty list adds nothing. Omitted, the file's `_layering` applies, else the run's layering. It has no effect on a single document, the rendered document never carries it, and a list nested inside a section entry does not take it.",
           "type": "string",
           "enum": [
-            "merge",
-            "replace"
+            "replace",
+            "shallow",
+            "deep"
           ]
         }
       },
@@ -2197,6 +3882,52 @@
         "entries"
       ],
       "additionalProperties": false
+    },
+    "UnknownRule": {
+      "description": "A rule type the vendored spec does not know, passed through verbatim so a type GitHub ships tomorrow reaches it the day it ships; a typo comes back as GitHub's own 422 naming it.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "The rule type, as the rulesets API names it; none of the types the spec knows.",
+          "type": "string",
+          "not": {
+            "enum": [
+              "creation",
+              "update",
+              "deletion",
+              "required_linear_history",
+              "merge_queue",
+              "required_deployments",
+              "required_signatures",
+              "pull_request",
+              "required_status_checks",
+              "non_fast_forward",
+              "commit_message_pattern",
+              "commit_author_email_pattern",
+              "committer_email_pattern",
+              "branch_name_pattern",
+              "tag_name_pattern",
+              "workflows",
+              "code_scanning",
+              "copilot_code_review",
+              "license_compliance_scanning",
+              "file_path_restriction",
+              "max_file_path_length",
+              "file_extension_restriction",
+              "max_file_size"
+            ]
+          }
+        },
+        "parameters": {
+          "description": "The rule's parameters, as the API documents them for its type.",
+          "type": "object",
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": {}
     },
     "WebhookConfig": {
       "description": "One repository webhook, matched to the live repo by config.url. Hook URLs are configuration, not credentials: they appear in drift lines and notes on purpose. The secret never does.",
@@ -2216,7 +3947,7 @@
           ]
         },
         "events": {
-          "description": "Events that trigger deliveries, compared order-insensitively; GitHub defaults a new hook to [\"push\"]. Each name is one GitHub delivers to repository webhooks, or \"*\" for every event; anything else is refused at parse time, since GitHub would 422 it at apply time. The list is src/upstream-gaps/webhook-events.ts, kept from GitHub's webhook events reference, so an event GitHub adds is refused until a release adds the line.",
+          "description": "Events that trigger deliveries, compared order-insensitively; GitHub defaults a new hook to [\"push\"]. Each name is one GitHub delivers to repository webhooks, or \"*\" for every event; anything else is refused at parse time, since GitHub would 422 it at apply time. The accepted names come from GitHub's webhooks OpenAPI description, pinned through the @octokit/openapi-webhooks package, so an event GitHub adds is accepted once a release bumps that package.",
           "type": "array",
           "items": {
             "type": "string",
@@ -2357,6 +4088,33 @@
         "path",
         "state"
       ]
+    },
+    "WorkflowFileConfig": {
+      "description": "One workflow that must run for the rule to pass.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "The path to the workflow file.",
+          "type": "string"
+        },
+        "ref": {
+          "description": "The branch or tag of the workflow file to use.",
+          "type": "string"
+        },
+        "repository_id": {
+          "description": "The id of the repository that holds the workflow.",
+          "type": "integer"
+        },
+        "sha": {
+          "description": "The commit of the workflow file to use.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "repository_id"
+      ],
+      "additionalProperties": {}
     }
   }
 }

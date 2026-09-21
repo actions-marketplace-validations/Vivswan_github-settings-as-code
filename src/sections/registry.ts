@@ -7,7 +7,7 @@
  */
 
 import type { z } from "zod";
-import { SECTION_KEYS, type SectionKey, type SettingsFile } from "../schema.js";
+import { type ListSection, SECTION_KEYS, type SectionKey, type SettingsFile } from "../schema.js";
 import type { DeepReadonly, MustBeNever } from "../types.js";
 import { actionsSection } from "./actions/index.js";
 import { actionsSecretsSection } from "./actions_secrets/index.js";
@@ -29,6 +29,7 @@ import {
   type EndpointDict,
   freezeDeclarations,
   type GraphqlDict,
+  type KeyedListLayering,
   type ORG_PROBE,
   type SectionModule,
 } from "./contract/module.js";
@@ -181,6 +182,18 @@ type OwnerGatesWithoutProbe = {
 type _OwnerGatesDeclareTheProbe = MustBeNever<OwnerGatesWithoutProbe>;
 
 /**
+ * Every list section layers by key, so a list module registered without `layering` fails here by name:
+ * the fold would otherwise have no key to union its entries by and would replace them silently.
+ */
+type ListModulesWithoutKey = {
+  [K in ListSection]: SectionModules[K] extends { readonly layering: KeyedListLayering }
+    ? never
+    : K;
+}[ListSection];
+
+type _ListModulesDeclareTheirKey = MustBeNever<ListModulesWithoutKey>;
+
+/**
  * Derived from each module's literal ENDPOINTS, so every consumer (the mock handler tables, dispatch,
  * fault directives) tracks the declarations by construction.
  */
@@ -264,6 +277,12 @@ export function sectionShape(key: SectionKey): z.ZodType {
 /** The section module for a key (validate.ts reads shape + closedSurface). */
 export function sectionModule<K extends SectionKey>(key: K): SectionModule<K> {
   return guarded[key];
+}
+
+/** The key a list section's entries layer by; total because the registry requires the declaration (_ListModulesDeclareTheirKey). */
+export function listLayering(key: ListSection): KeyedListLayering {
+  const module: { readonly layering: KeyedListLayering } = byKey[key];
+  return module.layering;
 }
 
 export type TaggedEndpoint = DeepReadonly<

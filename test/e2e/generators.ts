@@ -11,6 +11,8 @@ import { validateSettingsDoc } from "../../src/engine/orchestrate.js";
 import { SectionSelection } from "../../src/engine/section-selection.js";
 import { silentIo } from "../../src/io.js";
 import {
+  LIST_SECTIONS,
+  type ListSection,
   SECTION_KEYS,
   type SectionKey,
   type SettingsFile,
@@ -40,7 +42,8 @@ import { genMilestones, milestonesWitness } from "../../src/sections/milestones/
 import { genPages } from "../../src/sections/pages/generators.js";
 import { allEndpoints, allGraphqlOps, SECTIONS } from "../../src/sections/registry.js";
 import { genRepository } from "../../src/sections/repository/generators.js";
-import { genRulesets } from "../../src/sections/rulesets/generators.js";
+import { genRulesets, PULL_REQUEST_PARAMETERS } from "../../src/sections/rulesets/generators.js";
+import { compileFailure } from "../../src/sections/secret_scanning_custom_patterns/compilable-form.js";
 import { genSecretScanningPatterns } from "../../src/sections/secret_scanning_custom_patterns/generators.js";
 import { MAX_VARIABLE_VALUE_BYTES } from "../../src/sections/shared/schema-helpers.js";
 import { genTeams } from "../../src/sections/teams/generators.js";
@@ -49,6 +52,7 @@ import { genWorkflows } from "../../src/sections/workflows/generators.js";
 import type { MustBeNever } from "../../src/types.js";
 import { ADMIN_SLUG } from "./constants.js";
 import {
+  DEFAULT_LAYERING_DIRECTIVE,
   E2E_SECRET_ENV,
   type EntriesForm,
   entriesOf,
@@ -59,6 +63,7 @@ import {
   type LiveWitness,
   type LiveWitnessKind,
   maybeWrapUndeclared,
+  NULL_VALUED_ENTRY_PATHS,
   UNDECLARED_KEY,
 } from "./gen-support.js";
 import type { LiveState } from "./mock/state.js";
@@ -228,6 +233,23 @@ function suppressMaskedCustomProperties(
     sections.splice(sections.indexOf("custom_properties"), 1);
   } else {
     mask.custom_properties = "read";
+  }
+}
+
+/**
+ * A personal account's repository takes pull, push, admin and 422s the rest (mock/state.ts, grantablePermission), and
+ * the runtime cannot refuse a triage or maintain there at parse: the owner is unknown until the repository read. So a
+ * generated file never declares one on a personal account; maintain folds to push, GitHub's own default. A post-draw
+ * rewrite, not a different draw, so the main stream and every recorded seed stay stable.
+ */
+function personalizeCollaborators(settings: Json, ownerKind: OwnerKind): void {
+  if (ownerKind !== "user" || settings.collaborators === undefined) {
+    return;
+  }
+  for (const entry of entriesOf(settings.collaborators)) {
+    if (entry.permission === "maintain") {
+      entry.permission = "push";
+    }
   }
 }
 
@@ -445,6 +467,37 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
     },
   },
   {
+    // Parse refuses an id no GitHub App has or GitHub rejects; otherwise the PATCH would report it late and on every run.
+    // The pair GitHub collapses is what nothing reads back, since the section has no read endpoint.
+    name: "check-suite-app-id-not-positive-integer",
+    build: (rng) => ({
+      doc: {
+        check_suite_preferences: {
+          auto_trigger_checks: [{ app_id: rng.pick([0, -15368, 15368.5] as const), setting: true }],
+        },
+      },
+      offendingToken: "check_suite_preferences.auto_trigger_checks[0].app_id",
+    }),
+  },
+  {
+    name: "check-suite-duplicate-app-id",
+    build: (rng) => {
+      const app_id = rng.pick([15368, 29310] as const);
+      return {
+        doc: {
+          check_suite_preferences: {
+            auto_trigger_checks: [
+              { app_id, setting: rng.bool() },
+              { app_id: 62410, setting: true },
+              { app_id, setting: rng.bool() },
+            ],
+          },
+        },
+        offendingToken: `check_suite_preferences.auto_trigger_checks[2].app_id: repeats app_id ${app_id} from auto_trigger_checks[0]`,
+      };
+    },
+  },
+  {
     name: "pages-wrong-type",
     build: (rng) => ({
       doc: { pages: rng.pick(["gh-pages", [1]] as const) },
@@ -588,6 +641,26 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
     },
   },
   {
+    name: "branches-checks-unknown-key",
+    build: (rng) => {
+      // A check item is GitHub's closed {context, app_id} shape; the entry is made literal, since a
+      // wildcard rule refuses `checks` itself ahead of the item.
+      const { value, entries, index, itemToken } = validItems(rng, "branches");
+      const entry = entries[index] as Json;
+      entry.name = "main";
+      entry.protection = {
+        required_status_checks: {
+          strict: true,
+          checks: [{ context: "ci", [rng.pick(["app", "app_slug", "name"])]: "ci-bot" }],
+        },
+      };
+      return {
+        doc: { branches: value },
+        offendingToken: `${itemToken}.protection.required_status_checks.checks[0]`,
+      };
+    },
+  },
+  {
     name: "workflows-state-enum",
     build: (rng) => {
       const { value, entries, index, itemToken } = validItems(rng, "workflows");
@@ -605,6 +678,93 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
         doc: { rulesets: value },
         offendingToken: `${itemToken}.conditions.ref_name.include`,
       };
+    },
+  },
+  {
+    name: "rulesets-enforcement-enum",
+    build: (rng) => {
+      const { value, entries, index, itemToken } = validItems(rng, "rulesets");
+      (entries[index] as Json).enforcement = rng.pick(["enabled", "Active", "on"]);
+      return { doc: { rulesets: value }, offendingToken: `${itemToken}.enforcement` };
+    },
+  },
+  {
+    name: "rulesets-ref-token-typo",
+    build: (rng) => {
+      // normalizeRefName passes every "~" value through, so a typo'd token would reach GitHub as written.
+      const { value, entries, index, itemToken } = validItems(rng, "rulesets");
+      (entries[index] as Json).conditions = {
+        ref_name: { include: [rng.pick(["~all", "~MAIN", "~default_branch", "release~1"])] },
+      };
+      return {
+        doc: { rulesets: value },
+        offendingToken: `${itemToken}.conditions.ref_name.include[0]`,
+      };
+    },
+  },
+  {
+    name: "rulesets-ref-pattern-illegal-character",
+    build: (rng) => {
+      // A character git refuses in a ref name; the pattern would reach GitHub prefixed and come back as a 422.
+      const { value, entries, index, itemToken } = validItems(rng, "rulesets");
+      (entries[index] as Json).conditions = {
+        ref_name: {
+          exclude: [
+            rng.pick([
+              "release^2",
+              "a:b",
+              "back\\slash",
+              "hot fix",
+              "a..b",
+              "main@{1}",
+              "tab\tbed",
+            ]),
+          ],
+        },
+      };
+      return {
+        doc: { rulesets: value },
+        offendingToken: `${itemToken}.conditions.ref_name.exclude[0]`,
+      };
+    },
+  },
+  {
+    name: "rulesets-bypass-actor-without-id",
+    build: (rng) => {
+      const { value, entries, index, itemToken } = validItems(rng, "rulesets");
+      (entries[index] as Json).bypass_actors = [
+        { actor_type: rng.pick(["Team", "User", "RepositoryRole", "Integration"]) },
+      ];
+      return { doc: { rulesets: value }, offendingToken: `${itemToken}.bypass_actors[0].actor_id` };
+    },
+  },
+  {
+    name: "rulesets-known-rule-parameter-case",
+    build: (rng) => {
+      // The casing GitHub sets on a KNOWN rule type is refused at parse; an unknown type still passes through to GitHub's own 422.
+      const { value, entries, index, itemToken } = validItems(rng, "rulesets");
+      (entries[index] as Json).rules = [
+        rng.pick([
+          { type: "branch_name_pattern", parameters: { operator: "startsWith", pattern: "feat/" } },
+          {
+            type: "pull_request",
+            parameters: { ...PULL_REQUEST_PARAMETERS, allowed_merge_methods: ["SQUASH"] },
+          },
+          {
+            type: "merge_queue",
+            parameters: {
+              check_response_timeout_minutes: 60,
+              grouping_strategy: "ALLGREEN",
+              max_entries_to_build: 5,
+              max_entries_to_merge: 5,
+              merge_method: "squash",
+              min_entries_to_merge: 1,
+              min_entries_to_merge_wait_minutes: 5,
+            },
+          },
+        ]),
+      ];
+      return { doc: { rulesets: value }, offendingToken: `${itemToken}.rules[0]: parameters.` };
     },
   },
   {
@@ -627,6 +787,45 @@ export const INVALID_SETTINGS_CASES: ReadonlyArray<{
       return {
         doc: { [key]: { [UNDECLARED_KEY]: rng.pick(["detele", "kep", true]), entries } },
         offendingToken: `${key}.${UNDECLARED_KEY}`,
+      };
+    },
+  },
+  {
+    name: "secret-scanning-pattern-uncompilable",
+    build: (rng) => {
+      // Each field is a regex GitHub compiles as Hyperscan; the schema refuses what no dialect parses,
+      // and the oracle here is the section's own check, so a pool value the check accepts fails the draw loudly.
+      const { value, entries, index, itemToken } = validItems(
+        rng,
+        "secret_scanning_custom_patterns",
+      );
+      const field = rng.pick([
+        "pattern",
+        "start_delimiter",
+        "end_delimiter",
+        "must_match",
+        "must_not_match",
+      ]);
+      // The last two are PCRE refusals a flagless RegExp alone would take: a quantified anchor, a group name declared twice.
+      const broken = rng.pick([
+        "([a-z",
+        "*token",
+        "key_[0-9]{6}\\",
+        "(?P<t>key_[0-9",
+        "\\A+",
+        "(?<t>x)|(?<t>y)",
+      ]);
+      if (compileFailure(broken) === undefined) {
+        throw new Error(
+          `the refused draw ${JSON.stringify(broken)} passes the syntax check; pick another`,
+        );
+      }
+      const entry = entries[index] as Json;
+      const listField = field === "must_match" || field === "must_not_match";
+      entry[field] = listField ? ["[0-9]", broken] : broken;
+      return {
+        doc: { secret_scanning_custom_patterns: value },
+        offendingToken: `${itemToken}.${field}${listField ? "[1]" : ""}`,
       };
     },
   },
@@ -955,6 +1154,7 @@ export function genScenario(
   const mode = rng.pick(["apply", "check"] as const);
   const policy = rng.pick(["fail", "warn"] as const);
   const ownerKind: OwnerKind = rng.pick(["org", "user"] as const);
+  personalizeCollaborators(settings, ownerKind);
   // 404 answers every denial with Not Found, but the client still classifies a 404 on a write as a permission denial
   // (src/github/api.ts), so its outcome classes equal fine_grained's for every operation generated today; 403 discriminates.
   const denialStyle: DenialStyle = rng.pick(["fine_grained", 403, 404] as const);
@@ -1481,7 +1681,7 @@ export function genDiscoveryScenario(
   return { scenario, meta: { pool, filters, privateRepos } };
 }
 
-// --- Layered merge scenarios (mode: merge fuzz) -----------------------------
+// --- Layered merge scenarios (mode: render fuzz) -----------------------------
 
 /** `name` is the file name the runner writes and the action's refusals and notices report. */
 export interface MergeLayer {
@@ -1494,14 +1694,11 @@ export interface MergeLayer {
  * scenario JSON, so it is not generated.
  *
  * duplicate-rule-type / duplicate-label      -> two entries of one keyed list sharing a key (rules by type, labels by case-folded name)
- * merge-on-unkeyed-wrapper / -file           -> an explicit `merge` on a knobbed section that has no layering key
- * bad-wrapper-layering / bad-file-layering   -> a directive value outside merge|replace
+ * bad-wrapper-layering / bad-file-layering   -> a directive value outside replace|shallow|deep (the retired `merge` among them)
  */
 export const MERGE_REFUSAL_KINDS = [
   "duplicate-rule-type",
   "duplicate-label",
-  "merge-on-unkeyed-wrapper",
-  "merge-on-unkeyed-file",
   "bad-wrapper-layering",
   "bad-file-layering",
 ] as const;
@@ -1515,15 +1712,19 @@ type MergeRefusalKind = (typeof MERGE_REFUSAL_KINDS)[number];
 export const MERGE_FEATURES = [
   /** A section declared non-null by a layer while the fold already holds it. */
   "override",
-  /** Labels declared under an effective merge layering while the fold holds labels. */
+  /** Labels declared under an effective shallow or deep layering while the fold holds labels. */
   "union-labels",
-  /** Rulesets declared under an effective merge layering while the fold holds rulesets. */
+  /** Rulesets declared under an effective shallow or deep layering while the fold holds rulesets. */
   "union-rulesets",
+  /** Environments declared under an effective shallow or deep layering while the fold holds environments: a plain-list union, its nested lists with it under deep. */
+  "union-environments",
+  /** A plain-list section (environments, branches, workflows) drawn in its `{_layering, entries}` wrapper form. */
+  "wrapper-layered",
   /** A unioned label whose name differs only by case from the spelling the fold holds. */
   "label-case-fold",
   /** A unioned label pairing with a held label through a rename: one of the two claims the other's name as its rename target or current name. */
   "label-rename-union",
-  /** A unioned ruleset re-declaring a held rule type with different parameters, so replacement is observable. */
+  /** A unioned ruleset re-declaring a held rule type with different parameters, so the swap (shallow) or the field merge (deep) is observable. */
   "rule-parameters",
   /** A top-level null over a section the fold holds, where null is not the section's value. */
   "null-deletes",
@@ -1536,11 +1737,13 @@ export const MERGE_FEATURES = [
   /** A top-level null over a section the fold does not hold and whose value null is not: it drops. */
   "null-drops",
   "wrapper-undeclared",
-  "wrapper-layering-merge",
   "wrapper-layering-replace",
+  "wrapper-layering-shallow",
+  "wrapper-layering-deep",
   "file-layering",
   "run-layering-replace",
-  "run-layering-merge",
+  "run-layering-shallow",
+  "run-layering-deep",
   "run-layering-default",
   "empty-layer",
   "refused",
@@ -1566,16 +1769,6 @@ export type MergeForce =
   | { kind: "valid"; layering: LayeringDirective }
   | { kind: "refused"; refusal: MergeRefusalKind };
 
-/** The knobbed sections whose module declares a layering key: the only lists a merge unions. */
-const KEYED_MERGE_SECTIONS: ReadonlySet<SectionKey> = new Set(
-  SECTIONS.filter((section) => section.layering !== undefined).map((section) => section.key),
-);
-
-/** The knobbed sections a merge always replaces (no layering key). */
-const UNKEYED_KNOBBED_SECTIONS: readonly SectionKey[] = UNDECLARED_POLICY_SECTIONS.filter(
-  (key) => !KEYED_MERGE_SECTIONS.has(key),
-);
-
 /** The sections whose top-level null is the section's value; on every other section a null over nothing drops. */
 const NULLABLE_SECTIONS = ["pages", "interaction_limits"] as const satisfies readonly SectionKey[];
 
@@ -1587,40 +1780,118 @@ function isKnobbedSection(key: string): key is (typeof UNDECLARED_POLICY_SECTION
   return (UNDECLARED_POLICY_SECTIONS as readonly string[]).includes(key);
 }
 
+function isListSectionKey(key: string): key is ListSection {
+  return (LIST_SECTIONS as readonly string[]).includes(key);
+}
+
+/** The nested keyed lists of a list section's entry, in the harness's own words (the oracle spells the keys). */
+const NESTED_LIST_FIELDS: Readonly<Partial<Record<ListSection, readonly string[]>>> = {
+  rulesets: ["rules"],
+  environments: [
+    "variables",
+    "secrets",
+    "deployment_branch_policies",
+    "deployment_protection_rules",
+    "reviewers",
+  ],
+};
+
+function isLayeringDirective(value: unknown): value is LayeringDirective {
+  return (LAYERING_DIRECTIVES as readonly unknown[]).includes(value);
+}
+
 function isPlainMapping(value: unknown): value is Json {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
- * A layer as its standalone validation sees it: every null the fold reads as a marker is dropped, a ruleset entry's
- * null field included (the one list this generator places nulls in). Other lists are data, so a null inside them stays for the validator to judge.
+ * A layer as its standalone validation sees it, in the harness's own words: every null the fold reads as a marker is
+ * dropped. A list section's entries are entered only under an effective `deep` (the wrapper's directive, else the
+ * file's, else the run's), their nested keyed lists with them in either form (a nested wrapper's own null knob is a
+ * marker too), and a null at a NULL_VALUED_ENTRY_PATHS path stays as the value; under `shallow` and `replace` the fold
+ * copies entries as written, so a null inside one stays for the validator to judge, as does a null inside any other list.
  */
-function markerNullsDropped(doc: Json): Json {
-  const dropDeep = (value: unknown): unknown => {
+export function markerNullsDropped(doc: Json, run: LayeringDirective): Json {
+  const dropDeep = (
+    value: unknown,
+    lists: readonly string[] = [],
+    valued: readonly string[] = [],
+    prefix = "",
+  ): unknown => {
     if (!isPlainMapping(value)) {
       return value;
     }
     const out: Json = {};
     for (const [key, child] of Object.entries(value)) {
-      if (child !== null) {
-        out[key] = dropDeep(child);
+      const path = prefix === "" ? key : `${prefix}.${key}`;
+      if (child === null) {
+        if (valued.includes(path)) {
+          put(out, key, null);
+        }
+        continue;
       }
+      put(
+        out,
+        key,
+        prefix === "" && lists.includes(key)
+          ? dropNested(child)
+          : dropDeep(child, [], valued, path),
+      );
     }
     return out;
   };
+  const dropNested = (value: unknown): unknown => {
+    if (Array.isArray(value)) {
+      return value.map((item) => dropDeep(item));
+    }
+    if (!isPlainMapping(value) || !Array.isArray(value.entries)) {
+      return dropDeep(value);
+    }
+    const { entries, ...knobs } = value;
+    return { ...(dropDeep(knobs) as Json), entries: entries.map((item) => dropDeep(item)) };
+  };
+  const file = isLayeringDirective(doc[LAYERING_KEY]) ? doc[LAYERING_KEY] : undefined;
   const out: Json = {};
   for (const [key, value] of Object.entries(doc)) {
     if (value === null) {
+      // The section's own value where null is one (`pages: null`); a marker everywhere else.
+      if (isNullValued(key)) {
+        out[key] = null;
+      }
       continue;
     }
-    if (key === "rulesets") {
-      const entries = entriesOf(value).map((entry) => dropDeep(entry) as Json);
-      out[key] = Array.isArray(value) ? entries : { ...(value as Json), entries };
-    } else {
-      out[key] = isKnobbedSection(key) ? value : dropDeep(value);
+    if (!isListSectionKey(key)) {
+      out[key] = dropDeep(value);
+      continue;
     }
+    const wrapper = wrapperDirective(value);
+    const effective = (isLayeringDirective(wrapper) ? wrapper : undefined) ?? file ?? run;
+    const nested = NESTED_LIST_FIELDS[key] ?? [];
+    const valued = NULL_VALUED_ENTRY_PATHS[key] ?? [];
+    // Under shallow and replace the entries are copied as written; only deep enters them.
+    const entries =
+      effective === "deep"
+        ? entriesOf(value).map((entry) => dropDeep(entry, nested, valued) as Json)
+        : entriesOf(value);
+    if (Array.isArray(value)) {
+      out[key] = entries;
+      continue;
+    }
+    // The wrapper's own knobs are mapping keys to the fold under every directive, so a null one (`_undeclared: null`) is a marker.
+    const { entries: _entries, ...knobs } = value as Json;
+    out[key] = { ...(dropDeep(knobs) as Json), entries };
   }
   return out;
+}
+
+/** Set an own data property whatever the key; assigning `__proto__` would set the prototype, as the engine's copier avoids too. */
+function put(record: Json, key: string, value: unknown): void {
+  Object.defineProperty(record, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
 }
 
 /**
@@ -1628,10 +1899,10 @@ function markerNullsDropped(doc: Json): Json {
  * limits, selected_actions is refused beside an allowed_actions other than selected), so null placements are probed
  * through the action's own validator.
  */
-function standaloneValid(doc: Json): boolean {
+function standaloneValid(doc: Json, run: LayeringDirective): boolean {
   return !(
     "error" in
-    validateSettingsDoc(markerNullsDropped(doc), "layer", SectionSelection.ALL, silentIo())
+    validateSettingsDoc(markerNullsDropped(doc, run), "layer", SectionSelection.ALL, silentIo())
   );
 }
 
@@ -1640,7 +1911,7 @@ function mergeLayerName(index: number, count: number): string {
   return index === count - 1 ? "settings.yml" : `layer-${index}.yml`;
 }
 
-/** Every nested key path through a non-knobbed section's plain mappings; lists are data to the merge, so the walk never enters one. */
+/** Every nested key path through a mapping section's plain mappings; lists are data to the merge, so the walk never enters one, nor a list section's wrapper. */
 function nestedMappingPaths(doc: Json): string[][] {
   const paths: string[][] = [];
   const walk = (value: unknown, path: string[]): void => {
@@ -1656,7 +1927,7 @@ function nestedMappingPaths(doc: Json): string[][] {
     }
   };
   for (const [key, value] of Object.entries(doc)) {
-    if (!isKnobbedSection(key) && key !== LAYERING_KEY) {
+    if (!isListSectionKey(key) && key !== LAYERING_KEY) {
       walk(value, [key]);
     }
   }
@@ -1719,7 +1990,8 @@ function ensureEntries(doc: Json, key: SectionKey): Json[] {
   return entriesOf(value);
 }
 
-const BAD_LAYERING_VALUES = ["MERGE", "union", "both", 1] as const;
+/** `merge` is the directive's retired spelling: it fails as any unknown value does. */
+const BAD_LAYERING_VALUES = ["merge", "DEEP", "union", "both", 1] as const;
 
 interface LayerDraft {
   doc: Json;
@@ -1834,14 +2106,8 @@ export function mergeFeaturesOf(
     features.add("refused");
     return MERGE_FEATURES.filter((feature) => features.has(feature));
   }
-  features.add(
-    runInput === undefined
-      ? "run-layering-default"
-      : runInput === "merge"
-        ? "run-layering-merge"
-        : "run-layering-replace",
-  );
-  const run = runInput ?? "merge";
+  features.add(runInput === undefined ? "run-layering-default" : `run-layering-${runInput}`);
+  const run = runInput ?? DEFAULT_LAYERING_DIRECTIVE;
   const present = new Set<string>();
   const held: HeldKeyed = { labels: [], rulesets: new Map() };
   for (const layer of layers) {
@@ -1874,22 +2140,29 @@ export function mergeFeaturesOf(
       if (present.has(key)) {
         features.add("override");
       }
-      if (isKnobbedSection(key)) {
+      if (isListSectionKey(key)) {
         if (!Array.isArray(value)) {
           const wrapper = value as Json;
           if (wrapper[UNDECLARED_KEY] !== undefined) {
             features.add("wrapper-undeclared");
           }
-          if (wrapper[LAYERING_KEY] === "merge") {
-            features.add("wrapper-layering-merge");
+          if (!isKnobbedSection(key)) {
+            features.add("wrapper-layered");
           }
-          if (wrapper[LAYERING_KEY] === "replace") {
-            features.add("wrapper-layering-replace");
+          const directive = wrapper[LAYERING_KEY];
+          if (isLayeringDirective(directive)) {
+            features.add(`wrapper-layering-${directive}`);
+          }
+        }
+        if (key === "environments") {
+          const effective = wrapperDirective(value) ?? fileDirective ?? run;
+          if (present.has(key) && effective !== "replace") {
+            features.add("union-environments");
           }
         }
         if (key === "labels" || key === "rulesets") {
           const effective = wrapperDirective(value) ?? fileDirective ?? run;
-          const unite = present.has(key) && effective === "merge";
+          const unite = present.has(key) && effective !== "replace";
           if (unite) {
             features.add(key === "labels" ? "union-labels" : "union-rulesets");
             for (const entry of entriesOf(value)) {
@@ -1963,10 +2236,10 @@ export function genMergeScenario(
   const count = rng.int(4) + 2;
   const force = options.force;
 
-  const rolledLayering = rng.pick(["merge", "replace", undefined] as const);
+  const rolledLayering = rng.pick([...LAYERING_DIRECTIVES, undefined]);
   const runLayering: LayeringDirective | undefined =
     force?.kind === "valid" ? force.layering : rolledLayering;
-  const effectiveRunLayering: LayeringDirective = runLayering ?? "merge";
+  const effectiveRunLayering: LayeringDirective = runLayering ?? DEFAULT_LAYERING_DIRECTIVE;
 
   const rolledRefusal = rng.bool(0.2)
     ? { index: rng.int(count), kind: rng.pick(MERGE_REFUSAL_KINDS) }
@@ -1997,14 +2270,14 @@ export function genMergeScenario(
       respellLabels(layerRng.fork("case"), draft, held, effectiveRunLayering, present);
       placeNulls(layerRng.fork("nulls"), draft, lower, present, pool, effectiveRunLayering);
     }
-    if (!standaloneValid(draft.doc)) {
+    if (!standaloneValid(draft.doc, effectiveRunLayering)) {
       // Every placement above is probed, so an invalid layer here is a hole in the probes, not a scenario to run.
       throw new Error(
         `BUG: merge layer ${name} fails its standalone validation: ${JSON.stringify(draft.doc)}`,
       );
     }
     if (refusal !== undefined && refusal.index === i) {
-      refuseLayer(layerRng.fork("refusal"), draft, refusal.kind, pool);
+      refuseLayer(layerRng.fork("refusal"), draft, refusal.kind);
     }
     for (const [key, value] of Object.entries(draft.doc)) {
       if (key === LAYERING_KEY) {
@@ -2016,7 +2289,7 @@ export function genMergeScenario(
           held,
           key,
           value,
-          present.has(section) && effectiveLayering(draft, key, effectiveRunLayering) === "merge",
+          present.has(section) && effectiveLayering(draft, key, effectiveRunLayering) !== "replace",
         );
       }
       if (value === null) {
@@ -2025,7 +2298,7 @@ export function genMergeScenario(
         continue;
       }
       present.add(section);
-      if (!isKnobbedSection(key) && isPlainMapping(value)) {
+      if (!isListSectionKey(key) && isPlainMapping(value)) {
         heldMappings.add(section);
       } else {
         heldMappings.delete(section);
@@ -2041,7 +2314,7 @@ export function genMergeScenario(
     tiers: ["mock"],
     settings: top.doc,
     settings_layers: layers.slice(0, -1).map((layer) => layer.doc),
-    inputs: { mode: "merge", ...(runLayering === undefined ? {} : { layering: runLayering }) },
+    inputs: { mode: "render", ...(runLayering === undefined ? {} : { layering: runLayering }) },
     denial_style: "fine_grained",
     owner_kind: "org",
     expect: { exit_code: 0 },
@@ -2059,14 +2332,11 @@ export function genMergeScenario(
   };
 }
 
-/**
- * The keyed sections are favored, so unions happen. A file-level `merge` forces every unkeyed knobbed section into a
- * wrapper saying `replace`, the one spelling the boundary admits for it.
- */
+/** The list sections are favored, so unions happen. */
 function drawLayer(rng: Rng, pool: readonly SectionKey[]): LayerDraft {
   const chosen = rng.bool(0.08)
     ? []
-    : pool.filter((key) => rng.bool(KEYED_MERGE_SECTIONS.has(key) ? 0.6 : 0.3));
+    : pool.filter((key) => rng.bool(isListSectionKey(key) ? 0.6 : 0.3));
   const doc: Json = {};
   for (const key of chosen) {
     doc[key] = genSettings(rng.fork(`settings:${key}`), key);
@@ -2074,7 +2344,8 @@ function drawLayer(rng: Rng, pool: readonly SectionKey[]): LayerDraft {
   const parameterRng = rng.fork("rule-parameters");
   for (const entry of rulesetEntries(doc)) {
     for (const rule of Array.isArray(entry.rules) ? entry.rules : []) {
-      if (isPlainMapping(rule) && parameterRng.bool(0.4)) {
+      // Only a rule drawn bare takes the marker: a typed rule's parameters are what the schema requires of it.
+      if (isPlainMapping(rule) && rule.parameters === undefined && parameterRng.bool(0.4)) {
         rule.parameters = { strict: parameterRng.bool() };
       }
     }
@@ -2085,29 +2356,22 @@ function drawLayer(rng: Rng, pool: readonly SectionKey[]): LayerDraft {
   }
   const wrapperDirectives: LayerDraft["wrapperDirectives"] = {};
   for (const key of chosen) {
-    if (!isKnobbedSection(key)) {
+    if (!isListSectionKey(key)) {
       continue;
     }
-    const keyed = KEYED_MERGE_SECTIONS.has(key);
-    const mustWrap = fileDirective === "merge" && !keyed;
     const entries = entriesOf(doc[key]);
-    if (!mustWrap && !rng.bool(0.4)) {
+    if (!rng.bool(0.4)) {
       doc[key] = entries;
       continue;
     }
+    // A plain list's wrapper takes the directive alone; only a knobbed one carries the policy.
     const wrapper: Json = { entries };
-    if (rng.bool(0.5)) {
+    if (isKnobbedSection(key) && rng.bool(0.5)) {
       wrapper[UNDECLARED_KEY] = rng.pick(["keep", "delete"] as const);
     }
-    const directive: LayeringDirective | undefined = mustWrap
-      ? "replace"
-      : keyed
-        ? rng.bool(0.5)
-          ? rng.pick(LAYERING_DIRECTIVES)
-          : undefined
-        : rng.bool(0.3)
-          ? "replace"
-          : undefined;
+    const directive: LayeringDirective | undefined = rng.bool(0.5)
+      ? rng.pick(LAYERING_DIRECTIVES)
+      : undefined;
     if (directive !== undefined) {
       wrapper[LAYERING_KEY] = directive;
       wrapperDirectives[key] = directive;
@@ -2134,7 +2398,7 @@ function respellLabels(
     value === undefined ||
     value === null ||
     !present.has("labels") ||
-    effectiveLayering(draft, "labels", run) !== "merge"
+    effectiveLayering(draft, "labels", run) === "replace"
   ) {
     return;
   }
@@ -2160,7 +2424,7 @@ function unionsLabels(
     value !== undefined &&
     value !== null &&
     present.has("labels") &&
-    effectiveLayering(draft, "labels", run) === "merge"
+    effectiveLayering(draft, "labels", run) !== "replace"
   );
 }
 
@@ -2252,8 +2516,8 @@ function placeNulls(
           return false;
         }
         return (
-          standaloneValid(withoutPath(lower.doc, path)) &&
-          standaloneValid(withParentsOnly(doc, path))
+          standaloneValid(withoutPath(lower.doc, path), run) &&
+          standaloneValid(withParentsOnly(doc, path), run)
         );
       });
       if (candidates.length > 0) {
@@ -2261,7 +2525,8 @@ function placeNulls(
       }
       continue;
     }
-    if (doc.rulesets === null || effectiveLayering(draft, "rulesets", run) !== "merge") {
+    // A null inside an entry is a marker only under deep; under shallow the entry is swapped in whole, null and all.
+    if (doc.rulesets === null || effectiveLayering(draft, "rulesets", run) !== "deep") {
       continue;
     }
     const candidates = rulesetEntries(lower.doc).flatMap((entry) =>
@@ -2280,7 +2545,7 @@ function placeNulls(
     if (lowerEntry !== undefined) {
       delete lowerEntry[candidate.field];
     }
-    if (!standaloneValid(lowerProbe)) {
+    if (!standaloneValid(lowerProbe, run)) {
       continue;
     }
     const entries = ensureEntries(doc, "rulesets");
@@ -2294,17 +2559,8 @@ function placeNulls(
 }
 
 /** When the layer lacks the section a kind needs, one is created, outside the pool if need be: the refusal is the point of the layer. */
-function refuseLayer(
-  rng: Rng,
-  draft: LayerDraft,
-  kind: MergeRefusalKind,
-  pool: readonly SectionKey[],
-): void {
+function refuseLayer(rng: Rng, draft: LayerDraft, kind: MergeRefusalKind): void {
   const doc = draft.doc;
-  const unkeyed = UNKEYED_KNOBBED_SECTIONS.filter((key) => pool.includes(key));
-  const unkeyedKey =
-    unkeyed.find((key) => doc[key] !== undefined && doc[key] !== null) ??
-    (unkeyed.length > 0 ? rng.pick(unkeyed) : undefined);
   switch (kind) {
     case "duplicate-rule-type": {
       const entries = ensureEntries(doc, "rulesets");
@@ -2327,23 +2583,8 @@ function refuseLayer(
       entries.push({ name: rng.bool(0.5) && flipped !== name ? flipped : name });
       return;
     }
-    case "merge-on-unkeyed-wrapper": {
-      const key = unkeyedKey ?? "milestones";
-      const entries = ensureEntries(doc, key);
-      doc[key] = { entries, [LAYERING_KEY]: "merge" };
-      return;
-    }
-    case "merge-on-unkeyed-file": {
-      const key = unkeyedKey ?? "milestones";
-      // The plain list inherits the file directive; a wrapper saying replace would override it and admit the layer.
-      doc[key] = ensureEntries(doc, key);
-      doc[LAYERING_KEY] = "merge";
-      return;
-    }
     case "bad-wrapper-layering": {
-      const declared = UNDECLARED_POLICY_SECTIONS.filter(
-        (key) => doc[key] !== undefined && doc[key] !== null,
-      );
+      const declared = LIST_SECTIONS.filter((key) => doc[key] !== undefined && doc[key] !== null);
       const key = declared.length > 0 ? rng.pick(declared) : "labels";
       const entries = ensureEntries(doc, key);
       doc[key] = { entries, [LAYERING_KEY]: rng.pick(BAD_LAYERING_VALUES) };

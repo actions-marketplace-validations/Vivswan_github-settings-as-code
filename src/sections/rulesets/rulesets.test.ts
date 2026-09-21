@@ -10,6 +10,7 @@ import { MockApi } from "../../../test/mock-api.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
 import { REPO } from "../../../test/sections/section-run.js";
 import { normalizeRefName, normalizeRuleset, rulesetsSection } from "./index.js";
+import type { RulesetConfig } from "./schema.js";
 
 describe("normalizeRefName", () => {
   test("branch short name", () => {
@@ -31,6 +32,7 @@ describe("normalizeRuleset", () => {
     const input = {
       name: "build-tags",
       target: "tag" as const,
+      enforcement: "active" as const,
       conditions: { ref_name: { include: ["templates/*", "v*"], exclude: [] } },
     };
     const out = normalizeRuleset(input);
@@ -98,7 +100,7 @@ describe("rulesets", () => {
       "DELETE /repos/o/r/rulesets/*",
     );
 
-  test("a missing ruleset plans a create with normalized refs and defaults; undeclared ones are notes", async () => {
+  test("a missing ruleset plans a create with normalized refs; undeclared ones are notes", async () => {
     const api = writable({
       [listRoute]: { data: [{ id: 7, name: "legacy", source_type: "Repository" }] },
     });
@@ -106,6 +108,7 @@ describe("rulesets", () => {
       {
         name: "build-tags",
         target: "tag",
+        enforcement: "active",
         conditions: { ref_name: { include: ["templates/*"], exclude: [] } },
         rules: [{ type: "deletion" }],
       },
@@ -136,7 +139,53 @@ describe("rulesets", () => {
     expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([listRoute]);
   });
 
-  test("a divergent existing ruleset plans a full-payload update carrying the subset drift", async () => {
+  test("a live rule's GitHub-filled parameter defaults under a declaration that names one parameter are not drift, since the PUT leaves them as they are", async () => {
+    const api = writable({
+      [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+      "GET /repos/o/r/rulesets/9": {
+        data: {
+          id: 9,
+          name: "main",
+          target: "branch",
+          enforcement: "active",
+          conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+          rules: [
+            {
+              type: "pull_request",
+              parameters: {
+                required_approving_review_count: 1,
+                dismiss_stale_reviews_on_push: false,
+                require_code_owner_review: false,
+                require_last_push_approval: false,
+                required_review_thread_resolution: false,
+                allowed_merge_methods: ["merge", "squash", "rebase"],
+              },
+            },
+          ],
+          bypass_actors: [],
+        },
+      },
+    });
+    const declared = {
+      name: "main",
+      target: "branch" as const,
+      enforcement: "active" as const,
+      conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
+    };
+    const clean = { ops: [], notes: [], drift: [] };
+    expect(
+      await plan(api, [
+        {
+          ...declared,
+          rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }],
+        },
+      ]),
+    ).toEqual(clean);
+    // A rule declared without any parameters key is GitHub's defaults too.
+    expect(await plan(api, [{ ...declared, rules: [{ type: "pull_request" }] }])).toEqual(clean);
+  });
+
+  test("a divergent existing ruleset plans a full-payload update carrying the subset drift and what the PUT would drop", async () => {
     const api = writable({
       [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
       "GET /repos/o/r/rulesets/9": {
@@ -146,12 +195,12 @@ describe("rulesets", () => {
           target: "branch",
           enforcement: "evaluate",
           rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
-          bypass_actors: [{ actor_id: 1, actor_type: "Team" }],
+          bypass_actors: [{ actor_id: 1, actor_type: "Team", bypass_mode: "always" }],
         },
       },
     });
     const result = await plan(api, [
-      { name: "main", target: "branch", rules: [{ type: "deletion" }] },
+      { name: "main", target: "branch", enforcement: "active", rules: [{ type: "deletion" }] },
     ]);
     expect(result).toEqual({
       ops: [
@@ -164,10 +213,13 @@ describe("rulesets", () => {
             enforcement: "active",
             rules: [{ type: "deletion" }],
           },
+          // The omitted line makes the op refuse itself in apply mode; the test below runs that hook.
+          before: expect.any(Function),
           describe: 'updating ruleset "main"',
           drift: [
-            "rulesets[main].rules[non_fast_forward]: present live but not declared",
             'rulesets[main].enforcement: declared "active" != live "evaluate"; apply will set the declared value',
+            "rulesets[main].rules[non_fast_forward]: present live but not declared",
+            'rulesets[main].bypass_actors: live has [{"actor_id":1,"actor_type":"Team","bypass_mode":"always"}] but the settings file omits it, so apply would REMOVE it; declare bypass_actors to keep it, or bypass_actors: [] to remove it on purpose',
           ],
           change: 'updated ruleset "main"',
         },
@@ -175,6 +227,38 @@ describe("rulesets", () => {
       notes: [],
       drift: [],
     });
+    expect(api.mutations()).toEqual([]);
+  });
+
+  test("apply refuses the update that would remove what the file omits: the PUT is never sent, and the failure carries the omitted line", async () => {
+    const api = writable({
+      [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
+      "GET /repos/o/r/rulesets/9": {
+        data: {
+          id: 9,
+          name: "main",
+          target: "branch",
+          enforcement: "evaluate",
+          rules: [{ type: "deletion" }],
+          bypass_actors: [{ actor_id: 1, actor_type: "Team", bypass_mode: "always" }],
+        },
+      },
+    });
+    const planned = await plan(api, [
+      { name: "main", target: "branch", enforcement: "active", rules: [{ type: "deletion" }] },
+    ]);
+    const execution = await executePlan(planned, rulesetsSection, api, REPO, {
+      resolveSecret() {
+        throw new Error("no secrets");
+      },
+    });
+    expect(execution.status).toBe("failed");
+    expect(execution.landed).toBe(0);
+    expect(String((execution as { error: Error }).error.message)).toBe(
+      "rulesets[main]: not applied - the update would remove a live value the settings file omits. " +
+        'rulesets[main].bypass_actors: live has [{"actor_id":1,"actor_type":"Team","bypass_mode":"always"}] but the settings file omits it, ' +
+        "so apply would REMOVE it; declare bypass_actors to keep it, or bypass_actors: [] to remove it on purpose",
+    );
     expect(api.mutations()).toEqual([]);
   });
 
@@ -187,14 +271,19 @@ describe("rulesets", () => {
       },
     });
     // A variable, not a literal, so the extra key is a passthrough field to the type checker rather than an excess property.
-    const misspelled = { name: "main", target: "branch" as const, enforcemant: "evaluate" };
+    const misspelled = {
+      name: "main",
+      target: "branch" as const,
+      enforcement: "active" as const,
+      enforcemant: "evaluate",
+    };
     const result = await plan(api, [misspelled]);
     expect(result).toEqual({
       ops: [
         {
           role: "update",
           params: { ruleset_id: "9" },
-          payload: { ...misspelled, enforcement: "active" },
+          payload: misspelled,
           describe: 'updating ruleset "main"',
           drift: [
             'rulesets[main].enforcemant: declared "evaluate" but the API response has no such field (new or write-only field?)',
@@ -215,7 +304,12 @@ describe("rulesets", () => {
       [{ id: 9, name: "main", source_type: "Repository", target: "branch", enforcement: "active" }],
       ["enforcemant"],
     );
-    const misspelled = { name: "main", target: "branch" as const, enforcemant: "evaluate" };
+    const misspelled = {
+      name: "main",
+      target: "branch" as const,
+      enforcement: "active" as const,
+      enforcemant: "evaluate",
+    };
     const pass = async () =>
       rulesetsSection.plan(planContext(rulesetsSection, api, REPO), [misspelled]);
     const first = await pass();
@@ -236,7 +330,7 @@ describe("rulesets", () => {
         {
           role: "update",
           params: { ruleset_id: "9" },
-          payload: { ...misspelled, enforcement: "active" },
+          payload: misspelled,
           describe: 'updating ruleset "main"',
           drift: [
             'rulesets[main].enforcemant: declared "evaluate" but the API response has no such field (new or write-only field?)',
@@ -258,10 +352,10 @@ describe("rulesets", () => {
     const BASE = { id: 9, name: "main", target: "branch", enforcement: "active" };
     const HIDDEN_NOTE =
       "rulesets[main]: bypass_actors is not visible to this token (GitHub returns it only to a token with write access to the ruleset), so drift on it cannot be judged here; grant Administration write to check it";
-    const team = { actor_id: 1, actor_type: "Team", bypass_mode: "always" };
+    const team = { actor_id: 1, actor_type: "Team", bypass_mode: "always" } as const;
     const cases: Array<{
       name: string;
-      declared: Record<string, unknown>[];
+      declared: NonNullable<RulesetConfig["bypass_actors"]>;
       live: Record<string, unknown>;
       expected: Awaited<ReturnType<typeof plan>>;
     }> = [
@@ -293,9 +387,7 @@ describe("rulesets", () => {
                 bypass_actors: [team],
               },
               describe: 'updating ruleset "main"',
-              drift: [
-                'rulesets[main].bypass_actors[0]: no matching live entry for {"actor_id":1,"actor_type":"Team","bypass_mode":"always"}',
-              ],
+              drift: ["rulesets[main].bypass_actors[Team 1]: missing live"],
               change: 'updated ruleset "main"',
             },
           ],
@@ -307,6 +399,49 @@ describe("rulesets", () => {
         name: "key present and equal: converged, no note",
         declared: [team],
         live: { ...BASE, bypass_actors: [team] },
+        expected: { ops: [], notes: [], drift: [] },
+      },
+      {
+        name: "a live mode other than the default under a declaration that omits the mode is ONE line on that actor, since the PUT would reset it to always",
+        declared: [{ actor_id: 1, actor_type: "Team" }],
+        live: { ...BASE, bypass_actors: [{ ...team, bypass_mode: "pull_request" }] },
+        expected: {
+          ops: [
+            {
+              role: "update",
+              params: { ruleset_id: "9" },
+              payload: {
+                name: "main",
+                target: "branch",
+                enforcement: "active",
+                bypass_actors: [team],
+              },
+              describe: 'updating ruleset "main"',
+              drift: [
+                'rulesets[main].bypass_actors[Team 1].bypass_mode: "always" != "pull_request"',
+              ],
+              change: 'updated ruleset "main"',
+            },
+          ],
+          notes: [],
+          drift: [],
+        },
+      },
+      {
+        name: "GitHub's default fill on a live actor (bypass_mode always, a DeployKey's null id, the null an OrganizationAdmin's id can read back as) is not drift under a declaration that omits it",
+        declared: [
+          { actor_id: 1, actor_type: "Team" },
+          { actor_type: "OrganizationAdmin" },
+          { actor_type: "DeployKey" },
+        ],
+        live: {
+          ...BASE,
+          bypass_actors: [
+            { actor_id: null, actor_type: "DeployKey", bypass_mode: "always" },
+            { actor_id: null, actor_type: "OrganizationAdmin", bypass_mode: "always" },
+            team,
+          ],
+        },
         expected: { ops: [], notes: [], drift: [] },
       },
     ];
@@ -373,6 +508,8 @@ describe("rulesets", () => {
     const result = await plan(api, [
       {
         name: "main",
+        target: "branch",
+        enforcement: "active",
         conditions: { ref_name: { include: ["main"] } },
         rules: [{ type: "deletion" }, { type: "non_fast_forward" }],
       },
@@ -388,8 +525,8 @@ describe("rulesets", () => {
     const api = new MockApi({});
     await expect(
       plan(api, [
-        { name: "main", target: "branch" },
-        { name: "main", target: "tag" },
+        { name: "main", target: "branch", enforcement: "active" },
+        { name: "main", target: "tag", enforcement: "active" },
       ]),
     ).rejects.toThrow(/same rulesets entry/);
     expect(api.calls).toHaveLength(0);
@@ -397,6 +534,7 @@ describe("rulesets", () => {
 
   test("a repeated rule type is a settings-file error before any read, and a live body repeating one fails loudly naming the ruleset", async () => {
     // Rules pair by type, so a repeat has no pairing; the settings-file case names the fix, the live case the defect.
+    const bare = { name: "main", target: "branch" as const, enforcement: "active" as const };
     const api = writable({
       [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
       "GET /repos/o/r/rulesets/9": {
@@ -410,14 +548,14 @@ describe("rulesets", () => {
       },
     });
     await expect(
-      plan(api, [{ name: "main", rules: [{ type: "deletion" }, { type: "deletion" }] }]),
+      plan(api, [{ ...bare, rules: [{ type: "deletion" }, { type: "deletion" }] }]),
     ).rejects.toThrow(
       'rulesets: the settings file declares conflicting rulesets: the ruleset "main" lists the rule type "deletion" more than once, and GitHub keeps one rule per type - declare each type once. Fix the settings file, then re-run',
     );
     await expect(
       plan(api, [
         {
-          name: "main",
+          ...bare,
           rules: [
             { type: "deletion" },
             { type: "deletion" },
@@ -428,7 +566,7 @@ describe("rulesets", () => {
       ]),
     ).rejects.toThrow('lists the rule types "deletion", "creation" more than once');
     expect(api.calls).toHaveLength(0);
-    await expect(plan(api, [{ name: "main", rules: [{ type: "deletion" }] }])).rejects.toThrow(
+    await expect(plan(api, [{ ...bare, rules: [{ type: "deletion" }] }])).rejects.toThrow(
       'rulesets: GitHub returned the ruleset "main" (id 9) with the rule type "deletion" more than once, so its rules cannot be paired by type; delete the repeated rule on GitHub, then re-run',
     );
     expect(api.mutations()).toEqual([]);
@@ -448,7 +586,9 @@ describe("rulesets", () => {
     });
     const result = await plan(api, {
       _undeclared: "delete",
-      entries: [{ name: "main", target: "branch", rules: [{ type: "deletion" }] }],
+      entries: [
+        { name: "main", target: "branch", enforcement: "active", rules: [{ type: "deletion" }] },
+      ],
     });
     expect(result).toEqual({
       ops: [
@@ -463,8 +603,8 @@ describe("rulesets", () => {
           },
           describe: 'updating ruleset "main"',
           drift: [
-            "rulesets[main].rules[deletion]: missing live",
             'rulesets[main].enforcement: declared "active" != live "disabled"; apply will set the declared value',
+            "rulesets[main].rules[deletion]: missing live",
           ],
           change: 'updated ruleset "main"',
         },
@@ -535,7 +675,12 @@ describe("rulesets", () => {
       _undeclared: "delete",
       entries: [
         { name: "main", target: "branch", enforcement: "active", rules: [{ type: "deletion" }] },
-        { name: "tags", target: "tag", conditions: { ref_name: { include: ["v*"] } } },
+        {
+          name: "tags",
+          target: "tag",
+          enforcement: "active",
+          conditions: { ref_name: { include: ["v*"] } },
+        },
       ],
     });
     expect(changes).toEqual([

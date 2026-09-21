@@ -6,9 +6,11 @@
 
 import { z } from "zod";
 import type { EndpointDecl } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   defaultUndeclaredPolicy,
+  keyedBy,
   loosen,
   type SectionMeta,
   type SectionModule,
@@ -103,20 +105,24 @@ async function readLiveAccess(
   const invitations = allInvitations.filter(isNamedInvitation);
   return {
     collaborators,
-    liveByLogin: liveByIdentity(
-      section,
-      "collaborator",
-      collaborators,
-      (c) => c.login.toLowerCase(),
-      (c) => liveIdentity(c.login),
+    liveByLogin: raise(
+      liveByIdentity(
+        section,
+        "collaborator",
+        collaborators,
+        (c) => c.login.toLowerCase(),
+        (c) => liveIdentity(c.login),
+      ),
     ),
     invitations,
-    inviteByLogin: liveByIdentity(
-      section,
-      "pending invitation",
-      invitations,
-      (invitation) => invitation.invitee.login.toLowerCase(),
-      (invitation) => liveIdentity(invitation.invitee.login, { invitation_id: invitation.id }),
+    inviteByLogin: raise(
+      liveByIdentity(
+        section,
+        "pending invitation",
+        invitations,
+        (invitation) => invitation.invitee.login.toLowerCase(),
+        (invitation) => liveIdentity(invitation.invitee.login, { invitation_id: invitation.id }),
+      ),
     ),
     emailInvitations: allInvitations.filter((invitation) => !isNamedInvitation(invitation)),
   };
@@ -129,6 +135,8 @@ function isOwner(ctx: CollaboratorsContext, login: string): boolean {
 export const collaboratorsSection = {
   key: "collaborators",
   undeclaredDefault: "delete",
+  // The fold plan() passes to rejectDuplicates: GitHub matches logins case-insensitively.
+  layering: keyedBy("username", { fold: (username) => username.toLowerCase() }),
   permission,
   endpoints: ENDPOINTS,
   shape: loosen(knobbed(CollaboratorConfig)),
@@ -140,11 +148,13 @@ export const collaboratorsSection = {
   },
   async plan(ctx, declared) {
     const { policy, entries: desired } = undeclaredPolicy(declared, defaultUndeclaredPolicy(this));
-    rejectDuplicates(
-      this,
-      desired,
-      (c) => c.username.toLowerCase(),
-      (c) => c.username,
+    raise(
+      rejectDuplicates(
+        this,
+        desired,
+        (c) => c.username.toLowerCase(),
+        (c) => c.username,
+      ),
     );
     // Both pools are resolved BEFORE the declared walk, so a declared user is never mistaken for
     // undeclared in the other pool; email invitations (null invitee, which no username can declare)

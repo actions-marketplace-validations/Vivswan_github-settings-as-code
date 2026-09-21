@@ -7,9 +7,11 @@
 
 import { z } from "zod";
 import type { EndpointDecl } from "../contract/endpoints.js";
+import { raise } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   defaultUndeclaredPolicy,
+  keyedBy,
   loosen,
   ORG_PROBE,
   type SectionMeta,
@@ -112,12 +114,14 @@ function propertiesByName(
   section: SectionMeta,
   live: readonly z.infer<typeof LiveProperty>[],
 ): Map<string, z.infer<typeof LiveProperty>> {
-  return liveByIdentity(
-    section,
-    "custom property",
-    live,
-    (p) => p.property_name,
-    (p) => liveIdentity(p.property_name),
+  return raise(
+    liveByIdentity(
+      section,
+      "custom property",
+      live,
+      (p) => p.property_name,
+      (p) => liveIdentity(p.property_name),
+    ),
   );
 }
 
@@ -131,6 +135,9 @@ interface PendingUpdate {
 export const customPropertiesSection = {
   key: "custom_properties",
   undeclaredDefault: "keep",
+  // Verbatim, as plan() passes to rejectDuplicates: GitHub documents no case folding for property names.
+  // `value: null` unsets the property, so a higher layer's null is the value, never a marker for the lower one.
+  layering: keyedBy("property_name", { nullValued: ["value"] }),
   permission,
   // Custom properties exist only under an organization owner; the registry's owner gate (contract/owner.ts)
   // probes the `org` role and no-ops with a note on a personal account.
@@ -148,11 +155,13 @@ export const customPropertiesSection = {
   async plan(ctx, declared) {
     const { policy, entries: desired } = undeclaredPolicy(declared, defaultUndeclaredPolicy(this));
     // GitHub documents no case folding for property names, so entries are duplicates only when they match verbatim.
-    rejectDuplicates(
-      this,
-      desired,
-      (p) => p.property_name,
-      (p) => p.property_name,
+    raise(
+      rejectDuplicates(
+        this,
+        desired,
+        (p) => p.property_name,
+        (p) => p.property_name,
+      ),
     );
     for (const property of desired) {
       rejectMalformedList(property);
