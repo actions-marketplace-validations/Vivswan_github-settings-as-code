@@ -1,6 +1,5 @@
 /**
- * The interaction_limits e2e mock fragment (aggregated in test/e2e/mock/sections.ts). It imports the
- * test-tree seams on purpose: the bundle entry is src/main.ts, so this file never reaches lib/index.js.
+ * The interaction_limits e2e mock fragment (aggregated in test/e2e/mock/sections.ts).
  */
 
 import { bypassUser } from "../../../test/e2e/mock/state.js";
@@ -16,6 +15,7 @@ import {
   type SectionRestHandlers,
   sameLogin,
 } from "../../../test/e2e/mock/support.js";
+import { BYPASS_MAX } from "./schema.js";
 
 export const interactionLimitsMockHandlers: SectionRestHandlers<"interaction_limits"> = {
   "interaction_limits.get": ({ state }) =>
@@ -62,15 +62,15 @@ export const interactionLimitsMockHandlers: SectionRestHandlers<"interaction_lim
   "interaction_limits.bypassList": ({ state }) => ok(state.pull_bypass_list),
   "interaction_limits.bypassAdd": ({ state, body }) => {
     // Adds are deduped case-insensitively against the stored list and are never a wholesale replace
-    // (the DELETE removes). The documented 100-user total is enforced, so an add-before-remove regression 422s here.
+    // (the DELETE removes). The documented total is enforced, so an add-before-remove regression 422s here.
     const additions = bypassLogins(body).filter(
       (login) => !state.pull_bypass_list.some((user) => sameLogin(user, login)),
     );
-    if (state.pull_bypass_list.length + additions.length > 100) {
+    if (state.pull_bypass_list.length + additions.length > BYPASS_MAX) {
       return {
         status: 422,
         body: {
-          message: "Validation Failed: the bypass list can only hold a maximum of 100 users",
+          message: `Validation Failed: the bypass list can only hold a maximum of ${BYPASS_MAX} users`,
         },
       };
     }

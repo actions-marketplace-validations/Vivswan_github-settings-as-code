@@ -4,6 +4,7 @@
  */
 
 import type { GitHubClient } from "./api.js";
+import { slugKey } from "./slug.js";
 
 /** A repository's visibility as the probe established it; "unknown" means it could not. */
 export type RepoVisibility = "public" | "private" | "internal" | "unknown";
@@ -13,7 +14,7 @@ export function createVisibilityResolver(
 ): (slug: string) => Promise<RepoVisibility> {
   const cache = new Map<string, Promise<RepoVisibility>>();
   return (slug) => {
-    const key = slug.toLowerCase();
+    const key = slugKey(slug);
     let pending = cache.get(key);
     if (!pending) {
       pending = probe(api, slug);
@@ -30,9 +31,17 @@ async function probe(api: GitHubClient, slug: string): Promise<RepoVisibility> {
   if ("failed" in result || "error" in result) {
     return "unknown";
   }
-  const repo = result.data as { visibility?: unknown; private?: unknown } | null;
-  // Fail closed, mirroring discover.ts normalizeVisibility: the always-present `private` flag is the authority, so
-  // private === true wins over any `visibility` value.
+  return classifyVisibility(result.data as { visibility?: unknown; private?: unknown } | null);
+}
+
+/**
+ * Fails closed for the REDACTION decision. `visibility` is a plain string in the API schema and optional on GHES, so
+ * the always-present `private` flag is the authority: private === true wins over any `visibility` (even a stale
+ * "public"), and a body that proves neither public nor private is "unknown", which every caller hides.
+ */
+export function classifyVisibility(
+  repo: { visibility?: unknown; private?: unknown } | null,
+): RepoVisibility {
   if (repo?.private === true) {
     return repo.visibility === "internal" ? "internal" : "private";
   }
@@ -40,8 +49,5 @@ async function probe(api: GitHubClient, slug: string): Promise<RepoVisibility> {
   if (visibility === "public" || visibility === "private" || visibility === "internal") {
     return visibility;
   }
-  if (repo?.private === false) {
-    return "public";
-  }
-  return "unknown";
+  return repo?.private === false ? "public" : "unknown";
 }

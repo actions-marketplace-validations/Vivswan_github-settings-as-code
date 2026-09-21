@@ -5,9 +5,9 @@
 
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
+import { escapeRe } from "../../.github/scripts/lib/generated-regions.js";
 import {
   anchorCheck,
   anchorReleasePr,
@@ -28,6 +28,7 @@ import {
   stablePublishVerdict,
 } from "../../.github/scripts/release-pipeline.js";
 import { ROOT } from "../root.js";
+import { withTempDir } from "../temp-dir.js";
 import {
   ANCHOR_PUSH,
   BOT_IDENTITY,
@@ -56,7 +57,6 @@ import {
   pushGreenCommit,
   remoteRef,
   rivalPackage,
-  roots,
   seedFixture,
   shallowClone,
   subcommand,
@@ -70,33 +70,32 @@ setDefaultTimeout(60_000);
 installReleasePipelineFixture();
 
 describe("the fixture push guard", () => {
-  test("a push from outside the fixture area is refused before git runs (negative control)", () => {
-    const outside = mkdtempSync(join(tmpdir(), "not-a-release-pipeline-fixture-"));
-    roots.push(outside);
-    const origin = join(outside, "origin.git");
-    execFileSync("git", ["init", "--quiet", "--bare", "-b", "main", origin]);
-    const repo = join(outside, "repo");
-    execFileSync("git", ["clone", "--quiet", origin, repo]);
-    git(repo, "config", "user.name", "fixture");
-    git(repo, "config", "user.email", "fixture@example.invalid");
-    git(repo, "config", "commit.gpgsign", "false");
-    git(repo, "commit", "--quiet", "--allow-empty", "-m", "must never land");
-    let error: unknown;
-    try {
-      execFileSync("git", ["push", "origin", "HEAD:refs/heads/main"], {
-        cwd: repo,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (thrown) {
-      error = thrown;
-    }
-    expect((error as { status?: number }).status).toBe(1);
-    expect(String((error as { stderr?: string }).stderr).trim()).toBe(
-      guardRefusal(realpathSync(repo)),
-    );
-    expect(git(repo, "ls-remote", "origin", "refs/heads/main")).toBe("");
-  });
+  test("a push from outside the fixture area is refused before git runs (negative control)", () =>
+    withTempDir("not-a-release-pipeline-fixture-", (outside) => {
+      const origin = join(outside, "origin.git");
+      execFileSync("git", ["init", "--quiet", "--bare", "-b", "main", origin]);
+      const repo = join(outside, "repo");
+      execFileSync("git", ["clone", "--quiet", origin, repo]);
+      git(repo, "config", "user.name", "fixture");
+      git(repo, "config", "user.email", "fixture@example.invalid");
+      git(repo, "config", "commit.gpgsign", "false");
+      git(repo, "commit", "--quiet", "--allow-empty", "-m", "must never land");
+      let error: unknown;
+      try {
+        execFileSync("git", ["push", "origin", "HEAD:refs/heads/main"], {
+          cwd: repo,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (thrown) {
+        error = thrown;
+      }
+      expect((error as { status?: number }).status).toBe(1);
+      expect(String((error as { stderr?: string }).stderr).trim()).toBe(
+        guardRefusal(realpathSync(repo)),
+      );
+      expect(git(repo, "ls-remote", "origin", "refs/heads/main")).toBe("");
+    }));
 
   test("a push from inside a fixture lands (positive control)", () => {
     const fx = seedFixture();
@@ -144,8 +143,6 @@ const TAG = "refs/tags/v2.1.0";
 const V2 = "refs/tags/v2";
 const FROZEN =
   "the release-tags ruleset freezes version tags, so no rerun can replace it - inspect it by hand.";
-/** `text` as a regex source matching it literally. */
-const literally = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 describe("packageRelease", () => {
   test("a fresh release mints the merge commit's package under its build tag, tags it, and creates latest; a rerun verifies it and pushes nothing", () => {
@@ -347,7 +344,7 @@ describe("packageRelease", () => {
     drift(rerun);
     expect(() => packageRelease({ cwd: rerun, tag: "v2.1.0", sourceSha: fx.mergeSha })).toThrow(
       new RegExp(
-        `^${TAG} \\(${before}\\) packages ${fx.mergeSha}, but its tree [0-9a-f]{40} is not the tree [0-9a-f]{40} this checkout's build packages, .*Diff the two trees by hand; ${literally(FROZEN)}$`,
+        `^${TAG} \\(${before}\\) packages ${fx.mergeSha}, but its tree [0-9a-f]{40} is not the tree [0-9a-f]{40} this checkout's build packages, .*Diff the two trees by hand; ${escapeRe(FROZEN)}$`,
       ),
     );
     expect(git(fx.origin, "rev-parse", `${TAG}^{}`)).toBe(before);
@@ -359,7 +356,7 @@ describe("packageRelease", () => {
       const fx = seedFixture();
       const { from, sha, error } = plant(fx);
       git(from, "push", "--quiet", "origin", `${sha}:${TAG}`);
-      const frozen = new RegExp(`${literally(FROZEN)}$`);
+      const frozen = new RegExp(`${escapeRe(FROZEN)}$`);
       const pushes = withPushPlans(fx, [], () => {
         for (const path of [
           () => packageRelease({ cwd: fx.work, tag: "v2.1.0", sourceSha: fx.mergeSha }),

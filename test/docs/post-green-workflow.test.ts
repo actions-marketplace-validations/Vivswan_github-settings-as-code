@@ -13,10 +13,10 @@
 
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT } from "../root.js";
+import { withTempDir } from "../temp-dir.js";
 import { type Job, readWorkflow, type Step, type Workflow } from "./workflow-loader.js";
 
 const CI = readWorkflow("ci.yml");
@@ -510,29 +510,29 @@ describe("post-green.yml", () => {
     expect(wiringProblems(drifted).join("\n")).toMatch(message);
   });
 
-  test("a release-hook step under a condition of its own fails the wiring there (negative control)", () => {
-    const stable = readWorkflow("update-release.yml");
-    for (const job of Object.values(stable.jobs)) {
+  const gateSteps = (w: Workflow, pattern: RegExp, gate: string): void => {
+    for (const job of Object.values(w.jobs)) {
       for (const step of job.steps ?? []) {
-        if (/retag-major/.test(step.run ?? "")) step.if = "github.event_name == 'release'";
+        if (pattern.test(step.run ?? "")) step.if = gate;
       }
     }
-    expect(wiringProblems(stable).join("\n")).toMatch(
-      /"Move the major tag to the packaged commit" runs under a condition of its own/,
-    );
-  });
+  };
 
-  test("a verdict gate copied onto a hook without that probe fails the wiring there (negative control)", () => {
-    const stable = readWorkflow("update-release.yml");
-    for (const job of Object.values(stable.jobs)) {
-      for (const step of job.steps ?? []) {
-        if (/npm-verdict stable/.test(step.run ?? ""))
-          step.if = "steps.oidc.outputs.proceed == 'true'";
-      }
-    }
-    expect(wiringProblems(stable).join("\n")).toMatch(
+  test.each<[string, (w: Workflow) => void, RegExp]>([
+    [
+      "a release-hook step under a condition of its own",
+      (w) => gateSteps(w, /retag-major/, "github.event_name == 'release'"),
+      /"Move the major tag to the packaged commit" runs under a condition of its own/,
+    ],
+    [
+      "a verdict gate copied onto a hook without that probe",
+      (w) => gateSteps(w, /npm-verdict stable/, "steps.oidc.outputs.proceed == 'true'"),
       /reads steps\.oidc\.outputs\.proceed, which no earlier step writes/,
-    );
+    ],
+  ])("%s fails the wiring there (negative control)", (_case, mutate, message) => {
+    const stable = readWorkflow("update-release.yml");
+    mutate(stable);
+    expect(wiringProblems(stable).join("\n")).toMatch(message);
   });
 
   test("the judged sha the caller passes is the ref every checkout takes and the source every packaging step names", () => {
@@ -596,9 +596,13 @@ interface ProbeRun {
  * Run the probe under `bash -e` (what a `run:` step gets on a Linux runner) with git stubbed to write `stderr` and exit `gitStatus`; the
  * scratch directory is removed on every path.
  */
-function runProbe(run: string, stderr: string, gitStatus: number, patSet: boolean): ProbeRun {
-  const dir = mkdtempSync(join(tmpdir(), "post-green-probe-"));
-  try {
+function runProbe(
+  run: string,
+  stderr: string,
+  gitStatus: number,
+  patSet: boolean,
+): Promise<ProbeRun> {
+  return withTempDir("post-green-probe-", (dir) => {
     const bin = join(dir, "bin");
     mkdirSync(bin);
     writeFileSync(
@@ -634,9 +638,7 @@ function runProbe(run: string, stderr: string, gitStatus: number, patSet: boolea
       output: readFileSync(output, "utf8"),
       probeErrLeft: existsSync(join(dir, "probe.err")),
     };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  });
 }
 
 const FENCE_OPEN = /^::stop-commands::([0-9a-f]{32})$/;
@@ -667,19 +669,21 @@ describe("the push probe under bash", () => {
     return token;
   }
 
-  test("a stderr that does not end in a newline still closes the fence on a line of its own, under a token fresh per run", () => {
-    const probe = runProbe(run, "refused", 1, true);
+  test("a stderr that does not end in a newline still closes the fence on a line of its own, under a token fresh per run", async () => {
+    const probe = await runProbe(run, "refused", 1, true);
     expect(probe.status).toBe(1);
     const token = expectFenced(probe.lines, ["  refused"]);
     expect(probe.probeErrLeft).toBe(false);
     expect(probe.output).toBe("");
     // A fixed token is one remote text could name to resume command processing.
-    expect(expectFenced(runProbe(run, "refused", 1, true).lines, ["  refused"])).not.toBe(token);
+    expect(expectFenced((await runProbe(run, "refused", 1, true)).lines, ["  refused"])).not.toBe(
+      token,
+    );
   });
 
-  test("a stderr carrying workflow-command text is confined to indented lines inside the fence", () => {
+  test("a stderr carrying workflow-command text is confined to indented lines inside the fence", async () => {
     const hostile = "::stop-commands::probe-marker\nremote: %25 done\r\n::error::forged\n";
-    const probe = runProbe(run, hostile, 1, true);
+    const probe = await runProbe(run, hostile, 1, true);
     expect(probe.status).toBe(1);
     expectFenced(probe.lines, [
       "  ::stop-commands::probe-marker",
@@ -689,15 +693,15 @@ describe("the push probe under bash", () => {
     expect(probe.probeErrLeft).toBe(false);
   });
 
-  test("an empty stderr opens and closes the fence around nothing", () => {
-    const probe = runProbe(run, "", 1, true);
+  test("an empty stderr opens and closes the fence around nothing", async () => {
+    const probe = await runProbe(run, "", 1, true);
     expect(probe.status).toBe(1);
     expectFenced(probe.lines, []);
     expect(probe.probeErrLeft).toBe(false);
   });
 
-  test("without a PAT a refused probe warns naming both remedies, skips, and prints no stderr (control)", () => {
-    const probe = runProbe(run, "refused\n", 1, false);
+  test("without a PAT a refused probe warns naming both remedies, skips, and prints no stderr (control)", async () => {
+    const probe = await runProbe(run, "refused\n", 1, false);
     expect(probe.status).toBe(0);
     const commands = probe.lines.filter((line) => line.startsWith("::"));
     expect(commands).toHaveLength(1);
@@ -710,8 +714,8 @@ describe("the push probe under bash", () => {
     expect(probe.probeErrLeft).toBe(false);
   });
 
-  test("a probe the token passes proceeds and prints nothing (control)", () => {
-    const probe = runProbe(run, "", 0, true);
+  test("a probe the token passes proceeds and prints nothing (control)", async () => {
+    const probe = await runProbe(run, "", 0, true);
     expect(probe.status).toBe(0);
     expect(probe.lines).toEqual([""]);
     expect(probe.output).toBe("proceed=true\n");

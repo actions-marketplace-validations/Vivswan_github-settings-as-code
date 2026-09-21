@@ -13,6 +13,7 @@ import {
   FORKS_FILTERS,
   VISIBILITY_FILTERS,
 } from "../discovery/discover.js";
+import { LIST_SEPARATOR } from "../discovery/repos-input.js";
 import { parseRepoSlug, type RepoRef } from "../discovery/targets.js";
 import { LAYERINGS, type Layering, UNDECLARED_POLICIES } from "../engine/layers.js";
 import { SectionSelection } from "../engine/section-selection.js";
@@ -425,9 +426,6 @@ function readUndeclared(input: Inputs): Result<UndeclaredPolicy | undefined, Pro
   return readEnum(input, "undeclared", UNDECLARED_POLICIES, undefined, "undeclared policy");
 }
 
-/** What separates the entries of a list input; a single path can never contain one. */
-const LIST_SEPARATOR = /[\n,]/;
-
 function splitList(value: string): string[] {
   return value
     .split(LIST_SEPARATOR)
@@ -728,25 +726,22 @@ function parseSnapshotFileArm(
 }
 
 /**
- * The file a one-file destination input names, or its declared default: known before any parsing, so a failure can
- * name it. The CLI's init reads `settings-file` this way, since it writes the file apply and check read.
+ * The file the `settings-file` input names, or its declared default: known before any parsing, so a failure can
+ * name it. The CLI's init writes that file, the one apply and check read.
  */
-export function snapshotFileDestination(read: InputReader, destination: "settings-file"): string {
-  return inputs(read).orDefault(destination);
+export function snapshotFileDestination(read: InputReader): string {
+  return inputs(read).orDefault("settings-file");
 }
 
 /**
- * The file arm for a caller whose destination is a one-file input of its own:
- * the CLI's init writes the settings file, so it reads `settings-file` as the
- * destination (refusing a list separator as apply and check do) and can never
- * be the dir form.
+ * The file arm for the CLI's init, whose destination is the `settings-file` input
+ * (refusing a list separator as apply and check do) and can never be the dir form.
  */
 export function parseSnapshotFileConfig(
   read: InputReader,
   env: ConfigEnv,
-  destination: "settings-file",
 ): Result<SnapshotFileConfig, Problem> {
-  const path = snapshotFileDestination(read, destination);
+  const path = snapshotFileDestination(read);
   if (LIST_SEPARATOR.test(path)) {
     return err({ code: "input-settings-file-is-list", value: path, mode: "init" });
   }

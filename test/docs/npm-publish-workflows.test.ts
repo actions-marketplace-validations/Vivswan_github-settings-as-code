@@ -11,10 +11,10 @@
 
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT } from "../root.js";
+import { withTempDir } from "../temp-dir.js";
 import { type Job, readWorkflow, type Step, type Workflow } from "./workflow-loader.js";
 
 /** A job that runs steps (the publishers are never reusable-workflow calls). */
@@ -55,6 +55,9 @@ const stepNamed = (job: RunJob, name: string): Step =>
     job.steps.find((step) => step.name === name),
     `step ${name}`,
   );
+/** The npm the guard step's script refuses to publish below: its `floor=` line. */
+const guardFloor = (guard: Step): string =>
+  must(guard.run?.match(/^floor=(\S+)$/m)?.[1], "floor= line in the guard");
 const setupNode = (job: RunJob): Step =>
   must(
     job.steps.find((step) => step.uses?.startsWith("actions/setup-node@")),
@@ -286,7 +289,11 @@ describe("the npm publish jobs", () => {
           runJob(w.jobs[NEXT_JOB], "next"),
           "Require an npm that publishes through OIDC",
         );
-        guard.run = guard.run?.replace("11.5.1", "11.6.0");
+        const floor = guardFloor(guard);
+        guard.run = guard.run?.replace(
+          `floor=${floor}`,
+          `floor=${Number(floor.split(".")[0]) + 1}.0.0`,
+        );
       },
       /"Require an npm that publishes through OIDC" diverged/,
     ],
@@ -311,9 +318,8 @@ function runStep(
   run: string,
   env: Record<string, string>,
   bin?: (dir: string) => void,
-): { lines: string[]; status: number; output: string } {
-  const dir = mkdtempSync(join(tmpdir(), "npm-publish-step-"));
-  try {
+): Promise<{ lines: string[]; status: number; output: string }> {
+  return withTempDir("npm-publish-step-", (dir) => {
     const binDir = join(dir, "bin");
     mkdirSync(binDir);
     bin?.(binDir);
@@ -337,22 +343,22 @@ function runStep(
       status,
       output: readFileSync(output, "utf8"),
     };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  });
 }
 
 describe("the OIDC probe under bash", () => {
   const { next } = publishers();
   const run = must(must(next.steps[0], "probe step").run, "probe run");
 
-  test("a runner that minted a token URL proceeds silently", () => {
-    const probe = runStep(run, { ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.invalid/oidc" });
+  test("a runner that minted a token URL proceeds silently", async () => {
+    const probe = await runStep(run, {
+      ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.invalid/oidc",
+    });
     expect(probe).toEqual({ lines: [], status: 0, output: "proceed=true\n" });
   });
 
-  test("a runner without one warns naming the missing grant and skips (control)", () => {
-    const probe = runStep(run, {});
+  test("a runner without one warns naming the missing grant and skips (control)", async () => {
+    const probe = await runStep(run, {});
     expect(probe.status).toBe(0);
     expect(probe.output).toBe("proceed=false\n");
     expect(probe.lines).toHaveLength(1);
@@ -363,13 +369,11 @@ describe("the OIDC probe under bash", () => {
 
 describe("the npm floor guard under bash", () => {
   const stable = runJob(readWorkflow(STABLE_FILE).jobs[STABLE_JOB], `${STABLE_JOB} job`);
-  const run = must(
-    stepNamed(stable, "Require an npm that publishes through OIDC").run,
-    "guard run",
-  );
+  const guard = stepNamed(stable, "Require an npm that publishes through OIDC");
+  const run = must(guard.run, "guard run");
   /** Trusted publishing exists from this npm on (npm's changelog for 11.5.1); the script must hold that floor or a newer one. */
   const OIDC_NPM = "11.5.1";
-  const floor = must(run.match(/^floor=(\S+)$/m)?.[1], "floor= line in the guard");
+  const floor = guardFloor(guard);
 
   test("the script's floor is not below the npm that introduced trusted publishing", () => {
     const [scriptFloor] = [floor, OIDC_NPM].sort((a, b) =>
@@ -423,8 +427,8 @@ describe("the npm floor guard under bash", () => {
       },
     ],
   ];
-  test.each(floors)("an npm %s", (_name, before, after, expected) => {
-    const guard = runStep(run, {}, stubNpm(before, after));
+  test.each(floors)("an npm %s", async (_name, before, after, expected) => {
+    const guard = await runStep(run, {}, stubNpm(before, after));
     expect({ lines: guard.lines, status: guard.status }).toEqual(expected);
   });
 });
@@ -468,8 +472,8 @@ describe("the confirmation block under bash", () => {
     unsettled: { status: 0, command: /^::warning::/ },
     behind: { status: 1, command: /^::error::/ },
   };
-  test.each([...outcomes, "nonsense"])("a %s line", (outcome) => {
-    const step = runStep(
+  test.each([...outcomes, "nonsense"])("a %s line", async (outcome) => {
+    const step = await runStep(
       run,
       { SOURCE_SHA: "b8df084c" },
       stubBun(`${outcome} next 2.0.1-main.446 is placed`),
@@ -563,7 +567,9 @@ describe("the publish blocks under bash", () => {
       { lines: ["::warning::2.1.0 is already on the registry"], status: 0, output: "" },
     ],
   ];
-  test.each(cases)("%s", (_name, run, verdict, expected) => {
-    expect(runStep(run, { SOURCE_SHA: source, TAG: "v2.1.0" }, stubs(verdict))).toEqual(expected);
+  test.each(cases)("%s", async (_name, run, verdict, expected) => {
+    expect(await runStep(run, { SOURCE_SHA: source, TAG: "v2.1.0" }, stubs(verdict))).toEqual(
+      expected,
+    );
   });
 });
