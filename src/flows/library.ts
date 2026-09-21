@@ -6,7 +6,7 @@
 
 import type { Result } from "neverthrow";
 import type { RepoRef } from "../discovery/targets.js";
-import type { Layer, Layering, OptOutNotice } from "../engine/layers.js";
+import type { FoldOptions, Layer, RemovalNotice } from "../engine/layers.js";
 import {
   type RepoRunOptions,
   type RepoRunResult,
@@ -14,6 +14,7 @@ import {
   type ValidatedSettings,
   validateSettingsDoc,
 } from "../engine/orchestrate.js";
+import type { SettingsSource } from "../engine/secret-refs.js";
 import { SectionSelection } from "../engine/section-selection.js";
 import {
   type RenderableSnapshot,
@@ -24,6 +25,7 @@ import {
 import type { GitHubClient } from "../github/api.js";
 import { type CollectedLine, collectingIo, type Io } from "../io.js";
 import type { LayerProblem, SettingsProblem } from "../problem.js";
+import type { UndeclaredPolicy } from "../types.js";
 import { foldLayers } from "./layers.js";
 import { SNAPSHOT_SCHEMA_URL } from "./snapshot.js";
 
@@ -48,6 +50,10 @@ export interface ValidateOptions {
   sections?: SectionSelection;
   /** Where the warnings print; without one they come back as the report's `log`. */
   io?: Io;
+  /** The action's `undeclared` input: the fallback policy below a list's wrapper and the file's own; unset by default. */
+  undeclared?: UndeclaredPolicy;
+  /** Who authored the document: "operator" (the default) honors `$NAME` secret references, "target" refuses them. */
+  secretSource?: SettingsSource;
 }
 
 export interface ValidateReport {
@@ -66,6 +72,7 @@ export function validateSettings(
     options.source ?? UNNAMED_SOURCE,
     options.sections ?? SectionSelection.ALL,
     out.io,
+    { undeclared: options.undeclared, secretSource: options.secretSource },
   ).map((settings) => ({ settings, log: out.log() }));
 }
 
@@ -73,14 +80,16 @@ export interface MergeOptions {
   /** How the merged document is named in problems and warnings. */
   source?: string;
   /** How the list sections fold across layers; the action's `layering` input, "deep" unless set. */
-  layering?: Layering;
+  layering?: FoldOptions["layering"];
+  /** The action's `undeclared` input: the fallback policy below a list's wrapper and the file's own; unset by default. */
+  undeclared?: UndeclaredPolicy;
   io?: Io;
 }
 
-/** The fold's result: the merged document, its opt-out notices, and the file text mode: render writes, byte for byte. */
+/** The fold's result: the merged document, its removal notices, and the file text mode: render writes, byte for byte. */
 export interface MergeReport {
   settings: ValidatedSettings;
-  notices: OptOutNotice[];
+  notices: RemovalNotice[];
   yaml: string;
   log: CollectedLine[];
 }
@@ -94,7 +103,7 @@ export function mergeSettings(
   return foldLayers(
     layers,
     options.source ?? MERGED_SOURCE,
-    options.layering ?? "deep",
+    { layering: options.layering ?? "deep", undeclared: options.undeclared },
     out.io,
   ).map((folded) => ({ ...folded, log: out.log() }));
 }
@@ -104,7 +113,6 @@ interface RepositoryOptions {
   sections?: SectionSelection;
   onMissingPermission?: RepoRunOptions["onMissingPermission"];
   io?: Io;
-  secretSource?: RepoRunOptions["secretSource"];
   secretEnv?: RepoRunOptions["secretEnv"];
 }
 
@@ -137,7 +145,6 @@ async function runMode(
       mode,
       onMissingPermission: options.onMissingPermission ?? "fail",
       sections: options.sections ?? SectionSelection.ALL,
-      secretSource: options.secretSource,
       secretEnv: options.secretEnv,
     },
     out.io,

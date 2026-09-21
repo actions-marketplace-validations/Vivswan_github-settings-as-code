@@ -3,21 +3,23 @@
  * does not exist is skipped loudly, never created: workflow files are code, not settings.
  */
 
+import type { Result } from "neverthrow";
 import { z } from "zod";
 import type { EndpointDecl } from "../contract/endpoints.js";
-import { raise } from "../contract/errors.js";
+import type { SectionFailure } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
+  duplicateFieldIssues,
   keyedBy,
   listEntries,
   loosen,
   type SectionMeta,
   type SectionModule,
+  type SectionSnapshot,
   valueDrift,
 } from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
 import type { PlannedOp, SectionPlan } from "../contract/plan.js";
-import { rejectDuplicates } from "../contract/requests.js";
 import { layeredList } from "../shared/schema-helpers.js";
 import { WorkflowsConfig } from "./schema.js";
 
@@ -40,15 +42,13 @@ function workflowPath(declared: string): string {
 function workflowsByPath(
   section: SectionMeta,
   live: readonly LiveWorkflow[],
-): Map<string, LiveWorkflow> {
-  return raise(
-    liveByIdentity(
-      section,
-      "workflow",
-      live.filter((workflow) => workflow.state !== "deleted"),
-      (workflow) => workflow.path,
-      (workflow) => liveIdentity(workflow.path, { workflow_id: workflow.id }),
-    ),
+): Result<Map<string, LiveWorkflow>, SectionFailure> {
+  return liveByIdentity(
+    section,
+    "workflow",
+    live.filter((workflow) => workflow.state !== "deleted"),
+    (workflow) => workflow.path,
+    (workflow) => liveIdentity(workflow.path, { workflow_id: workflow.id }),
   );
 }
 
@@ -81,77 +81,71 @@ export const workflowsSection = {
   // The enable/disable PUTs carry no body at all, so an extra key can only be a typo that would silently do nothing.
   closedSurface: {
     known: { path: true, state: true },
-    describe: (w) => w.path,
     consequence: "the enable/disable calls send no payload, so the key would silently do nothing",
+  },
+  // Two entries naming the same file ("ci.yml" and ".github/workflows/ci.yml") would fight each other on every run.
+  validate(desired) {
+    return duplicateFieldIssues(desired, { field: "path", fold: workflowPath }, "workflow");
   },
   async plan(ctx, desired) {
     const workflows = listEntries(desired);
-    // Two entries naming the same file ("ci.yml" and ".github/workflows/ci.yml") would fight each other on every run.
-    raise(
-      rejectDuplicates(
-        this,
-        workflows,
-        (w) => workflowPath(w.path),
-        (w) => w.path,
-      ),
-    );
-    const present = workflowsByPath(
-      this,
-      await ctx.read.list.listAllEnveloped("workflows", LiveWorkflow),
-    );
-
-    const plan: SectionPlan<PlannedOp<typeof ENDPOINTS>> = { ops: [], notes: [], drift: [] };
-    for (const workflow of workflows) {
-      const match = present.get(workflowPath(workflow.path));
-      if (!match) {
-        // No operation can create a workflow file.
-        plan.drift.push(
-          `workflows[${workflow.path}]: declared in the settings file but no workflow with that path exists on the repo, so apply skips it - create the workflow file, or remove it from the workflows section`,
-        );
-        continue;
-      }
-      const liveState = match.state === "active" ? "active" : "disabled";
-      if (liveState === workflow.state) {
-        continue;
-      }
-      const action = workflow.state === "active" ? "enable" : "disable";
-      plan.ops.push({
-        role: action,
-        params: { workflow_id: String(match.id) },
-        drift: [
-          valueDrift(
-            `workflows[${workflow.path}]`,
-            JSON.stringify(workflow.state),
-            JSON.stringify(liveState),
-            {
-              qualifier: match.state === liveState ? undefined : match.state,
-              remedy: `apply will ${action} the workflow`,
-            },
-          ),
-        ],
-        change: `${action}d workflow "${match.path}"`,
+    return ctx.read.list
+      .listAllEnveloped("workflows", LiveWorkflow)
+      .andThen((live) => workflowsByPath(this, live))
+      .map((present) => {
+        const plan: SectionPlan<PlannedOp<typeof ENDPOINTS>> = { ops: [], notes: [], drift: [] };
+        for (const workflow of workflows) {
+          const match = present.get(workflowPath(workflow.path));
+          if (!match) {
+            // No operation can create a workflow file.
+            plan.drift.push(
+              `workflows[${workflow.path}]: declared in the settings file but no workflow with that path exists on the repo, so apply skips it - create the workflow file, or remove it from the workflows section`,
+            );
+            continue;
+          }
+          const liveState = match.state === "active" ? "active" : "disabled";
+          if (liveState === workflow.state) {
+            continue;
+          }
+          const action = workflow.state === "active" ? "enable" : "disable";
+          plan.ops.push({
+            role: action,
+            params: { workflow_id: String(match.id) },
+            drift: [
+              valueDrift(
+                `workflows[${workflow.path}]`,
+                JSON.stringify(workflow.state),
+                JSON.stringify(liveState),
+                {
+                  qualifier: match.state === liveState ? undefined : match.state,
+                  remedy: `apply will ${action} the workflow`,
+                },
+              ),
+            ],
+            change: `${action}d workflow "${match.path}"`,
+          });
+        }
+        return plan;
       });
-    }
-    return plan;
   },
   // Every disabled_* live state reads back as "disabled", the effective state apply compares; a
   // "deleted" workflow has no file and would only plan as unfixable drift, so it is left out.
   async snapshot(ctx) {
-    const present = [
-      ...workflowsByPath(
-        this,
-        await ctx.read.list.listAllEnveloped("workflows", LiveWorkflow),
-      ).values(),
-    ];
-    if (present.length === 0) {
-      return { value: undefined, notes: [] };
-    }
-    return {
-      value: present.map((w) => ({
-        path: w.path,
-        state: w.state === "active" ? ("active" as const) : ("disabled" as const),
-      })),
-      notes: [],
-    };
+    return ctx.read.list
+      .listAllEnveloped("workflows", LiveWorkflow)
+      .andThen((live) => workflowsByPath(this, live))
+      .map((byPath): SectionSnapshot<"workflows"> => {
+        const present = [...byPath.values()];
+        if (present.length === 0) {
+          return { value: undefined, notes: [] };
+        }
+        return {
+          value: present.map((w) => ({
+            path: w.path,
+            state: w.state === "active" ? ("active" as const) : ("disabled" as const),
+          })),
+          notes: [],
+        };
+      });
   },
 } satisfies SectionModule<"workflows", typeof ENDPOINTS>;

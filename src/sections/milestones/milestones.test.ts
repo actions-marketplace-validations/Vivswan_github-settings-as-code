@@ -3,7 +3,9 @@ import { planContext } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
+import type { SectionInput } from "../contract/module.js";
 import { milestonesSection } from "./index.js";
 import { githubStoresDueOn, milestonesMockHandlers } from "./mock.js";
 
@@ -18,8 +20,13 @@ const KEEP_NOTE =
   '"_undeclared: keep" - add it to the settings file to manage it, or set "_undeclared: delete" ' +
   "to have apply DELETE it, detaching it from every issue that carries it (closing is not " +
   "enough; closed milestones are still listed)";
-const plan = (api: MockApi, desired: Parameters<typeof milestonesSection.plan>[1]) =>
-  milestonesSection.plan(planContext(milestonesSection, api, REPO), desired);
+const plan = async (api: MockApi, desired: SectionInput<"milestones">) =>
+  unwrap(
+    await milestonesSection.plan(
+      planContext(milestonesSection, api, REPO),
+      validatedInput("milestones", desired),
+    ),
+  );
 
 describe("milestones", () => {
   test("plans an update per drifted milestone and a create per missing one, keeps the undeclared one as a note, reading only", async () => {
@@ -119,7 +126,7 @@ describe("milestones", () => {
     expect(result).toEqual({ ops: [], notes: [], drift: [] });
   });
 
-  test("a due_on differing by a day, or missing live, is drift, and the update sends the day as noon UTC so GitHub keeps that day", async () => {
+  test("a due_on differing by a day, or missing live, is drift on the day, and the update sends the day as noon UTC so GitHub keeps that day", async () => {
     const api = new MockApi({
       [LIST]: {
         data: [
@@ -146,7 +153,7 @@ describe("milestones", () => {
           payload: { title: "v1", due_on: "2026-01-16T12:00:00Z" },
           describe: 'updating milestone "v1"',
           drift: [
-            'milestones[v1].due_on: declared "2026-01-16T12:00:00Z" != live "2026-01-15T12:00:00Z"; apply will set the declared value',
+            'milestones[v1].due_on: declared "2026-01-16" != live "2026-01-15"; apply will set the declared value',
           ],
           change: 'updated milestone "v1"',
         },
@@ -156,7 +163,7 @@ describe("milestones", () => {
           payload: { title: "v2", due_on: "2026-12-31T12:00:00Z" },
           describe: 'updating milestone "v2"',
           drift: [
-            'milestones[v2].due_on: declared "2026-12-31T12:00:00Z" != live null; apply will set the declared value',
+            'milestones[v2].due_on: declared "2026-12-31" != live null; apply will set the declared value',
           ],
           change: 'updated milestone "v2"',
         },
@@ -187,7 +194,7 @@ describe("milestones", () => {
   test.each<
     [
       form: string,
-      declared: Parameters<typeof milestonesSection.plan>[1],
+      declared: SectionInput<"milestones">,
       ops: Awaited<ReturnType<typeof plan>>["ops"],
       notes: string[],
     ]
@@ -219,12 +226,16 @@ describe("milestones", () => {
     },
   );
 
-  test("duplicate titles are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(plan(api, [{ title: "v1" }, { title: "v1", state: "closed" }])).rejects.toThrow(
-      /same milestones entry/,
+  test("duplicate titles are a validate issue, so the document fails before any API call", () => {
+    expect(milestonesSection.validate([{ title: "v1" }, { title: "v1", state: "closed" }])).toEqual(
+      [
+        {
+          path: "[1].title",
+          message:
+            '"v1" names the same milestone as "v1" declared earlier; keep exactly one entry per milestone',
+        },
+      ],
     );
-    expect(api.calls).toHaveLength(0);
   });
 
   test("executing the plan against the mock converges: the re-plan is empty", async () => {
@@ -256,15 +267,15 @@ describe("milestones", () => {
       ],
     });
     expect(changes).toEqual([
+      'DELETED undeclared milestone "v0.9"',
       'updated milestone "v1.0"',
       'created milestone "v2.0"',
-      'DELETED undeclared milestone "v0.9"',
     ]);
     expect(notes).toEqual([]);
     expect(api.writes).toEqual([
+      "DELETE /repos/o/r/milestones/1",
       "PATCH /repos/o/r/milestones/7",
       "POST /repos/o/r/milestones",
-      "DELETE /repos/o/r/milestones/1",
     ]);
     expect(second).toEqual({ ops: [], notes: [], drift: [] });
     // The mock stored the day as GitHub does: Pacific midnight, in PDT for June.

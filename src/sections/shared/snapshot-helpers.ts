@@ -4,13 +4,15 @@
  * wrapper a list section's snapshot emits.
  */
 
+import { err, ok, type Result } from "neverthrow";
 import type { z } from "zod";
 import type { ReplaceSweep } from "../../engine/diff.js";
 import type { UndeclaredPolicySection } from "../../schema.js";
 import type { UndeclaredPolicyList } from "../../types.js";
-import { PermissionDenied } from "../contract/errors.js";
+import type { SectionFailure } from "../contract/errors.js";
 import { defaultUndeclaredPolicy, type SectionMeta } from "../contract/module.js";
 import type { SnapshotContext } from "../contract/plan.js";
+import { isMapping } from "./raw-values.js";
 
 /** The zod internals the projection walks: the def discriminator and its children. */
 interface ProjectionDef {
@@ -38,10 +40,6 @@ const LEAF_TYPES: ReadonlySet<string> = new Set([
   "unknown",
   "null",
 ]);
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 /**
  * A live value projected onto a schema slice, so server-assigned fields fall away without a hand
@@ -72,7 +70,7 @@ function project(schema: z.ZodType, live: unknown): unknown {
     case "default":
       return project(def.innerType as z.ZodType, live);
     case "object": {
-      if (!isPlainObject(live)) {
+      if (!isMapping(live)) {
         return live;
       }
       const shape = def.shape ?? {};
@@ -98,7 +96,7 @@ function project(schema: z.ZodType, live: unknown): unknown {
         ? live.map((item) => project(def.element as z.ZodType, item))
         : live;
     case "record":
-      return isPlainObject(live)
+      return isMapping(live)
         ? Object.fromEntries(
             Object.entries(live).map(([key, value]) => [
               key,
@@ -187,26 +185,27 @@ export function leftOutOfSnapshot(label: string, reason: string): string {
 
 /**
  * One read of a snapshot whose denial is that read's alone, for a section whose keys sit behind
- * different grants (repository, actions, environments). Under `warn` a PermissionDenied becomes a
- * note naming the key left out and the grant advice; under `fail` it propagates, so the engine
- * fails the section exactly as it does a primary read's denial. Anything else propagates. The
- * policy arrives as the carrier only snapshotContext() mints, so a section cannot pick "warn".
+ * different grants (repository, actions, environments). Under `warn` a denial becomes a note naming
+ * the key left out and the grant advice; under `fail` it propagates, so the engine fails the section
+ * exactly as it does a primary read's denial. Any other failure propagates. The policy arrives as the
+ * carrier only snapshotContext() mints, so a section cannot pick "warn".
  */
 export async function readOrNote<T>(
   ctx: Pick<SnapshotContext, "onMissingPermission">,
   notes: string[],
   label: string,
-  read: () => Promise<T>,
-): Promise<{ value: T } | { denied: true }> {
-  try {
-    return { value: await read() };
-  } catch (error) {
-    if (error instanceof PermissionDenied && ctx.onMissingPermission.notesDenials) {
-      notes.push(leftOutOfSnapshot(label, error.detail));
-      return { denied: true };
+  read: () => PromiseLike<Result<T, SectionFailure>>,
+): Promise<Result<{ value: T } | { denied: true }, SectionFailure>> {
+  const result = await read();
+  if (result.isErr()) {
+    const failure = result.error;
+    if (failure.kind === "permission-denied" && ctx.onMissingPermission.notesDenials) {
+      notes.push(leftOutOfSnapshot(label, failure.detail));
+      return ok({ denied: true });
     }
-    throw error;
+    return err(failure);
   }
+  return ok({ value: result.value });
 }
 
 /** A knobbed section's snapshot value: its entries under the section's own default policy, spelled out. */

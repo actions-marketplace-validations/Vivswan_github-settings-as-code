@@ -3,12 +3,14 @@ import { captureIo } from "../../../test/io/capture.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
 import { validateSettingsDoc } from "../../engine/orchestrate.js";
 import { SectionSelection } from "../../engine/section-selection.js";
 import { snapshotRepository } from "../../engine/snapshot.js";
 import { silentIo } from "../../io.js";
 import { describeProblem } from "../../problem.js";
+import type { SectionInput } from "../contract/module.js";
 import { type PlainData, planContext, type SectionPlan } from "../contract/plan.js";
 import { secretScanningPatternsSection } from "./index.js";
 import { secretScanningCustomPatternsMockHandlers } from "./mock.js";
@@ -35,10 +37,12 @@ function livePattern(overrides: Record<string, unknown>): Record<string, unknown
   };
 }
 
-const plan = (api: MockApi, desired: Parameters<typeof secretScanningPatternsSection.plan>[1]) =>
-  secretScanningPatternsSection.plan(
-    planContext(secretScanningPatternsSection, api, REPO),
-    desired,
+const plan = async (api: MockApi, desired: SectionInput<"secret_scanning_custom_patterns">) =>
+  unwrap(
+    await secretScanningPatternsSection.plan(
+      planContext(secretScanningPatternsSection, api, REPO),
+      validatedInput("secret_scanning_custom_patterns", desired),
+    ),
   );
 
 /** A plan with every change thunk rendered; the section builds the lines at plan time. */
@@ -47,7 +51,7 @@ function rendered(result: SectionPlan) {
     ...result,
     ops: result.ops.map((op) => ({
       ...op,
-      change: typeof op.change === "function" ? [op.change(null)].flat() : [op.change],
+      change: typeof op.change === "function" ? [unwrap(op.change(null))].flat() : [op.change],
     })),
   };
 }
@@ -256,15 +260,19 @@ describe("secret_scanning_custom_patterns", () => {
     expect(result.ops[0]?.drift).toHaveLength(3);
   });
 
-  test("two entries with the same name are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("two entries with the same name are a validate issue, so the document fails before any API call", () => {
+    expect(
+      secretScanningPatternsSection.validate([
         { name: "dup", pattern: "a" },
         { name: "dup", pattern: "b" },
       ]),
-    ).rejects.toThrow(/same secret_scanning_custom_patterns entry/);
-    expect(api.calls).toHaveLength(0);
+    ).toEqual([
+      {
+        path: "[1].name",
+        message:
+          '"dup" names the same custom pattern as "dup" declared earlier; keep exactly one entry per custom pattern',
+      },
+    ]);
   });
 
   test.each<[form: string, live: Record<string, unknown>, at: RegExp]>([
@@ -397,7 +405,7 @@ describe("secret_scanning_custom_patterns snapshot", () => {
     expect(result.outcomes).toEqual([
       { key: "secret_scanning_custom_patterns", status: "snapshot", detail: [] },
     ]);
-    expect(result.settings?.secret_scanning_custom_patterns).toEqual({
+    expect<unknown>(result.settings?.secret_scanning_custom_patterns).toEqual({
       _undeclared: "keep",
       entries: [{ name: "vendor-key", pattern }],
     });
@@ -427,7 +435,7 @@ describe("secret_scanning_custom_patterns snapshot", () => {
         ],
       },
     ]);
-    expect(result.settings?.secret_scanning_custom_patterns).toEqual({
+    expect<unknown>(result.settings?.secret_scanning_custom_patterns).toEqual({
       _undeclared: "keep",
       entries: [{ name: "vendor-key", pattern: "key_[A-Z0-9]{32}" }],
     });
@@ -451,7 +459,7 @@ describe("secret_scanning_custom_patterns snapshot", () => {
     // pattern stays live under the keep policy the empty declaration spells.
     const result = await snapshot([livePattern({ id: 8, name: "odd-one", pattern: "(key" })]);
     expect(result.result).toBe("snapshot");
-    expect(result.settings?.secret_scanning_custom_patterns).toEqual({
+    expect<unknown>(result.settings?.secret_scanning_custom_patterns).toEqual({
       _undeclared: "keep",
       entries: [],
     });

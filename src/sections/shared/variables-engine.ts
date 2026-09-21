@@ -4,12 +4,15 @@
  * (../environments/nested.ts) plan through it.
  */
 
+import { err, ok, type Result } from "neverthrow";
 import { z } from "zod";
 import { phantomKeys, phantomNote, subsetDiff } from "../../engine/diff.js";
-import type { UndeclaredPolicy } from "../../types.js";
-import { raise } from "../contract/errors.js";
+import type { UndeclaredPolicy, UndeclaredPolicyList } from "../../types.js";
+import type { SectionFailure } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
+  type DeclaredIssue,
+  duplicateFieldIssues,
   missingDrift,
   type SectionMeta,
   undeclaredDrift,
@@ -17,7 +20,6 @@ import {
   valueDrift,
 } from "../contract/module.js";
 import { type PlainData, plainData, type SectionPlan } from "../contract/plan.js";
-import { rejectDuplicates } from "../contract/requests.js";
 
 /** Case-insensitive key for variable names (GitHub stores them uppercased). */
 export function variableKey(name: string): string {
@@ -48,8 +50,6 @@ interface VariablesScopeProse {
   where?: string;
   /** Appended to change and describe lines (` in environment "prod"`). */
   suffix?: string;
-  /** What two declared entries under one name are reported as naming, when `<section> entry` understates it (`variable of the "prod" environment`). */
-  what?: string;
 }
 
 interface VariableCreate {
@@ -84,7 +84,7 @@ export interface VariablesPlanScope<
   Remove extends AnyPlannedOp,
 > extends VariablesScopeProse {
   /** The parsed {name, value} identities of the enveloped list, all pages. */
-  readonly list: () => Promise<LiveVariable[]>;
+  readonly list: () => PromiseLike<Result<LiveVariable[], SectionFailure>>;
   /** The planned POST; the builders are function-valued so one demanding an unsupplied facet fails. */
   readonly create: (write: VariableCreate) => Create;
   readonly update: (write: VariableUpdate) => Update;
@@ -92,23 +92,15 @@ export interface VariablesPlanScope<
 }
 
 /**
- * Variable names are case-insensitive on GitHub, so two entries differing only in case name one
- * variable. planVariables runs it before its read, so no scope can skip it.
+ * Variable names are case-insensitive on GitHub, so two entries differing only in case name one variable.
+ * Every scope's validate hook runs it over its declared value in either form (planVariables trusts the
+ * document); `what` names the resource ("variable", `variable of the "prod" environment`).
  */
-function rejectDuplicateVariableNames(
-  section: SectionMeta,
-  entries: readonly VariableEntry[],
-  what?: string,
-): void {
-  raise(
-    rejectDuplicates(
-      section,
-      entries,
-      (variable) => variableKey(variable.name),
-      (variable) => variable.name,
-      what,
-    ),
-  );
+export function duplicateVariableNameIssues(
+  declared: readonly VariableEntry[] | UndeclaredPolicyList<VariableEntry>,
+  what: string,
+): DeclaredIssue[] {
+  return duplicateFieldIssues(declared, { field: "name", fold: variableKey }, what);
 }
 
 /**
@@ -120,15 +112,13 @@ export function liveVariablesByKey(
   section: SectionMeta,
   noun: string,
   live: readonly LiveVariable[],
-): Map<string, LiveVariable> {
-  return raise(
-    liveByIdentity(
-      section,
-      noun,
-      live,
-      (variable) => variableKey(variable.name),
-      (variable) => liveIdentity(variable.name),
-    ),
+): Result<Map<string, LiveVariable>, SectionFailure> {
+  return liveByIdentity(
+    section,
+    noun,
+    live,
+    (variable) => variableKey(variable.name),
+    (variable) => liveIdentity(variable.name),
   );
 }
 
@@ -167,13 +157,18 @@ export async function planVariables<
      */
     defaultPolicy: UndeclaredPolicy;
   },
-): Promise<SectionPlan<Create | Update | Remove>> {
+): Promise<Result<SectionPlan<Create | Update | Remove>, SectionFailure>> {
   const { entries, policy, defaultPolicy } = opts;
   const suffix = scope.suffix ?? "";
   const plan: SectionPlan<Create | Update | Remove> = { ops: [], notes: [], drift: [] };
 
-  rejectDuplicateVariableNames(section, entries, scope.what);
-  const liveByKey = liveVariablesByKey(section, scope.noun, await scope.list());
+  const indexed = (await scope.list()).andThen((live) =>
+    liveVariablesByKey(section, scope.noun, live),
+  );
+  if (indexed.isErr()) {
+    return err(indexed.error);
+  }
+  const liveByKey = indexed.value;
   const declaredKeys = new Set(entries.map((variable) => variableKey(variable.name)));
 
   for (const variable of entries) {
@@ -240,5 +235,5 @@ export async function planVariables<
       );
     }
   }
-  return plan;
+  return ok(plan);
 }

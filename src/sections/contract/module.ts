@@ -1,3 +1,4 @@
+import type { Result } from "neverthrow";
 import { z } from "zod";
 import type { RepoRef } from "../../discovery/targets.js";
 import type { GitHubClient } from "../../github/api.js";
@@ -13,7 +14,7 @@ import type {
   UndeclaredPolicy,
   UndeclaredPolicyList,
 } from "../../types.js";
-import type { Layering } from "../shared/schema-helpers.js";
+import type { Layering, UNDECLARED_POLICIES } from "../shared/schema-helpers.js";
 import {
   type EndpointDecl,
   endpointKind,
@@ -22,6 +23,7 @@ import {
   type GatedReadDecl,
   type Route,
 } from "./endpoints.js";
+import type { SectionFailure } from "./errors.js";
 import type { GraphqlOpDecl } from "./graphql.js";
 import { grantFor, type SectionPermission } from "./permissions.js";
 import type { PlanContext, PlannedOp, SectionPlan, SnapshotContext } from "./plan.js";
@@ -85,7 +87,7 @@ export interface SectionMeta<
   readonly graphql?: G;
   /**
    * The generated Sections table's Undeclared-default column derives from it, and test/sections/docs-registry.test.ts
-   * fails a COVERAGE Notes cell that contradicts it; the wrapped `{_undeclared, entries}` form overrides it per run.
+   * fails a coverage note that contradicts it; the wrapped `{_undeclared, entries}` form overrides it per run.
    *
    *   "delete"     -> lists live resources and DELETES undeclared ones; `_undeclared: keep` softens to notes
    *   "keep"       -> lists live resources and KEEPS undeclared ones as notes; `_undeclared: delete` hardens
@@ -123,11 +125,16 @@ export interface KeyedListLayering {
    */
   readonly nested?: Readonly<Record<string, KeyedListLayering>>;
   /**
-   * Dotted paths within the entry whose null the ENTRY SCHEMA types as a value (custom_properties' `value` unsets the
-   * property): the fold writes such a null as the value and the per-layer view keeps it, where every other null inside
-   * an entry is a delete-the-lower-key marker. test/sections/registry.test.ts pins each list to the published schema.
+   * The dotted paths a `_remove: true` entry may carry beside the marker: the key field's own unless the key spans
+   * several (a reviewer is its `type` and `id`). Any other path on a removal is refused at the layer boundary by name.
    */
-  readonly nullValued?: readonly string[];
+  readonly removalPaths?: readonly string[];
+  /**
+   * A NESTED list's `_undeclared` default (an environment's variables), the last fallback engine/layers.ts resolves a
+   * nested wrapper without a policy to; absent on a nested list that takes no knob (a ruleset's rules, reviewers).
+   * test/sections/registry.test.ts pins it to the nested wrappers the schema declares.
+   */
+  readonly undeclaredDefault?: UndeclaredPolicy;
 }
 
 /** A list keyed by one string field of each entry, folded as the planner's duplicate check folds it. */
@@ -135,8 +142,8 @@ export function keyedBy(
   keyField: string,
   options: {
     readonly fold?: (name: string) => string;
-    readonly nullValued?: readonly string[];
     readonly nested?: Readonly<Record<string, KeyedListLayering>>;
+    readonly undeclaredDefault?: UndeclaredPolicy;
   } = {},
 ): KeyedListLayering {
   const fold = options.fold ?? ((name: string) => name);
@@ -146,23 +153,32 @@ export function keyedBy(
       const value = entry[keyField];
       return typeof value === "string" ? [fold(value)] : null;
     },
-    ...(options.nullValued === undefined ? {} : { nullValued: options.nullValued }),
     ...(options.nested === undefined ? {} : { nested: options.nested }),
+    ...(options.undeclaredDefault === undefined
+      ? {}
+      : { undeclaredDefault: options.undeclaredDefault }),
   };
 }
 
 /**
  * The entries of a list section's value in either form, by reference: the bare list, or the `{entries}` wrapper (the
  * knobbed `{_undeclared, entries}` and the plain-list `{_layering, entries}` alike). The one unwrap a planner over a
- * plain-list section performs; the knobbed ones read theirs through undeclaredPolicy().
+ * plain-list section performs; the knobbed ones read theirs through undeclaredPolicy(). A shape rule reads a wrapper
+ * whose `entries` is raw or missing beside its own shape issue (../shared/raw-values.ts); it holds no entries.
  */
 export function listEntries<E>(
   declared: readonly E[] | { readonly entries: readonly E[] },
 ): readonly E[] {
-  return Array.isArray(declared)
-    ? declared
-    : (declared as { readonly entries: readonly E[] }).entries;
+  if (Array.isArray(declared)) {
+    return declared;
+  }
+  const entries: unknown = (declared as { readonly entries: readonly E[] }).entries;
+  return Array.isArray(entries) ? (entries as readonly E[]) : [];
 }
+
+/** The policy type in ../../types.ts is zod-free and spells the values itself; both pins fail when the two sets part. */
+type _PolicyComplete = MustBeNever<Exclude<(typeof UNDECLARED_POLICIES)[number], UndeclaredPolicy>>;
+type _PolicySound = MustBeNever<Exclude<UndeclaredPolicy, (typeof UNDECLARED_POLICIES)[number]>>;
 
 /** The wrapper type in ../../types.ts is zod-free and spells the directive's values itself; both pins fail when the two sets part. */
 type _WrapperLayeringComplete = MustBeNever<
@@ -384,11 +400,34 @@ export function cannotVerifyNote(
 }
 
 /**
- * validateSettingsDoc (engine/orchestrate.ts) has run every section's shape before a handler sees this,
- * so plan() carries the proof in its parameter type instead of a per-section cast. Only `undefined` (the
- * absent-section marker) is excluded: a nullable section (interaction_limits) keeps its `null`.
+ * A section's declared value as the schema types it. Only `undefined` (the absent-section marker) is excluded: a
+ * nullable section (interaction_limits, pages) keeps its `null`. The validate and secretValues hooks take it, since
+ * they run inside validation; plan() takes ValidatedInput, the same shape carrying validation's proof.
  */
-type SectionInput<K extends SectionKey> = Exclude<SettingsFile[K], undefined>;
+export type SectionInput<K extends SectionKey> = Exclude<SettingsFile[K], undefined>;
+
+declare const validatedInput: unique symbol;
+
+/**
+ * The brand's carrier, named so a module's declaration prints a planner's input by this name (a bundled declaration
+ * cannot spell the unexported symbol). It holds the KEY the value was validated as, so a validated branches list is
+ * not a labels input, whose checks it never met. An alias, not an interface: an interface has no implicit index
+ * signature, so a branded mapping could no longer pass where a `Record<string, unknown>` is read.
+ */
+export type ValidatedBrand<K extends SectionKey = SectionKey> = { readonly [validatedInput]: K };
+
+/**
+ * The proof that validateSettingsDoc (engine/orchestrate.ts) ran section K's every file-only check over the value:
+ * a brand that exists at the type level only (no runtime field), minted at that one site and read off the
+ * ValidatedSettings document. Every plan() takes it, so a hand-built entry list cannot reach a planner and skip the
+ * checks; the unbranded shape is read back by assignment (`const declared: SectionInput<K> = desired`). A `null`
+ * value stays unbranded: it carries nothing a file-only check could judge, and no brand attaches to null.
+ */
+export type ValidatedInput<K extends SectionKey> = K extends SectionKey
+  ? Validated<SectionInput<K>, K>
+  : never;
+
+type Validated<T, K extends SectionKey> = T extends null ? null : T & ValidatedBrand<K>;
 
 interface SectionModuleBase<
   K extends SectionKey = SectionKey,
@@ -418,11 +457,6 @@ interface SectionModuleBase<
         known: {
           readonly [P in Extract<keyof EntryOf<NonNullable<SettingsFile[K]>>, string>]: true;
         };
-        /**
-         * Method syntax on purpose: a function-typed property is contravariant in its parameter, which
-         * would stop the module's exact type from erasing to SectionModule<SectionKey> in ../registry.ts.
-         */
-        describe(entry: EntryOf<NonNullable<SettingsFile[K]>>): string;
         /** What the unrecognized key would silently do, as message prose. */
         consequence: string;
       };
@@ -437,6 +471,110 @@ interface SectionModuleBase<
 }
 
 /**
+ * A finding of a section's file-only checks (SectionModule.validate). `path` follows the section key the way a
+ * zod issue's does (`[3].name`, `.entries[1].name`, "" for the whole value), so `labels[3].name: ...` reads alike
+ * whichever check raised it.
+ */
+export interface DeclaredIssue {
+  readonly path: string;
+  readonly message: string;
+}
+
+/**
+ * Every check that reads the declared value and nothing else (no API, no environment): a duplicated identity, a
+ * malformed key material, a list GitHub would fold. engine/validate.ts runs it inside document validation, in both
+ * modes, before the preflight barrier and the first write, and joins the findings to the settings-malformed-sections
+ * problem; the same check thrown from plan() would fire after earlier sections wrote (the preflight probe reports
+ * only denials). Required on a list section, since every entry list has an identity to keep unique; a mapping
+ * section may declare none. The erased view (SectionModule<SectionKey>) keeps it optional so every module erases.
+ */
+type ValidateFacet<K extends SectionKey> =
+  IsUnion<K> extends true
+    ? { validate?(declared: SectionInput<K>): readonly DeclaredIssue[] }
+    : [EntryOf<NonNullable<SettingsFile[K]>>] extends [never]
+      ? { validate?(declared: SectionInput<K>): readonly DeclaredIssue[] }
+      : { validate(declared: SectionInput<K>): readonly DeclaredIssue[] };
+
+type UnionToIntersection<U> = (U extends unknown ? (x: U) => void : never) extends (
+  x: infer I,
+) => void
+  ? I
+  : never;
+
+type IsUnion<T> = [T] extends [UnionToIntersection<T>] ? false : true;
+
+/**
+ * The entries of a knobbed list in either declared form, with the path prefix they sit under, so a file-only
+ * check's issue path matches the zod issue path for the same entry (`labels[1]` vs `labels.entries[1]`).
+ */
+export function declaredEntries<E>(declared: readonly E[] | UndeclaredPolicyList<E>): {
+  readonly entries: readonly E[];
+  readonly path: "" | ".entries";
+} {
+  return Array.isArray(declared)
+    ? { entries: declared, path: "" }
+    : { entries: (declared as UndeclaredPolicyList<E>).entries, path: ".entries" };
+}
+
+/**
+ * Two entries resolving to one natural key would fight each other on every run. Every collision is reported, each
+ * against the first entry under its key, so N duplicates cost one run to discover. `what` names the resource
+ * ("label", `secret of the "prod" environment`); `at` is the offending item's path within the list (`[3].name`).
+ */
+export function duplicateIssues<T>(
+  items: readonly T[],
+  identity: {
+    keyOf(item: T): string;
+    describe(item: T): string;
+    at(item: T, index: number): string;
+  },
+  what: string,
+): DeclaredIssue[] {
+  const seen = new Map<string, string>();
+  const issues: DeclaredIssue[] = [];
+  items.forEach((item, index) => {
+    const key = identity.keyOf(item);
+    const first = seen.get(key);
+    if (first === undefined) {
+      seen.set(key, identity.describe(item));
+      return;
+    }
+    issues.push({
+      path: identity.at(item, index),
+      message: `"${identity.describe(item)}" names the same ${what} as "${first}" declared earlier; keep exactly one entry per ${what}`,
+    });
+  });
+  return issues;
+}
+
+/**
+ * duplicateIssues over a list whose entries carry ONE identity field, in either declared form: the key is `fold`
+ * of the field (the field itself when GitHub matches exactly), the description the field verbatim, and each issue
+ * sits at `<wrapper path>[i].<field>`, so `labels[1].name` and `labels.entries[1].name` read alike.
+ */
+export function duplicateFieldIssues<F extends string, E extends Record<F, string>>(
+  declared: readonly E[] | UndeclaredPolicyList<E>,
+  identity: {
+    readonly field: F;
+    /** Folds the field to the key GitHub matches it by; omitted, GitHub matches exactly. */
+    readonly fold?: (name: string) => string;
+  },
+  what: string,
+): DeclaredIssue[] {
+  const { entries, path } = declaredEntries(declared);
+  const fold = identity.fold ?? ((name: string): string => name);
+  return duplicateIssues(
+    entries,
+    {
+      keyOf: (entry) => fold(entry[identity.field]),
+      describe: (entry) => entry[identity.field],
+      at: (_entry, index) => `${path}[${index}].${identity.field}`,
+    },
+    what,
+  );
+}
+
+/**
  * What a section reads back as a settings document: its live state in the section's own declared
  * form, or `undefined` when nothing exists (the engine omits the key). `notes` carry what the value
  * cannot: a secret's unreadable value, a feature the repository lacks.
@@ -448,7 +586,8 @@ export interface SectionSnapshot<K extends SectionKey = SectionKey> {
 
 /**
  * plan() only READS (through the port in PlanContext) and returns the operations that would converge the
- * repository; the engine renders them as drift in check mode and executes them in apply mode.
+ * repository, or the failure that ended it as a value (a denied read, a live state it cannot reconcile); the
+ * engine renders the operations as drift in check mode and executes them in apply mode.
  * Modules register in ../registry.ts.
  *
  *   snapshot() required  -> the section declares a read (a GET or a GraphQL query), so the live state it
@@ -462,11 +601,12 @@ export type SectionModule<
   E extends EndpointDict = EndpointDict,
   G extends GraphqlDict = GraphqlDict,
 > = SectionModuleBase<K, E, G> &
-  SnapshotFacet<K, E, G> & {
+  SnapshotFacet<K, E, G> &
+  ValidateFacet<K> & {
     plan(
       ctx: PlanContext<E, G, K>,
-      desired: SectionInput<K>,
-    ): Promise<SectionPlan<PlannedOp<E, G>>>;
+      desired: ValidatedInput<K>,
+    ): Promise<Result<SectionPlan<PlannedOp<E, G>>, SectionFailure>>;
     /** Pinned so a non-literal object carrying a run() handler is not assignable either. */
     run?: never;
   };
@@ -483,8 +623,16 @@ export type DeclaresRead<E extends EndpointDict, G extends GraphqlDict> = string
 
 type SnapshotFacet<K extends SectionKey, E extends EndpointDict, G extends GraphqlDict> =
   DeclaresRead<E, G> extends true
-    ? { snapshot(ctx: SnapshotContext<E, G, K>): Promise<SectionSnapshot<K>> }
-    : { snapshot?(ctx: SnapshotContext<E, G, K>): Promise<SectionSnapshot<K>> };
+    ? {
+        snapshot(
+          ctx: SnapshotContext<E, G, K>,
+        ): Promise<Result<SectionSnapshot<K>, SectionFailure>>;
+      }
+    : {
+        snapshot?(
+          ctx: SnapshotContext<E, G, K>,
+        ): Promise<Result<SectionSnapshot<K>, SectionFailure>>;
+      };
 
 /**
  * Freezes in place through every nested object and array; functions are left as they are (nothing
@@ -514,7 +662,7 @@ const DECLARATION_FIELDS = [
 ] as const satisfies readonly (keyof SectionModule)[];
 
 /** `shape` stays as zod built it; the rest are handlers. */
-type HandlerField = "shape" | "plan" | "snapshot" | "secretValues" | "run";
+type HandlerField = "shape" | "plan" | "snapshot" | "secretValues" | "validate" | "run";
 
 type _EveryModuleFieldSorted = MustBeNever<
   Exclude<keyof SectionModule, (typeof DECLARATION_FIELDS)[number] | HandlerField>
@@ -590,7 +738,7 @@ export function secretValuesOf(
  *
  *   scalars, arrays, null    -> pass through, so the piped shape reports its own error
  *   applied by               -> the sections whose whole value is one mapping (repository, the setups, interaction_limits)
- *   document-wide backstop   -> findNonPlain in engine/validate.ts
+ *   document-wide backstop   -> the raw non-plain walk in engine/validate.ts (validateSectionShapes)
  */
 export function requirePlainMapping(shape: z.ZodType): z.ZodType {
   return z
@@ -625,12 +773,84 @@ function defOf(schema: z.ZodType): LoosenDef {
   return (schema as unknown as { _zod: { def: LoosenDef } })._zod.def;
 }
 
+/** Every clone's own checks are rewired to report beside a failed nested value (reportingBesideFailures). */
 function cloneWith(schema: z.ZodType, patch: Partial<LoosenDef>): z.ZodType {
   const def = (schema as unknown as { _zod: { def: Record<string, unknown> } })._zod.def;
+  const checks = (def.checks as readonly z.core.$ZodCheck[] | undefined)?.map(
+    reportingBesideFailures,
+  );
   return z.util.clone(
     schema as unknown as Parameters<typeof z.util.clone>[0],
-    { ...def, ...patch } as never,
+    { ...def, ...patch, checks } as never,
   ) as unknown as z.ZodType;
+}
+
+/** The rewire for a check attached AFTER loosen(): a section composing a rule onto its loosened shape. */
+export function checksReportingBesideFailures(schema: z.ZodType): z.ZodType {
+  return cloneWith(schema, {});
+}
+
+const REPORTS_BESIDE_FAILURES = new WeakSet<z.core.$ZodCheck>();
+
+let swallowedThrowObserver: ((error: unknown) => void) | null = null;
+
+/** Test seam for the swallowed throws below (test/sections/raw-sibling.test.ts); production leaves it null. */
+export function observeSwallowedThrows(observer: ((error: unknown) => void) | null): void {
+  swallowedThrowObserver = observer;
+}
+
+/** The paths of the issues that abort a parse (a wrong type, a refused option); a rule's own finding and an unrecognized key do not. */
+function failedPaths(issues: readonly z.core.$ZodRawIssue[]): PropertyKey[][] {
+  return issues.flatMap((issue) => (issue.continue === true ? [] : [issue.path ?? []]));
+}
+
+function isUnder(path: readonly PropertyKey[], failed: readonly PropertyKey[]): boolean {
+  return failed.length <= path.length && failed.every((step, index) => step === path[index]);
+}
+
+/**
+ * zod skips a node's own checks once a nested value failed; rewired, a check runs unless the node itself was refused
+ * (a pathless failure). The contract for a rule, which then meets the raw value at a failed property: a finding under
+ * a failed path is dropped (the shape's issue stands there), a throw ends the rule with its findings so far, and a
+ * rule branching on a sibling's type guards that read itself, and a rule reading a property or the truth of a
+ * sibling asks for the type first (an empty string's length is zero, a number is truthy). With no failure a throw
+ * propagates.
+ */
+function reportingBesideFailures(check: z.core.$ZodCheck): z.core.$ZodCheck {
+  if (REPORTS_BESIDE_FAILURES.has(check)) {
+    return check;
+  }
+  const { when, ...def } = check._zod.def;
+  const inner = check._zod.check;
+  const clone: z.core.$ZodCheck = {
+    _zod: {
+      def: {
+        ...def,
+        when: (payload) =>
+          (when?.(payload) ?? true) && !failedPaths(payload.issues).some((p) => p.length === 0),
+      },
+      onattach: check._zod.onattach,
+      check: (payload) => {
+        const failed = failedPaths(payload.issues);
+        if (failed.length === 0) {
+          return inner(payload);
+        }
+        const before = payload.issues.length;
+        try {
+          inner(payload);
+        } catch (error) {
+          // The rule tripped on a raw value whose own shape issue is already listed.
+          swallowedThrowObserver?.(error);
+        }
+        const findings = payload.issues.splice(before);
+        payload.issues.push(
+          ...findings.filter((f) => !failed.some((path) => isUnder(f.path ?? [], path))),
+        );
+      },
+    },
+  };
+  REPORTS_BESIDE_FAILURES.add(clone);
+  return clone;
 }
 
 /**
@@ -639,6 +859,8 @@ function cloneWith(schema: z.ZodType, patch: Partial<LoosenDef>): z.ZodType {
  *
  *   strictObject             -> stays strict
  *   refine/superRefine       -> survives (clones carry the checks); one on the knobbed union itself throws instead
+ *   a leaf's own checks      -> rewired like a rule (a min or max length runs, in zod, on any value with a length,
+ *                               so it would judge a raw list beside the leaf's own type issue)
  *   knobbed-section union    -> rewrapped as a container-routed check, so a failing entry keeps its issue path
  *                               (`labels[2].name`) instead of a plain union's pathless "Invalid input"
  *   unrecognized CONTAINER   -> throws, rather than ship a shape that silently skipped loosening
@@ -682,7 +904,7 @@ export function loosen(schema: z.ZodType): z.ZodType {
           `BUG: loosen(): unhandled schema type "${def.type}" - teach loosen() its runtime derivation before authoring it in src/schema.ts`,
         );
       }
-      return schema;
+      return (def.checks?.length ?? 0) > 0 ? cloneWith(schema, {}) : schema;
   }
 }
 
@@ -736,6 +958,8 @@ function routedListShape(list: z.ZodType, wrapper: z.ZodType): z.ZodType {
         ctx.addIssue({
           code: "custom",
           message: `Invalid input: expected a list of entries, or a mapping with "entries" (and ${beside}), but this section parsed as ${value === null ? "null" : typeof value}`,
+          // A null list has no empty state of its own: engine/validate.ts names the fix from this instead of the type prose.
+          ...(value === null ? { params: { legal: "a list of entries ([] for none)" } } : {}),
         });
         return z.NEVER;
       }
@@ -744,7 +968,9 @@ function routedListShape(list: z.ZodType, wrapper: z.ZodType): z.ZodType {
         for (const issue of parsed.error.issues) {
           ctx.addIssue({ ...issue });
         }
-        return z.NEVER;
+        // The raw value, not z.NEVER: a rule the section composed onto the routed shape runs beside the failed
+        // entry (reportingBesideFailures) and must meet the entries, raw where they failed. The parse fails regardless.
+        return value;
       }
       return parsed.data;
     });
@@ -757,8 +983,11 @@ export type EntryOf<T> = T extends readonly (infer E)[]
     : never;
 
 /**
- * `defaultPolicy` is REQUIRED on purpose: a nested list cannot derive its default from its section's
- * undeclaredDefault, so the call site always says which applies. Entries are returned by reference.
+ * A validated document arrives with every knobbed list in wrapper form and its policy explicit
+ * (resolveUndeclaredPolicies in engine/layers.ts runs at the fold and in the validator), so at run time the
+ * wrapper's `_undeclared` is what a planner reads. `defaultPolicy` is REQUIRED all the same: it is the list's
+ * own default, which the drift prose names and which a plan() called on a raw declaration (a test) falls back
+ * to, and a nested list cannot derive it from its section's undeclaredDefault. Entries are returned by reference.
  */
 export function undeclaredPolicy<E>(
   declared: readonly E[] | UndeclaredPolicyList<E>,

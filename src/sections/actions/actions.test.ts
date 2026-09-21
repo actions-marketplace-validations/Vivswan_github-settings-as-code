@@ -11,10 +11,10 @@ import {
 } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { deniedDetail, REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
 import { describeProblem } from "../../problem.js";
-import { PermissionDenied } from "../contract/errors.js";
-import { sectionGrant } from "../contract/module.js";
+import { type SectionInput, sectionGrant } from "../contract/module.js";
 import { grantFor } from "../contract/permissions.js";
 import { actionsSection, endpointRouted } from "./index.js";
 // The `as ActionsConfig` casts below simulate keys GitHub adds: the shape passes unknown keys through verbatim, which the static config type cannot
@@ -72,8 +72,13 @@ function liveActions(seed: Record<string, unknown>): GitHubClient & { writes: st
 }
 
 describe("actions", () => {
-  const plan = (api: MockApi, desired: Parameters<typeof actionsSection.plan>[1]) =>
-    actionsSection.plan(planContext(actionsSection, api, REPO), desired);
+  const plan = async (api: MockApi, desired: SectionInput<"actions">) =>
+    unwrap(
+      await actionsSection.plan(
+        planContext(actionsSection, api, REPO),
+        validatedInput("actions", desired),
+      ),
+    );
   const roles = (api: MockApi) => api.calls.map((c) => `${c.method} ${c.path}`);
 
   test("routes every divergent key to its own PUT: base, workflow, then the routed table", async () => {
@@ -525,18 +530,6 @@ describe("actions", () => {
     );
   });
 
-  test("a claim-key list handed to plan() beside use_default: true is ignored, as GitHub ignores it", async () => {
-    // The shape refuses the pair in a settings file, but the library's direct plan() takes the typed object with no parse; the plan narrows on the
-    // flag, so the ignored list is never compared and never planned as drift.
-    const api = new MockApi({
-      [OIDC]: { data: { use_default: true, include_claim_keys: ["context"] } },
-    });
-    const bypassed = { use_default: true, include_claim_keys: ["repo"] } as unknown as NonNullable<
-      ActionsConfig["oidc_customization_sub"]
-    >;
-    expect((await plan(api, { oidc_customization_sub: bypassed })).ops).toEqual([]);
-  });
-
   test("a declared use_immutable_subject rides the remainder diff", async () => {
     // The flag flips the whole subject format; undeclared, the inherited org/date default stays uncompared like every other undeclared key.
     const api = new MockApi({
@@ -575,8 +568,7 @@ describe("actions", () => {
     } catch (error) {
       thrown = error;
     }
-    expect(thrown).toBeInstanceOf(PermissionDenied);
-    expect((thrown as PermissionDenied).detail).toContain("can also mean the repository is public");
+    expect(deniedDetail(thrown)).toContain("can also mean the repository is public");
   });
 
   test("a denied OIDC read renders the Actions grant, not the section's Administration", async () => {
@@ -589,12 +581,11 @@ describe("actions", () => {
     } catch (error) {
       thrown = error;
     }
-    expect(thrown).toBeInstanceOf(PermissionDenied);
-    const denied = thrown as PermissionDenied;
+    const detail = deniedDetail(thrown);
     // The advice grades by the SECTION's need on the override permission: the OIDC PUT sibling writes with the same Actions permission, so read-only
     // advice would cost a second round trip.
-    expect(denied.detail).toContain(grantFor({ repo: ["actions"] }));
-    expect(denied.detail).not.toContain('"Administration"');
+    expect(detail).toContain(grantFor({ repo: ["actions"] }));
+    expect(detail).not.toContain('"Administration"');
   });
 
   test("each fork PR policy object is planned verbatim to its own endpoint, every toggle compared", async () => {
@@ -626,7 +617,8 @@ describe("actions", () => {
       ["putForkPrApproval", approval, "applied the fork PR contributor approval policy"],
       ["putForkPrPrivate", privateRepos, "applied the private-repo fork PR workflow settings"],
     ]);
-    // Every live value is flipped, so an omitted comparison cannot pass here; the passthrough field drifts as unknown to GitHub.
+    // Every live value is flipped, so an omitted comparison cannot pass here; the passthrough field
+    // drifts as unknown to GitHub, and the note says the PUT would never converge on it.
     expect(result.ops[1]?.drift).toEqual([
       "actions.fork_pr_workflows_private_repos.run_workflows_from_fork_pull_requests: true != false",
       "actions.fork_pr_workflows_private_repos.send_write_tokens_to_workflows: false != true",
@@ -636,7 +628,69 @@ describe("actions", () => {
     ]);
     // No base-permissions read: these keys alone must not imply enabled: true.
     expect(roles(api)).toEqual([FORK_APPROVAL, FORK_PRIVATE]);
-    expect(result.notes).toEqual([]);
+    expect(result.notes).toEqual([
+      'actions.fork_pr_workflows_private_repos: declared key "extra_field" does not exist on the live fork PR workflow settings, ' +
+        "so if GitHub ignores it this PUT will re-run on every apply without converging. Fix the key name, or remove it from the settings file",
+    ]);
+  });
+
+  test("a key outside a routed mapping's shape that the GET never echoes is noted as never converging, per mapping", async () => {
+    const privateRepos = {
+      run_workflows_from_fork_pull_requests: true,
+      send_write_tokens_to_workflows: false,
+      send_secrets_and_variables: false,
+      require_approval_for_fork_pr_workflows: true,
+    };
+    const api = new MockApi({
+      [RETENTION]: { data: { days: 30, maximum_allowed_days: 400 } },
+      [OIDC]: { data: { use_default: false, include_claim_keys: ["repo"] } },
+      [FORK_APPROVAL]: { data: { approval_policy: "first_time_contributors" } },
+      [FORK_PRIVATE]: { data: privateRepos },
+    });
+    const result = await plan(api, {
+      artifact_and_log_retention: { days: 30, retention_days: 30 },
+      oidc_customization_sub: {
+        use_default: false,
+        include_claim_keys: ["repo"],
+        claim_prefix: "repo",
+      },
+      fork_pr_contributor_approval: { approval_policy: "first_time_contributors", policy: "all" },
+      fork_pr_workflows_private_repos: { ...privateRepos, send_secret_and_variables: false },
+    } as ActionsConfig);
+    const tail =
+      "so if GitHub ignores it this PUT will re-run on every apply without converging. Fix the key name, or remove it from the settings file";
+    expect(result.notes).toEqual([
+      `actions.artifact_and_log_retention: declared key "retention_days" does not exist on the live retention window, ${tail}`,
+      `actions.oidc_customization_sub: declared key "claim_prefix" does not exist on the live OIDC subject claim template, ${tail}`,
+      `actions.fork_pr_contributor_approval: declared key "policy" does not exist on the live approval policy, ${tail}`,
+      `actions.fork_pr_workflows_private_repos: declared key "send_secret_and_variables" does not exist on the live fork PR workflow settings, ${tail}`,
+    ]);
+    // The unknown key is the whole drift of each mapping: every declared value matches live.
+    expect(result.ops.map((op) => [op.role, op.drift.length])).toEqual([
+      ["putRetention", 1],
+      ["putOidcSub", 1],
+      ["putForkPrApproval", 1],
+      ["putForkPrPrivate", 1],
+    ]);
+  });
+
+  test("a documented template key the GET omits is drift the PUT resolves, never a note: one PUT, then the re-plan is empty", async () => {
+    // use_immutable_subject is optional on GitHub's GET; the three routed mapping GETs mark every
+    // field required, so only the template has such a key.
+    const api = liveActions({
+      "/repos/o/r/actions/oidc/customization/sub": { use_default: true },
+    });
+    const { first, second, changes } = await provePlanIdempotent(actionsSection, api, {
+      oidc_customization_sub: { use_default: true, use_immutable_subject: true },
+    });
+    expect(first.notes).toEqual([]);
+    expect(first.ops.map((op) => op.drift)).toEqual([
+      [
+        "actions.oidc_customization_sub.use_immutable_subject: declared true but the API response has no such field (new or write-only field?)",
+      ],
+    ]);
+    expect(changes).toEqual(["applied the OIDC subject claim template"]);
+    expect(second).toEqual({ ops: [], notes: [], drift: [] });
   });
 
   test("executing the plan converges: every routed PUT lands once, then nothing", async () => {
@@ -754,8 +808,8 @@ describe("actions", () => {
 });
 
 describe("actions snapshot", () => {
-  const snapshot = (api: GitHubClient, policy: OnMissingPermission = "fail") =>
-    actionsSection.snapshot(snapshotContext(actionsSection, api, REPO, policy));
+  const snapshot = async (api: GitHubClient, policy: OnMissingPermission = "fail") =>
+    unwrap(await actionsSection.snapshot(snapshotContext(actionsSection, api, REPO, policy)));
   /** The note a sub-read the fake has no body for produces: its 404 classifies as a denial. */
   const leftOut = (key: string, path: string, grant = sectionGrant(actionsSection)) =>
     `actions.${key}: left out of the snapshot - the token was denied GET ${path}: 404 Not Found (a 404 here can also mean the resource does not exist). To fix, ${grant}`;
@@ -983,8 +1037,7 @@ describe("actions snapshot", () => {
     } catch (error) {
       thrown = error;
     }
-    expect(thrown).toBeInstanceOf(PermissionDenied);
-    expect((thrown as PermissionDenied).detail).toContain(sectionGrant(actionsSection));
+    expect(deniedDetail(thrown)).toContain(sectionGrant(actionsSection));
   });
 
   test("under fail, a denied sub-read fails the section with that read's own grant advice, never a note", async () => {
@@ -1013,8 +1066,7 @@ describe("actions snapshot", () => {
     } catch (error) {
       thrown = error;
     }
-    expect(thrown).toBeInstanceOf(PermissionDenied);
-    expect((thrown as PermissionDenied).detail).toBe(
+    expect(deniedDetail(thrown)).toBe(
       `the token was denied GET /repos/o/r/actions/oidc/customization/sub: 404 Not Found (a 404 here can also mean the resource does not exist). To fix, ${grantFor({ repo: ["actions"] }, undefined, "write")}`,
     );
     // The control: under warn the same fixture reads back with the denial as its one note.

@@ -8,7 +8,10 @@ import {
 } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
+import type { SectionFailure } from "../contract/errors.js";
+import type { SectionInput } from "../contract/module.js";
 import { normalizeRefName, normalizeRuleset, rulesetsSection } from "./index.js";
 import type { RulesetConfig } from "./schema.js";
 
@@ -90,8 +93,13 @@ function liveRepo(
 
 describe("rulesets", () => {
   const listRoute = "GET /repos/o/r/rulesets?per_page=100&page=1";
-  const plan = (api: MockApi, desired: Parameters<typeof rulesetsSection.plan>[1]) =>
-    rulesetsSection.plan(planContext(rulesetsSection, api, REPO), desired);
+  const plan = async (api: MockApi, desired: SectionInput<"rulesets">) =>
+    unwrap(
+      await rulesetsSection.plan(
+        planContext(rulesetsSection, api, REPO),
+        validatedInput("rulesets", desired),
+      ),
+    );
   /** A mock that would accept every write the section declares. */
   const writable = (routes: ConstructorParameters<typeof MockApi>[0]) =>
     new MockApi(routes).allowMutations(
@@ -139,7 +147,7 @@ describe("rulesets", () => {
     expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([listRoute]);
   });
 
-  test("a live rule's GitHub-filled parameter defaults under a declaration that names one parameter are not drift, since the PUT leaves them as they are", async () => {
+  test("a live rule's GitHub-filled parameter defaults under a declaration without a parameters key are not drift, since the PUT leaves them as they are", async () => {
     const api = writable({
       [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
       "GET /repos/o/r/rulesets/9": {
@@ -172,17 +180,13 @@ describe("rulesets", () => {
       enforcement: "active" as const,
       conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } },
     };
-    const clean = { ops: [], notes: [], drift: [] };
-    expect(
-      await plan(api, [
-        {
-          ...declared,
-          rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }],
-        },
-      ]),
-    ).toEqual(clean);
-    // A rule declared without any parameters key is GitHub's defaults too.
-    expect(await plan(api, [{ ...declared, rules: [{ type: "pull_request" }] }])).toEqual(clean);
+    // A partial parameters mapping is refused at parse (the spec requires every pull_request parameter), so the
+    // one form that leaves GitHub's defaults in place is a rule declared without a parameters key.
+    expect(await plan(api, [{ ...declared, rules: [{ type: "pull_request" }] }])).toEqual({
+      ops: [],
+      notes: [],
+      drift: [],
+    });
   });
 
   test("a divergent existing ruleset plans a full-payload update carrying the subset drift and what the PUT would drop", async () => {
@@ -254,7 +258,7 @@ describe("rulesets", () => {
     });
     expect(execution.status).toBe("failed");
     expect(execution.landed).toBe(0);
-    expect(String((execution as { error: Error }).error.message)).toBe(
+    expect((execution as { failure: SectionFailure }).failure.message).toBe(
       "rulesets[main]: not applied - the update would remove a live value the settings file omits. " +
         'rulesets[main].bypass_actors: live has [{"actor_id":1,"actor_type":"Team","bypass_mode":"always"}] but the settings file omits it, ' +
         "so apply would REMOVE it; declare bypass_actors to keep it, or bypass_actors: [] to remove it on purpose",
@@ -311,7 +315,12 @@ describe("rulesets", () => {
       enforcemant: "evaluate",
     };
     const pass = async () =>
-      rulesetsSection.plan(planContext(rulesetsSection, api, REPO), [misspelled]);
+      unwrap(
+        await rulesetsSection.plan(
+          planContext(rulesetsSection, api, REPO),
+          validatedInput("rulesets", [misspelled]),
+        ),
+      );
     const first = await pass();
     const execution = await executePlan(first, rulesetsSection, api, REPO, {
       resolveSecret() {
@@ -521,20 +530,52 @@ describe("rulesets", () => {
     ]);
   });
 
-  test("duplicate ruleset names are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("duplicate ruleset names are a validate issue, so the document fails before any API call", () => {
+    expect(
+      rulesetsSection.validate([
         { name: "main", target: "branch", enforcement: "active" },
         { name: "main", target: "tag", enforcement: "active" },
       ]),
-    ).rejects.toThrow(/same rulesets entry/);
-    expect(api.calls).toHaveLength(0);
+    ).toEqual([
+      {
+        path: "[1].name",
+        message:
+          '"main" names the same ruleset as "main" declared earlier; keep exactly one entry per ruleset',
+      },
+    ]);
   });
 
-  test("a repeated rule type is a settings-file error before any read, and a live body repeating one fails loudly naming the ruleset", async () => {
+  test("a repeated rule type is a validate issue at the ruleset's rules, and a live body repeating one fails loudly naming the ruleset", async () => {
     // Rules pair by type, so a repeat has no pairing; the settings-file case names the fix, the live case the defect.
     const bare = { name: "main", target: "branch" as const, enforcement: "active" as const };
+    expect(
+      rulesetsSection.validate([{ ...bare, rules: [{ type: "deletion" }, { type: "deletion" }] }]),
+    ).toEqual([
+      {
+        path: "[0].rules",
+        message:
+          'the ruleset "main" lists the rule type "deletion" more than once, and GitHub keeps one rule per type - declare each type once',
+      },
+    ]);
+    expect(
+      rulesetsSection.validate([
+        {
+          ...bare,
+          rules: [
+            { type: "deletion" },
+            { type: "deletion" },
+            { type: "creation" },
+            { type: "creation" },
+          ],
+        },
+      ]),
+    ).toEqual([
+      expect.objectContaining({
+        message: expect.stringContaining(
+          'lists the rule types "deletion", "creation" more than once',
+        ),
+      }),
+    ]);
     const api = writable({
       [listRoute]: { data: [{ id: 9, name: "main", source_type: "Repository" }] },
       "GET /repos/o/r/rulesets/9": {
@@ -547,32 +588,13 @@ describe("rulesets", () => {
         },
       },
     });
-    await expect(
-      plan(api, [{ ...bare, rules: [{ type: "deletion" }, { type: "deletion" }] }]),
-    ).rejects.toThrow(
-      'rulesets: the settings file declares conflicting rulesets: the ruleset "main" lists the rule type "deletion" more than once, and GitHub keeps one rule per type - declare each type once. Fix the settings file, then re-run',
-    );
-    await expect(
-      plan(api, [
-        {
-          ...bare,
-          rules: [
-            { type: "deletion" },
-            { type: "deletion" },
-            { type: "creation" },
-            { type: "creation" },
-          ],
-        },
-      ]),
-    ).rejects.toThrow('lists the rule types "deletion", "creation" more than once');
-    expect(api.calls).toHaveLength(0);
     await expect(plan(api, [{ ...bare, rules: [{ type: "deletion" }] }])).rejects.toThrow(
       'rulesets: GitHub returned the ruleset "main" (id 9) with the rule type "deletion" more than once, so its rules cannot be paired by type; delete the repeated rule on GitHub, then re-run',
     );
     expect(api.mutations()).toEqual([]);
   });
 
-  test("wrapped _undeclared:delete plans the DELETE after the declared upserts", async () => {
+  test("wrapped _undeclared:delete plans the DELETE before the declared upserts", async () => {
     const api = writable({
       [listRoute]: {
         data: [
@@ -593,6 +615,15 @@ describe("rulesets", () => {
     expect(result).toEqual({
       ops: [
         {
+          role: "remove",
+          params: { ruleset_id: "7" },
+          describe: 'deleting undeclared ruleset "legacy"',
+          drift: [
+            'rulesets[legacy]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
+          ],
+          change: 'DELETED undeclared ruleset "legacy"',
+        },
+        {
           role: "update",
           params: { ruleset_id: "9" },
           payload: {
@@ -607,15 +638,6 @@ describe("rulesets", () => {
             "rulesets[main].rules[deletion]: missing live",
           ],
           change: 'updated ruleset "main"',
-        },
-        {
-          role: "remove",
-          params: { ruleset_id: "7" },
-          describe: 'deleting undeclared ruleset "legacy"',
-          drift: [
-            'rulesets[legacy]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
-          ],
-          change: 'DELETED undeclared ruleset "legacy"',
         },
       ],
       notes: [],
@@ -684,14 +706,14 @@ describe("rulesets", () => {
       ],
     });
     expect(changes).toEqual([
+      'DELETED undeclared ruleset "legacy"',
       'updated ruleset "main"',
       'created ruleset "tags"',
-      'DELETED undeclared ruleset "legacy"',
     ]);
     expect(api.writes).toEqual([
+      "DELETE /repos/o/r/rulesets/7",
       "PUT /repos/o/r/rulesets/9",
       "POST /repos/o/r/rulesets",
-      "DELETE /repos/o/r/rulesets/7",
     ]);
     expect(first.drift).toEqual([]);
     expect(second).toEqual({ ops: [], notes: [], drift: [] });
@@ -732,8 +754,8 @@ describe("rulesets", () => {
 });
 
 describe("rulesets snapshot", () => {
-  const snapshot = (api: GitHubClient) =>
-    rulesetsSection.snapshot(snapshotContext(rulesetsSection, api, REPO, "fail"));
+  const snapshot = async (api: GitHubClient) =>
+    unwrap(await rulesetsSection.snapshot(snapshotContext(rulesetsSection, api, REPO, "fail")));
 
   /** A live ruleset as the by-id GET returns it, server fields included. */
   const served = (
@@ -823,9 +845,11 @@ describe("rulesets snapshot", () => {
           "and an entry without it would clear it on the next update; grant Administration write to read it back",
       ],
     });
-    const planned = await rulesetsSection.plan(
-      planContext(rulesetsSection, api, REPO),
-      read.value as NonNullable<typeof read.value>,
+    const planned = unwrap(
+      await rulesetsSection.plan(
+        planContext(rulesetsSection, api, REPO),
+        validatedInput("rulesets", read.value),
+      ),
     );
     expect({ ops: planned.ops, drift: planned.drift }).toEqual({ ops: [], drift: [] });
     expect(api.writes).toEqual([]);

@@ -6,6 +6,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { ok } from "neverthrow";
 import type { GitHubClient } from "../../src/github/api.js";
 import type { SectionKey } from "../../src/schema.js";
 import type { SectionModule } from "../../src/sections/contract/module.js";
@@ -14,8 +15,9 @@ import { labelsSection } from "../../src/sections/labels/index.js";
 import { SECTIONS } from "../../src/sections/registry.js";
 import { completeRule, type LiveState, ruleWireNode } from "../e2e/mock/state.js";
 import { type FragmentFake, registryFake } from "./fragment-fake.js";
-import { REPO } from "./section-run.js";
+import { failureOf, REPO, unwrap } from "./section-run.js";
 import { STAMPS } from "./snapshot-rows/families.js";
+import { validatedInput } from "./validated-input.js";
 
 /** One live list seeded with a pair under one identity. */
 interface Seed {
@@ -532,9 +534,11 @@ async function proveNoLiveList(section: SectionModule, declared: unknown): Promi
       return fake.tryGraphql(op, variables, slug, mark);
     },
   };
-  await section.plan(planContext(section, api, REPO), declared as never);
+  unwrap(
+    await section.plan(planContext(section, api, REPO), validatedInput(section.key, declared)),
+  );
   if (section.snapshot !== undefined) {
-    await section.snapshot(snapshotContext(section, api, REPO, "fail"));
+    unwrap(await section.snapshot(snapshotContext(section, api, REPO, "fail")));
   }
   expect(reads, `${section.key} claims no live list`).toEqual([]);
 }
@@ -584,7 +588,7 @@ describe("duplicate live identities", () => {
     const [seed] = SEEDS.labels as readonly Seed[];
     const unguarded = {
       ...labelsSection,
-      snapshot: async () => ({ value: undefined, notes: [] }),
+      snapshot: async () => ok({ value: undefined, notes: [] }),
     } as SectionModule;
     await expect(proveRefused(unguarded, seed as Seed)).rejects.toThrow();
     const padded = {
@@ -602,17 +606,23 @@ async function proveRefused(section: SectionModule, seed: Seed): Promise<void> {
   if (seed.declared !== undefined) {
     const fake = registryFake(seed.live);
     const api = clientFor(fake, seed);
-    await expect(
-      section.plan(planContext(section, api, REPO), seed.declared as never),
-    ).rejects.toThrow(new Error(seed.refusal));
+    expect(
+      failureOf(
+        await section.plan(
+          planContext(section, api, REPO),
+          validatedInput(section.key, seed.declared),
+        ),
+      ),
+    ).toEqual({ kind: "live-duplicate", message: seed.refusal });
     expect(fake.writes).toEqual([]);
   }
   if (section.snapshot !== undefined) {
     const fake = registryFake(seed.live);
     const api = clientFor(fake, seed);
-    await expect(section.snapshot(snapshotContext(section, api, REPO, "fail"))).rejects.toThrow(
-      new Error(seed.refusal),
-    );
+    expect(failureOf(await section.snapshot(snapshotContext(section, api, REPO, "fail")))).toEqual({
+      kind: "live-duplicate",
+      message: seed.refusal,
+    });
     expect(fake.writes).toEqual([]);
   }
 }

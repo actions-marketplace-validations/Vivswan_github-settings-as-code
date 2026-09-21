@@ -63,17 +63,17 @@ The examples continue from one another and form one program (the docs tests comp
 
 | Name | Kind | Says |
 |---|---|---|
-| `validateSettings` | function | Validate a parsed document into the branded `ValidatedSettings` every other verb takes; a top-level `null` is a fold marker, not a document value (except on `pages` and `interaction_limits`, whose null is the section's value), so `validateSettings({ labels: null })` refuses where `mergeSettings([{ name, doc: { labels: null } }])` accepts and drops the section |
-| `ValidateOptions` | type | `source`, `sections`, `io` |
+| `validateSettings` | function | Validate a parsed document into the branded `ValidatedSettings` every other verb takes; a `null` is a declared value, refused where the key has no empty state |
+| `ValidateOptions` | type | `source`, `sections`, `io`, `undeclared` (the action's input of that name: the fallback policy below a list's wrapper and the file's top-level `_undeclared`), `secretSource` (who authored the document: `operator`, the default, honors `$NAME` secret references; `target` refuses them) |
 | `ValidateReport` | type | `settings` and `log` |
-| `ValidatedSettings` | type | The document as zod parsed it, branded by validation; `validateSettings`, `mergeSettings`, and a snapshot that did not fail hand one out |
+| `ValidatedSettings` | type | The document as zod parsed it, branded by validation, every knobbed list in `{_undeclared, entries}` form with its policy resolved; `validateSettings`, `mergeSettings`, and a snapshot that did not fail hand one out |
 | `mergeSettings` | function | Fold an ordered list of `Layer`s into one validated document, as `mode: render` does: each layer validated alone, folded, validated again; its `yaml` is byte for byte the file `mode: render` writes, the fold in the canonical order every rendered document shares (sections in execution order, keys as the schema declares them, the entries of every list section by identity; `branches`, `bypass_actors`, `reviewers`, and scalar lists as written), so no layer's key order reaches the file |
-| `MergeOptions` | type | `source`, `layering` (`"deep"` unless set), `io` |
-| `MergeReport` | type | `settings`, `notices` (one per null that deleted a lower declaration; a top-level null that met nothing drops without one, or stays where null is the section's value: `pages`, `interaction_limits`), `yaml` (the file text `rendered-file` gets), `log` |
+| `MergeOptions` | type | `source`, `layering` (`"deep"` unless set), `undeclared` (unset unless given), `io` |
+| `MergeReport` | type | `settings`, `notices` (one per `_remove: true` entry that dropped a lower entry), `yaml` (the file text `mode: render` writes, byte for byte), and `log` (the lines the fold printed) |
 | `Layer` | type | One layer: its `name` (a path, usually) and its parsed `doc` |
 | `Layering` | type | `"replace"`, `"shallow"`, or `"deep"`: how every list section's entries fold across layers, by the section's key |
-| `OptOutNotice` | type | A `null` that deleted what a lower layer declared: the layer and the path |
-| `describeOptOut` | function | One notice as the line the action prints |
+| `RemovalNotice` | type | A `_remove: true` entry that dropped what a lower layer declared: the layer and the entry's path |
+| `describeRemoval` | function | One notice as the line the action prints |
 | `readLayerFiles` | function | Read paths into `Layer`s in order; the first unreadable file is the problem |
 | `readSettingsFile` | function | Read and parse one YAML file, given its role (`settings-file`, `defaults-file`, `layer`, `central-file`), so the problem's advice fits |
 | `SettingsFileRole` | type | The four roles |
@@ -126,7 +126,8 @@ console.log(parsed.success, SECTION_KEYS.length, schema.$schema);
 |---|---|---|
 | `GitHubApi` | class | The REST and GraphQL client the action uses: retries, throttling, the pinned API version, trace redaction |
 | `GitHubApiOptions` | type | Its constructor's options: `token` required; `io` (the trace sink), `baseUrl`, `apiVersion`, `retryBaseMs` (real milliseconds per plugin second), `scheduler` (the throttling limiter), `userAgent` optional |
-| `GitHubClient` | type | The port every verb reads and writes through, and the interface a test double implements |
+| `GitHubClient` | type | The port every verb reads and writes through, and the interface a test double implements; it answers, never rejects |
+| `ClientAnswer` | type | What one request ends in: `data`, an `error` (GitHub's answer, an `ApiError`), or `failed` (the whole line for a request with no HTTP answer: not sent, the transport failed, a GraphQL body off the wire contract) |
 | `DEFAULT_API_VERSION` | const | The `X-GitHub-Api-Version` the action pins |
 | `ApiError` | type | A failed request as the port returns it: `status`, `message`, `body` |
 | `GraphqlOp` | type | A GraphQL operation as the port takes it |
@@ -147,7 +148,7 @@ const client = new GitHubApi({ token: process.env.GITHUB_TOKEN ?? "" });
 | Name | Kind | Says |
 |---|---|---|
 | `checkRepository` | function | Plan and diff every active section without writing |
-| `CheckOptions` | type | `sections`, `onMissingPermission`, `io`, and the secret knobs (`secretSource`, `secretEnv`) |
+| `CheckOptions` | type | `sections`, `onMissingPermission`, `io`, and `secretEnv`, the environment `applyRepository` resolves the secret references from; check mode reads none |
 | `CheckReport` | type | `repo`, `result`, `outcomes` (one `SectionOutcome` per section), `preflightDenied`, `log` |
 | `applyRepository` | function | Execute the plan: the repository converges on the document |
 | `ApplyOptions` | type | The same knobs as `CheckOptions` |
@@ -206,7 +207,7 @@ console.log(snapshot.result, snapshot.yaml ?? "(failed: no document)");
 | `MultiConfig` | type | Its config |
 | `TargetOutcome` | type | One fleet target's result, with its `source` |
 | `runRender` | function | Fold settings files into `rendered-file`; no token, no API call |
-| `RenderConfig` | type | Its config: `settingsFiles`, `renderedFile`, `layering` |
+| `RenderConfig` | type | Its config: `settingsFiles`, `renderedFile`, `layering`, `undeclared` |
 | `FinishedRender` | type | Its result: the layers and the written file |
 | `runSnapshot` | function | The live settings of one repository to a file, or of every fleet target to a directory |
 | `SnapshotConfig` | type | Its config, in the `file` or the `dir` form |
@@ -267,7 +268,7 @@ console.log(found.value.repos.map((r) => r.slug));
 | `openReportChannel` | function | The issue or artifact channel the action delivers through |
 | `PrivateReportChannel` | type | `none`, `issue`, `issue-on-failure`, or `artifact` |
 | `deliverArtifactReport` | function | The artifact half, behind an uploader you supply; never throws |
-| `ArtifactUploader` | type | `upload(name, file)`: the port the Actions runner implements |
+| `ArtifactUploader` | type | `upload(name, file)`: the port the Actions runner implements; it resolves to `{ uploaded: true }` or `{ failed }` with the reason |
 
 ```ts
 import { encryptReport, parseRecipient } from "@vivswan/github-settings-as-code";
@@ -284,7 +285,10 @@ const sealed = await encryptReport(recipient, "# report");
 |---|---|---|
 | `SECTIONS` | const | Every section module in execution order |
 | `sectionModule` | function | One module by key |
-| `SectionModule` | type | A module: its `key`, `endpoints`, `permission`, `plan()`, and `snapshot()` when it has one |
+| `SectionModule` | type | A module: its `key`, `endpoints`, `permission`, `plan()`, `snapshot()` when it has one, and `validate()` on a list section (its file-only checks, run by document validation) |
+| `ValidatedInput` | type | What `plan()` takes: one section's value read off a `ValidatedSettings` document (`settings.labels`); only validation mints it, so a hand-built entry list does not compile |
+| `ValidatedBrand` | type | The mark a `ValidatedInput` carries: a type-level property holding the section key the value was validated as, with no runtime field; a declaration spells a planner's input as the section's value `& ValidatedBrand<"labels">` |
+| `SectionInput` | type | The section's value without the brand, as the schema types it; what a list module's `validate()` hook takes, since it runs inside validation |
 | `sectionGrant` | function | The PAT grant a section needs, as prose |
 | `allEndpoints` | function | Every declared REST route, tagged with its owner |
 | `allGraphqlOps` | function | Every declared GraphQL operation, tagged with its owner |
@@ -299,8 +303,9 @@ const sealed = await encryptReport(recipient, "# report");
 | `snapshotContext` | function | The context `snapshot()` reads through: the plan context plus the denial policy |
 | `SnapshotContext` | type | That context |
 | `DenialPolicy` | type | The policy as `snapshot()` sees it; only `snapshotContext` mints one |
-| `SectionPlan` | type | What `plan()` resolves to: the operations, notes, and drift |
-| `SectionSnapshot` | type | What `snapshot()` resolves to: the section's value and notes |
+| `SectionPlan` | type | What `plan()` resolves to on `Ok`: the operations, notes, and drift |
+| `SectionSnapshot` | type | What `snapshot()` resolves to on `Ok`: the section's value and notes |
+| `SectionFailure` | type | What `plan()` or `snapshot()` resolves to on `Err`: the whole line as `message`, and a `kind` for policy (`"permission-denied"` also carries the section, the detail, and the HTTP status) |
 
 ```ts
 import { planContext, sectionGrant, sectionModule, snapshotContext } from "@vivswan/github-settings-as-code";
@@ -314,16 +319,31 @@ A module's `plan()` and `snapshot()` are callable directly, each over a context 
 - `planContext(module, client, repo)` for `plan()`.
 - `snapshotContext(module, client, repo, onMissingPermission)` for `snapshot()`; the fourth argument is the `OnMissingPermission`, `"fail"` or `"warn"`. The context carries it as a `DenialPolicy` only this factory mints, so a literal object cannot stand in for one.
 - A context belongs to the module it was built from: `labels.plan(planContext(branches, ...))` does not compile, and a module handed another section's context at runtime rejects with an error naming both sections before it reads anything.
+- `plan()` takes the section's value off a validated document (`settings.labels`, a `ValidatedInput<"labels">`), never a list you built by hand. Only `validateSettings()`, `mergeSettings()`, and a `snapshotRepository()` that did not fail mint that type.
+- `plan()` and `snapshot()` resolve to a neverthrow `Result`: the plan or snapshot on `Ok`, a `SectionFailure` on `Err` (a denied read, a live state the section cannot reconcile, a duplicated live pair). Neither rejects for anything a settings file or the network can cause; a rejection is the wrong-context refusal above, a `GitHubClient` that throws instead of answering (breaking its contract), or a `BUG:` invariant.
+- A module's own `snapshot()` value is unbranded and goes through `validateSettings()` first. So the file-only checks (two entries naming one label) have run before any planner reads.
+- The brand names the section: on a module named by its key, a validated `branches` list is not a `labels` input. The erased `SectionModule` view is one key on both sides, as it is for contexts, so only the key-named module carries that check.
+- A `null` section value (`pages`, `interaction_limits`) carries no brand, since it holds nothing to check.
 
 Prefer `checkRepository()` and `snapshotRepository()` for the whole document: one run over every selected section, permission failures classified per section, and one report or rendered file at the end.
 
 ```ts
-import type { SectionPlan, SectionSnapshot } from "@vivswan/github-settings-as-code";
+import type { SectionFailure, SectionPlan, SectionSnapshot, ValidatedInput } from "@vivswan/github-settings-as-code";
 
-const labelsPlan: SectionPlan = await labels.plan(planContext(labels, client, repo.value), settings.labels ?? []);
-const labelsSnapshot: SectionSnapshot<"labels"> | undefined = await labels.snapshot?.(
-  snapshotContext(labels, client, repo.value, "warn"),
-);
+const declaredLabels: ValidatedInput<"labels"> | undefined = settings.labels;
+if (declaredLabels === undefined) throw new Error("the document declares no labels");
+const planned = await labels.plan(planContext(labels, client, repo.value), declaredLabels);
+if (planned.isErr()) {
+  const failure: SectionFailure = planned.error;
+  throw new Error(`${failure.kind}: ${failure.message}`);
+}
+const labelsPlan: SectionPlan = planned.value;
+const read = await labels.snapshot?.(snapshotContext(labels, client, repo.value, "warn"));
+let labelsSnapshot: SectionSnapshot<"labels"> | undefined;
+if (read !== undefined) {
+  if (read.isErr()) throw new Error(read.error.message);
+  labelsSnapshot = read.value;
+}
 console.log(labelsPlan.ops.length, labelsSnapshot?.value, labelsSnapshot?.notes);
 ```
 

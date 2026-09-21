@@ -43,7 +43,7 @@ Code is the source of truth: this section holds only the rules and the decisions
 - The import layering of `src/` is declared in `architecture.yml`; a new cross-layer import is a deliberate edit to that file.
 - A type a section module exposes is exported from its home module, or the bundled declarations cannot reach it and the package-smoke job fails.
 - New sections and endpoints ship with e2e scenarios, and `bun run test:e2e` runs green before they land.
-- Errors are values: `throw` only for `BUG:` invariants (programming errors no user can cause), a bare rethrow in its `catch`, and, until the request layer converts, in files `architecture.yml` names. The arch lint enforces it; its ratchet only shrinks.
+- Errors are values: `throw` only for `BUG:` invariants (programming errors no user can cause), a bare rethrow in its `catch`, and where a third party's contract demands it (`architecture.yml` names the file and the reason). The arch lint enforces it; its ratchet only shrinks.
 - No backward-compatibility shims: a change that breaks an input, key, format, or behavior ships the break behind a major with a loud error naming the fix; a one-shot migration only when many files must move at once. A shim that stays anyway carries a `COMPAT(vN)` marker naming the major that deletes it.
 
 ### Decisions a reader would otherwise reverse
@@ -51,6 +51,7 @@ Code is the source of truth: this section holds only the rules and the decisions
 - A flat `src/sections/<key>/` directory means repository scope, permanently; org/user scopes arrive as sibling scope directories with their own document, keys, and registry (the ":" reservation in `src/sections/registry.ts`).
 - The section directory is the unit of work: its `<key>.docs.yml` feeds the generated docs, and the compiler flags every forgotten registration step.
 - `src/upstream-gaps/` holds one file per GitHub feature an upstream artifact lags; `gap.ts` states how each kind graduates.
+- The layered fold is a CSS-like cascade in which `null` is a value: GitHub's EMPTY or OFF state, not CSS `unset`. docs/operate/layering.md owns the rules, including the two CSS has no analogue for (an undeclared key keeps GitHub's current value; `_remove: true` drops a keyed entry).
 
 ### Releases
 

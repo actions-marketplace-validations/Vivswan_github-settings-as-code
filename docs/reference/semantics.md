@@ -55,6 +55,16 @@ Three sections illustrate the range of default policies:
 
 Every section's own default is stated in the [Sections table](sections.md)'s Undeclared default column, and the [undeclared policy](undeclared-policy.md) page covers the knob that overrides it.
 
+Within the six sections built on the list-section factory (`labels`, `milestones`, `autolinks`, `deploy_keys`, `webhooks`, `rulesets`), apply deletes the undeclared resources first and then walks the declared entries in file order (a changed resource GitHub cannot edit is deleted and recreated in place), so a delete has freed a name or prefix before the create that needs it is sent.
+
+## Null is the empty state
+
+A `null` in the settings file is a declared value: the EMPTY or OFF state on GitHub (`pages: null` turns Pages off, `cname: null` removes the custom domain, `protection: null` strips a branch's protection). A key with no empty state refuses it at validation, naming the values that exist: `repository.enable_git_lfs has no empty state; write true or false`.
+
+A whole section takes `null` only where `null` is its off state (`pages`, `interaction_limits`).
+
+A file written by hand and a file `mode: render` folded mean the same thing by it. The [layering guide](../operate/layering.md) covers how a higher layer's `null` wins and how `_remove` drops a keyed entry instead.
+
 ## Errors and retries
 
 Permission failures (403, or 404 on admin endpoints with a fine-grained token) are the only softenable errors; everything else always fails with the API message verbatim. The [permissions page](permissions.md) covers the `on-missing-permission` and `required-sections` inputs that do the softening.
@@ -63,8 +73,15 @@ Rate limits (429 and secondary limits) and transient 5xx or network failures are
 
 ## The preflight barrier
 
-Under `on-missing-permission: fail`, every declared section is probed read-only before ANY write. If a section is inaccessible, nothing is applied at all (per repository in multi-repo mode; earlier targets in the same run are already done).
+Before the barrier, and in every mode, document validation runs every check that reads only the settings file: the section shapes, unknown keys, two entries naming one resource, a malformed deploy key. A settings-file mistake fails the run before any section runs, with the collected issues listed by path, so nothing is written.
+
+A section's shape reports every mistake it finds in that one run, like a compiler: its cross-field rules (a contradictory pair, a key that belongs elsewhere) are judged even when a sibling value already failed its type.
+A rule meeting such a raw sibling reports what it can and passes over what it cannot read; the sibling's own type issue is the report there.
+
+The shape's own issues are capped at 5 per section; the line after them counts the rest ("...and N more issues in this section"). The checks that need the parsed section (two entries naming one resource) wait for its shape to pass and report every finding; only the unrecognized-key check of a closed section keeps a cap of its own, 5 entries.
+
+Under `on-missing-permission: fail`, every active section (each declared section the `sections` input selects; all of them when that input is unset) is then probed read-only before ANY write; if a section is inaccessible, nothing is applied at all (per repository in multi-repo mode; earlier targets in the same run are already done).
 
 The API has no transactions. A read-but-not-write token can still fail mid-apply, and a section whose reads need no grant at all (`custom_properties` - its values read is Metadata-gated) surfaces a missing write grant only at its first write. Re-running after fixing it converges because applies are idempotent.
 
-See [COVERAGE.md](https://github.com/Vivswan/github-settings-as-code/blob/main/COVERAGE.md) for the full inventory: everything supported, every repo-scoped gap, and the user-scoped surface that is out of scope by design.
+See the [coverage page](coverage.md) for the full inventory: everything supported, every repo-scoped gap, and the user-scoped surface that is out of scope by design.

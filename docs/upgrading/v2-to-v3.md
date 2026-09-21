@@ -4,7 +4,7 @@ order: 20
 
 # Upgrading from v2 to v3
 
-Fifty-five breaks. Seven are for library consumers (sections 9, 23, 24, 27, 34, 35, and 54), one is for anyone pinning a sha (section 21), and eighteen are parse-time refusals (sections 36 to 52 and 55): a declaration GitHub would reject, or that could never converge, now fails before any request. Section 53 is silent: YAML merge keys resolve.
+Fifty-eight breaks. Nine are for library consumers (sections 9, 23, 24, 27, 34, 35, 54, 56, and 58), one is for anyone pinning a sha (section 21), and eighteen are parse-time refusals (sections 36 to 52 and 55): a declaration GitHub would reject, or that could never converge, now fails before any request. Section 53 is silent: YAML merge keys resolve. Section 57 respells one validation message.
 
 The silent ones include the fallback, the renamed `GSAC_RETRY_BASE_MS`, the rendered file (it reorders once), and the snapshot file (it reorders once and no longer dates itself). Run `mode: check` before the first v3 apply and diff the first v3 rendered file.
 
@@ -27,7 +27,7 @@ The changelog entry for 3.0.0 will carry the release-please footers in the [CHAN
 | One wording per concept in drift lines and notes | Per-section spellings of "cannot verify", "left out", and field drift; quoted webhook labels | One template each | Only a grep over the output notices; [section 13](#13-one-wording-per-concept-in-drift-lines-and-notes) |
 | Webhooks manage web hooks only | A service hook was matched and deleted like any other | A service hook or url-less hook is outside the section | It is left alone and noted by snapshot; [section 14](#14-webhooks-manage-web-hooks-only) |
 | A ruleset without `source_type` is repository-owned | Kept with a note under `_undeclared: delete` | Deleted like any other undeclared repository ruleset | No error: under `_undeclared: delete` the ruleset is deleted, where v2 kept it with a note; [section 15](#15-a-ruleset-without-source_type-is-repository-owned) |
-| Underscore keys are directives, never notes | An unknown `_note: ...` at the top level was dropped silently | Three directives exist, each at its own place: `_layering` at the top level or on a list section's wrapper, `_undeclared` at the top level or on a knobbed wrapper, `_remove: true` on a keyed list entry only; any other underscore key, or a directive out of its place, fails validation | Validation fails before any section runs, naming the directives; [section 16](#16-underscore-keys-are-directives-never-notes) |
+| Underscore keys are directives, never notes | An unknown `_note: ...` at the top level was dropped silently | Three directives exist, each at its own place: `_layering` at the top level or on a list section's wrapper, `_undeclared` at the top level or on a knobbed wrapper, `_remove: true` on a keyed list entry only, in a higher layer of a fold (a single document refuses it); any other underscore key at the top level or on a wrapper, or a directive out of its place, fails validation | Validation fails before any section runs, naming the directives; [section 16](#16-underscore-keys-are-directives-never-notes) |
 | `teams` takes the `_undeclared` knob | A plain array; an undeclared team was never listed or touched | `teams: {_undeclared: keep, entries: [...]}` accepted, default `keep`; `delete` revokes undeclared direct grants | No error. Every run now lists the repository's teams and notes each undeclared direct grant (access granted at the organization level is noted only under `delete`); snapshots write the wrapper form; [section 17](#17-teams-takes-the-_undeclared-knob) |
 | `GSAC_RETRY_BASE_MS` | `RETRY_BASE_MS`, undocumented | `GSAC_RETRY_BASE_MS`, in the inputs reference | No error: an unknown environment variable is ignored, so a harness setting the old name waits real seconds; [section 18](#18-gsac_retry_base_ms) |
 | The sealing key is read at apply time | Check mode read `GET .../secrets/public-key` and failed on a malformed key | The first sealed PUT reads it at apply | Check mode issues one request fewer per secret family; a malformed key fails at apply; [section 19](#19-the-sealing-key-is-read-at-apply-time) |
@@ -61,12 +61,15 @@ The changelog entry for 3.0.0 will carry the release-please footers in the [CHAN
 | Webhooks: events, content type, `insecure_ssl`, and the url | `events: [pushes]`, `content_type: JSON`, `insecure_ssl: 2`, or `url: hooks.example.com/ci` 422ed at apply after other sections wrote | Events from GitHub's repository list (or `*`); `json` or `form`; `"0"`, `"1"`, `0`, or `1`; an absolute URL | Validation fails naming the entry and the accepted values; [section 47](#47-webhooks-events-content-type-insecure_ssl-and-the-url) |
 | Secret scanning patterns must compile | `pattern: "([a-z"` parsed; check saw a missing pattern; apply hit the bulk-create 422 | `pattern`, `start_delimiter`, `end_delimiter`, `must_match`, and `must_not_match` pass a syntax check that first translates the PCRE-only forms Hyperscan accepts | Validation fails naming the field and the reason; a snapshot leaves out a live pattern the check cannot verify, with a note; [section 48](#48-secret-scanning-patterns-must-compile) |
 | Rulesets: enforcement, bypass actors, ref-name tokens, rule parameters | `enforcement: enabled`, `include: ["~all"]`, a Team actor without `actor_id`, or `grouping_strategy: allgreen` 422ed after earlier sections wrote | `enforcement` is `active`, `evaluate`, or `disabled`; bypass actors are typed from the spec; a `~` value is `~ALL` or `~DEFAULT_BRANCH`; the 23 known rule types carry typed parameters, and an unknown type passes through | Validation fails naming the entry, key, and accepted values; [section 49](#49-rulesets-enforcement-actors-tokens-and-parameters) |
-| Milestones: `due_on` is a day | `due_on: 2026-01-15` compared unequal to the `08:00:00Z` GitHub echoes and drifted forever; `T00:00:00Z` stored the previous day; `null` and offset timestamps passed through | A calendar day `YYYY-MM-DD`, or a UTC timestamp read for its day; written as noon UTC; `null` and offsets are refused | Validation fails naming the day form; a snapshot writes `YYYY-MM-DDT12:00:00Z`; [section 50](#50-milestones-due_on-is-a-day) |
+| Milestones: `due_on` is a day | `due_on: 2026-01-15` compared unequal to the `08:00:00Z` GitHub echoes and drifted forever; `T00:00:00Z` stored the previous day; `null` and offset timestamps passed through | A calendar day `YYYY-MM-DD`, or a UTC timestamp read for its day; written as noon UTC; `null` and offsets are refused | Validation fails naming the day form; a snapshot writes the day; [section 50](#50-milestones-due_on-is-a-day) |
 | Environments: declared-off protection converges, and GitHub's refusals move to parse | `wait_timer: 0`, `prevent_self_review: false`, `reviewers: []` on an unprotected environment drifted forever; a two-false `deployment_branch_policy` 422ed | The disabled values are the baseline, so they converge; refused at parse: `wait_timer` outside 0 to 43200 or fractional, more than 6 reviewers, both policy flags true or both false, `prevent_self_review: true` without reviewers, a policy `type` outside `branch` and `tag` | Validation fails naming the fix (`deployment_branch_policy: null` spells "any branch"); [section 51](#51-environments-disabled-defaults-and-the-refusals) |
 | Autolinks: charset, the `<num>` placeholder, overlapping prefixes, the live flag | An empty or bad-charset `key_prefix` or a template without `<num>` 422ed; a recreate sent `is_alphanumeric: true` over a live `false` | Refused at parse: an empty `key_prefix`, a character outside GitHub's set, a template without `<num>`, two prefixes where one begins the other; a recreate keeps the live flag | Validation fails naming the key and an example value; [section 52](#52-autolinks-charset-placeholder-and-overlapping-prefixes) |
 | YAML merge keys resolve | `<<: *base` survived as a literal `<<` field and rode into the create payload | `<<` merges the aliased mapping, as the Probot Settings app's parser did | No error: an entry that carried a literal `<<` key now gets the merged fields instead; [section 53](#53-yaml-merge-keys-resolve) |
-| Library: a parsed ruleset entry carries `target` and `enforcement` | `SettingsFile` left both keys optional on a ruleset entry, so `{ rulesets: [{ name: "main" }] }` typed as one | Both keys are required on the parsed entry, the one `SettingsFile` and `sectionModule("rulesets").plan` take; the settings file still omits either and the parse fills `branch` and `active` | The literal fails to compile (`TS2322`, naming the missing key); parse the document through `validateSettings`, or declare both keys; [section 54](#54-library-a-parsed-ruleset-entry-carries-target-and-enforcement) |
+| Library: a parsed ruleset entry carries `target` and `enforcement` | `SettingsFile` left both keys optional on a ruleset entry, so `{ rulesets: [{ name: "main" }] }` typed as one | Both keys are required on the parsed entry, the one `SettingsFile` and `sectionModule("rulesets").plan` take; the settings file still omits either and the parse fills `branch` and `active` | The literal fails to compile (`TS2739`, naming the missing keys); parse the document through `validateSettings`, or declare both keys; [section 54](#54-library-a-parsed-ruleset-entry-carries-target-and-enforcement) |
 | Branches: a `restrictions` block carries `users` and `teams` | `restrictions: {}`, or a block naming only `apps` or only `users`, parsed clean and the protection PUT 422ed at apply | Both lists are required on the block (`[]` when none) and `apps` stays optional; `restrictions: null` lifts the push restriction; `dismissal_restrictions: {}` and `bypass_pull_request_allowances: {}` stay legal | Validation fails naming the two lists and the `null` form, with zero requests; [section 55](#55-branches-a-restrictions-block-carries-users-and-teams) |
+| Library: `plan()` and `snapshot()` resolve to a `Result` | `await labels.plan(ctx, declared)` resolved to the plan and rejected on a denied read, a duplicated live pair, or a live body the section could not reconcile | Both resolve to a neverthrow `Result`: the plan or snapshot on `Ok`, a `SectionFailure` on `Err`; a rejection is left for the wrong-context refusal, a client that throws instead of answering, and `BUG:` invariants | Reading `.ops` or `.value` off the awaited value fails to compile (`TS2339`); `rejects.toThrow` assertions on a section call pass a resolved promise through; [section 56](#56-library-plan-and-snapshot-resolve-to-a-result) |
+| A closed section's unrecognized key names the entry by index | `collaborators[octocat]: declares "permision", which this section does not recognize ...` | `collaborators[0] (username "octocat"): declares "permision", which this section does not recognize ...`; under a wrapper, `collaborators.entries[0] (username "octocat")` | Anything that greps the bracket for the entry's identity needs the new spelling; [section 57](#57-a-closed-sections-unrecognized-key-names-the-entry-by-index) |
+| Library: `GitHubClient` and `ArtifactUploader` answer, never reject | `tryRequest()` and `tryGraphql()` rejected for a request with no HTTP answer (not sent, the transport failed, a GraphQL body off the wire contract); `upload()` rejected to report a failed upload | Both port methods resolve to a `ClientAnswer` whose third arm is `{ failed }`, the whole line; `upload()` resolves to `{ uploaded: true }` or `{ failed }`. A test double that still throws is read as a broken contract: the failure is reported, never classified | A double returning `void` from `upload()`, or a caller reading `.data` off a `ClientAnswer` without narrowing `failed`, fails to compile; [section 58](#58-library-githubclient-and-artifactuploader-answer-never-reject) |
 
 ## 1. The defaults-file fallback
 
@@ -192,8 +195,8 @@ Every rename, old to new. An old name fails to compile, naming the missing expor
 | `GithubApi` | `GitHubApi` |
 | `GithubClient` | `GitHubClient` |
 | `MissingPermissionPolicy` | `OnMissingPermission` (the input's name) |
-| `checkRepository(client, { repo, settings, onMissingPermission, sections }, io?)` | `checkRepository(client, repo, settings, { onMissingPermission?, sections?, io?, secretSource?, secretEnv? })` |
-| `applyRepository(client, { repo, settings, onMissingPermission, sections }, io?)` | `applyRepository(client, repo, settings, { onMissingPermission?, sections?, io?, secretSource?, secretEnv? })` |
+| `checkRepository(client, { repo, settings, onMissingPermission, sections }, io?)` | `checkRepository(client, repo, settings, { onMissingPermission?, sections?, io?, secretEnv? })`; the document's `secretSource` is `validateSettings`'s knob |
+| `applyRepository(client, { repo, settings, onMissingPermission, sections }, io?)` | `applyRepository(client, repo, settings, { onMissingPermission?, sections?, io?, secretEnv? })` |
 | `RepoRunReport` | `CheckReport`, `ApplyReport` |
 | `RepoRunOptions` | `CheckOptions`, `ApplyOptions` (the knobs alone); the engine's `RepoRunOptions` is in the internal entry |
 | `snapshotRepository(client, repo, { sections?, onMissingPermission?, io? })` | Unchanged call; its options type is `SnapshotOptions` |
@@ -296,9 +299,9 @@ v2 refused to delete an undeclared ruleset whose list entry lacked `source_type`
 
 v2 dropped any unknown top-level key starting with `_` as a private note, while rejecting the same key inside a section's `{entries}` wrapper.
 
-v3 has one rule everywhere: the underscore belongs to the three directives, and any other underscore key fails validation before any section runs. Each directive has its place: `_layering` at the top level or on a list section's wrapper, `_undeclared` at the top level or on a knobbed wrapper ([section 32](#32-file-wide-_undeclared-and-the-undeclared-input)), and `_remove: true` on a keyed list entry ([section 31](#31-null-wins-and-means-empty-and-_remove-drops-an-entry)).
+v3 has one rule at the top level and on the wrappers: the underscore belongs to the three directives, and any other underscore key there fails validation before any section runs. Each directive has its place: `_layering` at the top level or on a list section's wrapper, `_undeclared` at the top level or on a knobbed wrapper ([section 32](#32-file-wide-_undeclared-and-the-undeclared-input)), and `_remove: true` on a keyed list entry ([section 31](#31-null-wins-and-means-empty-and-_remove-drops-an-entry)).
 
-A directive out of its place is refused like any unknown key: `{name: bug, _remove: true}` drops an entry, while a top-level `_remove: true` or `labels: {_remove: true, entries: []}` fails validation.
+A directive out of its place is refused like any unknown key: `{name: bug, _remove: true}` drops an entry, while a top-level `_remove: true` or `labels: {_remove: true, entries: []}` fails validation. A removal also needs a fold to act in: in a single document (a one-file apply or check) it fails validation naming its site, since there is no lower layer to remove from.
 
 ```yaml settings
 # owner: platform-team, see runbook RB-112
@@ -315,7 +318,7 @@ settings.yml has malformed section entries: unknown underscore key: _owner. The 
 
 A `sections` allowlist does not soften it (an unknown plain section outside the allowlist still only warns). The reason is the loud-failure promise: a misspelled `_layerin: replace` dropped as a note would merge a layer its author meant to replace.
 
-Move each note into a YAML comment; the [layering guide](../operate/layering.md#three-knobs) states the rule beside the directives.
+Move each note into a YAML comment; the [layering guide](../operate/layering.md#four-knobs) states the rule beside the directives.
 
 ## 17. teams takes the _undeclared knob
 
@@ -517,9 +520,9 @@ layering: deep (default)  labels:                      # union by name; the same
 
 Every list section folds this way, by the key its planner matches on: labels, collaborators, teams, and environments case-folded; the secret and variable families uppercased; workflow paths as GitHub lists them; the rest verbatim (a ruleset's `rules` by `type` inside a deep pair). The pre-release builds unioned labels and rulesets only and replaced the other seventeen silently, the three plain lists of [section 30](#30-environments-branches-and-workflows-layer-by-key) among them.
 
-The value `merge` is gone. `labels: {_layering: merge, entries: [...]}` fails with `labels._layering must be one of "replace", "shallow", "deep"; got a string that is none of them`, and the `layering` input refuses it the same way.
+The value `merge` is gone. `labels: {_layering: merge, entries: [...]}` fails with `labels._layering must be one of "replace", "shallow", "deep"; got a string that is none of them`, and the `layering` input refuses it too, naming the same three values.
 
-Fix: write `deep` where a layer said `merge`, and `_layering: replace` on any list section a higher layer meant to replace whole. Under `shallow` and `deep` an empty higher list adds nothing; clearing a list takes `replace` with an empty list. The [layering guide](../operate/layering.md#three-knobs) owns the rules.
+Fix: write `deep` where a layer said `merge`, and `_layering: replace` on any list section a higher layer meant to replace whole. Under `shallow` and `deep` an empty higher list adds nothing; clearing a list takes `replace` with an empty list. The [layering guide](../operate/layering.md#four-knobs) owns the rules.
 
 ## 29. mode: merge is mode: render
 
@@ -716,10 +719,10 @@ v3            _undeclared: delete          # every knobbed section of this file,
 
 The run input `undeclared` (`keep` or `delete`, unset by default) sets the same default for every file an apply, check, or render reads; `mode: snapshot` rejects it. The precedence, highest first: the list's wrapper, then the file's top-level `_undeclared`, then the `undeclared` input, then the list's own default the [undeclared policy](../reference/undeclared-policy.md) page lists.
 
-A wrong value is refused before any section runs:
+A wrong value is refused before any section runs, one line in the collected list (abbreviated):
 
 ```text
-settings.yml: _undeclared must be one of "keep", "delete"; got a string that is none of them. Write _undeclared: keep or _undeclared: delete at the top of the file, or remove the key so each list's own policy applies
+settings.yml has malformed section entries: _undeclared must be one of "keep", "delete"; got a string that is none of them. Write _undeclared: keep or _undeclared: delete at the top of the file, or remove the key so each list's own policy applies (...)
 ```
 
 A file-wide `delete` reaches the nested `environments[].deployment_protection_rules` list too: an undeclared deployment gate is disabled, where the nested default is `keep`. Set the nested wrapper to `keep` on the environment that must keep its gates.
@@ -762,7 +765,7 @@ v3   -> ::error::settings.yml has malformed section entries: labels[1].name: "Bu
         result: failed, zero requests
 ```
 
-Every section's file-only checks run at validation, selected or not: duplicate identities (a rename target and the pre-rename name included), malformed lists, an unreadable deploy key, a non-plain value, a non-finite passthrough number, a passthrough alias cycle. The collected issues name their paths, and the run exits 1 before any request.
+Every section's file-only checks run at validation, selected or not: duplicate identities (a rename target and the pre-rename name included), malformed lists, an unreadable deploy key, a secret value that is not a whole-value `$NAME` reference the document's author may use, a non-plain value, a non-finite passthrough number, a passthrough alias cycle. The collected issues name their paths, and the run exits 1 before any request.
 
 Fix the declaration, in the excluded section too. For `@vivswan/github-settings-as-code` consumers: `SectionModule` gains a required `validate(declared)` hook on list modules, so a custom list module without one stops compiling; the [library page](../reference/library.md) documents its shape.
 
@@ -1070,7 +1073,7 @@ v3   due_on: 2026-01-15                # a calendar day; written as 2026-01-15T1
      due_on: 2026-01-15T00:00:00+02:00 # refused, naming the day form
 ```
 
-GitHub reads the sent instant in US Pacific time, keeps the day, and stores Pacific midnight. v3 writes noon UTC (the same day in PST and PDT) and compares the live timestamp by its UTC day. A UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` is still accepted, read for its date part, because a snapshot writes `YYYY-MM-DDT12:00:00Z` and must parse again.
+GitHub reads the sent instant in US Pacific time, keeps the day, and stores Pacific midnight. v3 writes noon UTC (the same day in PST and PDT), compares the live timestamp by its UTC day, and a snapshot writes the day. A UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` is still accepted, read for its date part.
 
 Fix: write the day. There is no `null` to clear a due date yet.
 
@@ -1147,7 +1150,7 @@ The parsed entry always carries both, so the full-payload PUT sends them and the
 ```text
 pre-release   const doc: SettingsFile = { rulesets: [{ name: "main" }] };            // compiles
 
-v3            const doc: SettingsFile = { rulesets: [{ name: "main" }] };            // TS2322: target and enforcement are missing
+v3            const doc: SettingsFile = { rulesets: [{ name: "main" }] };            // TS2739: target and enforcement are missing
               const { settings } = validateSettings({ rulesets: [{ name: "main" }] })._unsafeUnwrap();  // parsed: both keys filled
               const doc: SettingsFile = { rulesets: [{ name: "main", target: "branch", enforcement: "active" }] };
 ```
@@ -1179,6 +1182,67 @@ v3   branches[0].protection.restrictions.users: protection.restrictions must car
 GitHub's protection PUT requires `users` and `teams` under `restrictions` and takes `apps` as optional, so each missing list is refused before any request. The two review-side holders are unchanged: `dismissal_restrictions: {}` and `bypass_pull_request_allowances: {}` stay legal, since GitHub documents the empty mapping there as "disabled".
 
 Fix: declare both lists (`users: []` and `teams: []` when none), or write `restrictions: null` to lift the push restriction.
+
+## 56. Library: `plan()` and `snapshot()` resolve to a `Result`
+
+For `@vivswan/github-settings-as-code` consumers. The old form is the pre-release v3 builds', as in sections 24, 29, 35, and 54.
+
+A section never throws for what a user can cause. `plan()` and `snapshot()` resolve to a neverthrow `Result`: the plan or snapshot on `Ok`, a `SectionFailure` on `Err`, whose `message` is the whole line the action reports and whose `kind` names the policy the engine applies (`"permission-denied"` carries the section, the detail, and the HTTP status beside it). Every line is the one the thrown error carried.
+
+```text
+pre-release   const plan = await labels.plan(ctx, declared);          // resolves to the plan, rejects on a denied read
+              plan.ops.length;
+
+v3            const planned = await labels.plan(ctx, declared);       // resolves to Result<SectionPlan, SectionFailure>
+              if (planned.isErr()) throw new Error(planned.error.message);
+              planned.value.ops.length;
+```
+
+The change hook of a planned operation, its capture hook, and its `before`, `payload`, and `variables` thunks return a `Result` too; a hook that used to throw its verification failure returns `err(...)` with the same text.
+
+A rejection out of `plan()` or `snapshot()` now means one of three things: the module was handed another section's context (the guard the [library page](../reference/library.md#sections) describes, unchanged), the `GitHubClient` you supplied threw instead of answering (section 58), or a `BUG:` invariant fired.
+
+Fix: match on the `Result` (`isErr()`, `match`, or `_unsafeUnwrap()` in a test) where the awaited value was read directly, and assert `Err` where a test asserted a rejection.
+
+## 57. A closed section's unrecognized key names the entry by index
+
+A bracket in a validation issue's path always holds an index now. The unrecognized-key message of the closed sections (`collaborators`, `teams`, `workflows`, `custom_properties`, `secret_scanning_custom_patterns`, and the four secrets sections) was the one message that put the entry's identity there; it names the entry by its index and carries the identity in the text.
+
+```text
+v2   collaborators[octocat]: declares "permision", which this section does not recognize (known keys: username, permission) - ...
+
+v3   collaborators[0] (username "octocat"): declares "permision", which this section does not recognize (known keys: username, permission) - ...
+```
+
+Under an `{_undeclared, entries}` wrapper the path reads `collaborators.entries[0] (username "octocat")`, as every other issue under a wrapper does.
+
+Fix: anything that greps the bracket for the entry's identity reads the parenthesis instead.
+
+## 58. Library: `GitHubClient` and `ArtifactUploader` answer, never reject
+
+For `@vivswan/github-settings-as-code` consumers. The old form is the pre-release v3 builds', as in section 56.
+
+`GitHubApi` never rejects. A request with no HTTP answer resolves to the `failed` arm of `ClientAnswer`, carrying the whole line the action reports (the request, the reason, the remedy). The reason is withheld where the request carried a secret, and for a GraphQL request where the repository is redacted.
+
+The engine reads that arm wherever it read the throw:
+
+- a section fails with kind `transport`
+- discovery reports its transport problem
+- a multi-repo target fails with the line, where the run used to stop
+- the private-report channels warn without it
+
+```text
+pre-release   const answer = await client.tryRequest("GET", path);      // rejects on a network failure
+              if ("error" in answer) ...
+
+v3            const answer = await client.tryRequest("GET", path);      // resolves to ClientAnswer<unknown>
+              if ("failed" in answer) throw new Error(answer.failed);
+              if ("error" in answer) ...
+```
+
+`ArtifactUploader.upload()` resolves to `{ uploaded: true }` or `{ failed }`; `deliverArtifactReport` renders `failed` into its warning as it rendered the throw. A client or uploader that still throws is not classified: a section reports it under kind `thrown`, the report channels warn with their slug-free line.
+
+Fix: add the `failed` arm to every `GitHubClient` double and read it before `error`; return `{ uploaded: true }` from every `ArtifactUploader` double.
 
 ## Order of operations
 

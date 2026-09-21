@@ -3,8 +3,10 @@ import { validateSectionShapes } from "../../../src/engine/validate.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
 import { describeProblem } from "../../problem.js";
+import type { SectionInput } from "../contract/module.js";
 import {
   driftOf,
   type ExecTools,
@@ -52,8 +54,13 @@ function tools(resolved: Record<string, string> = {}): ExecTools {
   };
 }
 
-const plan = (api: MockApi, desired: Parameters<typeof webhooksSection.plan>[1]) =>
-  webhooksSection.plan(planContext(webhooksSection, api, REPO), desired);
+const plan = async (api: MockApi, desired: SectionInput<"webhooks">) =>
+  unwrap(
+    await webhooksSection.plan(
+      planContext(webhooksSection, api, REPO),
+      validatedInput("webhooks", desired),
+    ),
+  );
 
 /** The requests a plan would issue: role, path params, and the payload sealed with `resolved`. */
 async function requests(result: SectionPlan, resolved: Record<string, string> = {}) {
@@ -62,7 +69,7 @@ async function requests(result: SectionPlan, resolved: Record<string, string> = 
     result.ops.map(async (op) => [
       op.role,
       op.params,
-      typeof op.payload === "function" ? await op.payload(exec) : op.payload,
+      typeof op.payload === "function" ? unwrap(await op.payload(exec)) : op.payload,
     ]),
   );
 }
@@ -271,20 +278,20 @@ describe("webhooks plan", () => {
     expect(deleted.notes).toEqual([]);
     expect(deleted.ops.map((op) => [op.role, op.params, driftOf(op), op.change])).toEqual([
       [
-        "create",
-        undefined,
-        [
-          "webhooks[https://new.test/h]: missing - declared in the settings file but not on the repo; apply will create it",
-        ],
-        'created webhook "https://new.test/h"',
-      ],
-      [
         "remove",
         { hook_id: "8" },
         [
           'webhooks[https://old.test/h]: undeclared - not in the settings file and "_undeclared: delete" is set, so apply will DELETE it; add it to the settings file to keep it',
         ],
         'DELETED undeclared webhook "https://old.test/h"',
+      ],
+      [
+        "create",
+        undefined,
+        [
+          "webhooks[https://new.test/h]: missing - declared in the settings file but not on the repo; apply will create it",
+        ],
+        'created webhook "https://new.test/h"',
       ],
     ]);
   });
@@ -306,12 +313,19 @@ describe("webhooks plan", () => {
     await expect(plan(api, [])).rejects.toThrow(refusal);
   });
 
-  test("two declared entries with the same url are rejected before any call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [{ config: { url: "https://x.test/h" } }, { config: { url: "https://x.test/h" } }]),
-    ).rejects.toThrow(/Keep exactly one entry per resource/);
-    expect(api.calls).toEqual([]);
+  test("two declared entries with the same url are a validate issue at the nested identity field, so the document fails before any call", () => {
+    expect(
+      webhooksSection.validate([
+        { config: { url: "https://x.test/h" } },
+        { config: { url: "https://x.test/h" } },
+      ]),
+    ).toEqual([
+      {
+        path: "[1].config.url",
+        message:
+          '"https://x.test/h" names the same webhook as "https://x.test/h" declared earlier; keep exactly one entry per webhook',
+      },
+    ]);
   });
 
   test("executing the plan against the mock fragment converges: the re-plan carries only the secret-bearing config PATCHes", async () => {
@@ -352,23 +366,23 @@ describe("webhooks plan", () => {
       tools({ $WEBHOOK_SECRET: "hook-secret-1" }),
     );
     expect(changes).toEqual([
+      'DELETED undeclared webhook "https://stray.test/hook"',
       'updated webhook "https://ci.test/hook" config (the declared secret is re-sent every run)',
       'updated webhook "https://ci.test/hook"',
       'created webhook "https://deploy.test/hook"',
-      'DELETED undeclared webhook "https://stray.test/hook"',
     ]);
     expect(notes).toEqual([]);
     // provePlanIdempotent executes the converged second plan too, so the two secret-bearing config PATCHes land once more.
     expect(api.writes).toEqual([
+      "DELETE /repos/o/r/hooks/602",
       "PATCH /repos/o/r/hooks/601/config",
       "PATCH /repos/o/r/hooks/601",
       "POST /repos/o/r/hooks",
-      "DELETE /repos/o/r/hooks/602",
       "PATCH /repos/o/r/hooks/601/config",
       expect.stringMatching(/^PATCH \/repos\/o\/r\/hooks\/\d+\/config$/),
     ]);
     // The created hook now exists, so its secret recurs as a config PATCH: the facet with no lines, which check mode reads as clean plus the note.
-    expect(first.ops.map((op) => op.role)).toEqual(["updateConfig", "update", "create", "remove"]);
+    expect(first.ops.map((op) => op.role)).toEqual(["remove", "updateConfig", "update", "create"]);
     expect(second.ops.map((op) => [op.role, op.params, op.drift])).toEqual([
       [
         "updateConfig",

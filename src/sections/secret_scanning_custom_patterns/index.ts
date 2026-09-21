@@ -8,18 +8,21 @@
  * PATCH and DELETE    -> carry custom_pattern_version when GitHub supplies one; a pattern edited between read and write answers 412
  */
 
+import { ok, type Result } from "neverthrow";
 import { z } from "zod";
 import { agree } from "../../text.js";
 import type { EndpointDecl } from "../contract/endpoints.js";
-import { raise } from "../contract/errors.js";
+import type { SectionFailure } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   defaultUndeclaredPolicy,
+  duplicateFieldIssues,
   keyedBy,
   loosen,
   missingDrift,
   type SectionMeta,
   type SectionModule,
+  type SectionSnapshot,
   undeclaredDrift,
   undeclaredNote,
   undeclaredPolicy,
@@ -27,7 +30,6 @@ import {
 } from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
 import { hasDrift, type PlannedOp, type SectionPlan } from "../contract/plan.js";
-import { rejectDuplicates } from "../contract/requests.js";
 import { knobbed } from "../shared/schema-helpers.js";
 import {
   knobbedSnapshot,
@@ -146,15 +148,13 @@ function matches(declaredValue: string | string[], liveValue: unknown): boolean 
 function patternsByName<T extends { id: number; name: string }>(
   section: SectionMeta,
   live: readonly T[],
-): Map<string, T> {
-  return raise(
-    liveByIdentity(
-      section,
-      "secret scanning custom pattern",
-      live,
-      (p) => p.name,
-      (p) => liveIdentity(p.name, { pattern_id: p.id }),
-    ),
+): Result<Map<string, T>, SectionFailure> {
+  return liveByIdentity(
+    section,
+    "secret scanning custom pattern",
+    live,
+    (p) => p.name,
+    (p) => liveIdentity(p.name, { pattern_id: p.id }),
   );
 }
 
@@ -163,7 +163,7 @@ const key = "secret_scanning_custom_patterns";
 export const secretScanningPatternsSection = {
   key,
   undeclaredDefault: "keep",
-  // Verbatim, as plan() passes to rejectDuplicates: GitHub matches pattern names exactly.
+  // Verbatim, the key validate() rejects duplicates by: GitHub matches pattern names exactly.
   layering: keyedBy("name"),
   permission,
   endpoints: ENDPOINTS,
@@ -178,138 +178,144 @@ export const secretScanningPatternsSection = {
       must_match: true,
       must_not_match: true,
     },
-    describe: (p) => p.name,
     consequence:
       'the pattern endpoints accept no other field - in particular "state" and "push_protection_enabled" are read-only through this API surface - so the key would be dropped silently and never converge',
   },
+  validate(declared) {
+    return duplicateFieldIssues(declared, { field: "name" }, "custom pattern");
+  },
   async plan(ctx, declared) {
     const { policy, entries: desired } = undeclaredPolicy(declared, defaultUndeclaredPolicy(this));
-    raise(
-      rejectDuplicates(
-        this,
-        desired,
-        (p) => p.name,
-        (p) => p.name,
-      ),
-    );
-    const live = (await ctx.read.list.listAll(LivePatternEntry)).map(liveFrom);
-    const liveByName = patternsByName(this, live);
-    const declaredNames = new Set(desired.map((p) => p.name));
+    return ctx.read.list
+      .listAll(LivePatternEntry)
+      .map((entries) => entries.map(liveFrom))
+      .andThen((live) =>
+        patternsByName(this, live).map((liveByName) => {
+          const declaredNames = new Set(desired.map((p) => p.name));
 
-    const plan: SectionPlan<PlannedOp<typeof ENDPOINTS>> = { ops: [], notes: [], drift: [] };
-    const toCreate: SecretScanningPatternConfig[] = [];
-    const updates: PlannedOp<typeof ENDPOINTS>[] = [];
-    for (const entry of desired) {
-      const existing = liveByName.get(entry.name);
-      if (existing === undefined) {
-        toCreate.push(entry);
-        continue;
-      }
-      const divergent = Object.entries(declaredFields(entry)).filter(
-        ([field, value]) => !matches(value, existing.fields[field as UpdatableKey]),
+          const plan: SectionPlan<PlannedOp<typeof ENDPOINTS>> = { ops: [], notes: [], drift: [] };
+          const toCreate: SecretScanningPatternConfig[] = [];
+          const updates: PlannedOp<typeof ENDPOINTS>[] = [];
+          for (const entry of desired) {
+            const existing = liveByName.get(entry.name);
+            if (existing === undefined) {
+              toCreate.push(entry);
+              continue;
+            }
+            const divergent = Object.entries(declaredFields(entry)).filter(
+              ([field, value]) => !matches(value, existing.fields[field as UpdatableKey]),
+            );
+            const drift = divergent.map(([field, value]) => {
+              const liveValue = existing.fields[field as UpdatableKey];
+              // JSON.stringify(undefined) is not a string; spell absence out.
+              const liveRendered = liveValue === undefined ? "(absent)" : JSON.stringify(liveValue);
+              return valueDrift(
+                `${key}[${entry.name}].${field}`,
+                JSON.stringify(value),
+                liveRendered,
+              );
+            });
+            if (!hasDrift(drift)) {
+              continue;
+            }
+            updates.push({
+              role: "update",
+              params: { pattern_id: String(existing.id) },
+              // The PATCH body REQUIRES the version key but accepts null: a version-less live pattern
+              // writes without the concurrency check.
+              payload: {
+                custom_pattern_version: existing.version ?? null,
+                ...Object.fromEntries(divergent),
+              },
+              describe: `updating secret scanning pattern "${existing.name}"`,
+              drift,
+              change: `updated secret scanning custom pattern "${existing.name}"`,
+            });
+          }
+
+          const toDelete: LivePattern[] = [];
+          for (const pattern of live) {
+            if (declaredNames.has(pattern.name)) {
+              continue;
+            }
+            if (policy === "keep") {
+              plan.notes.push(
+                undeclaredNote({
+                  subject: `secret scanning custom pattern "${pattern.name}"`,
+                  action: "DELETE it (its alerts are then resolved, not deleted)",
+                }),
+              );
+              continue;
+            }
+            toDelete.push(pattern);
+          }
+
+          const [firstCreate, ...restCreate] = toCreate;
+          if (firstCreate !== undefined) {
+            const missing = (p: SecretScanningPatternConfig): string =>
+              missingDrift(`${key}[${p.name}]`);
+            const created = (p: SecretScanningPatternConfig): string =>
+              `created secret scanning custom pattern "${p.name}"`;
+            plan.ops.push({
+              role: "create",
+              payload: { patterns: toCreate.map(createBody) },
+              describe: `creating secret scanning ${agree(toCreate.length, "pattern", "patterns")} ${toCreate.map((p) => `"${p.name}"`).join(", ")}`,
+              drift: [missing(firstCreate), ...restCreate.map(missing)],
+              change: () => ok([created(firstCreate), ...restCreate.map(created)] as const),
+            });
+          }
+          plan.ops.push(...updates);
+          const [firstDelete, ...restDelete] = toDelete;
+          if (firstDelete !== undefined) {
+            const undeclared = (p: LivePattern): string =>
+              undeclaredDrift(defaultUndeclaredPolicy(this), {
+                label: `${key}[${p.name}]`,
+                action: "DELETE it and resolve its alerts",
+              });
+            const deleted = (p: LivePattern): string =>
+              `DELETED undeclared secret scanning custom pattern "${p.name}" (alerts resolved, not deleted)`;
+            // post_delete_action is ALWAYS "resolve_alerts": this action never destroys alert history
+            // (upstream defaults to delete_alerts), and there is no user knob.
+            plan.ops.push({
+              role: "remove",
+              payload: { patterns: toDelete.map(deleteBody), post_delete_action: "resolve_alerts" },
+              describe: `deleting undeclared secret scanning ${agree(toDelete.length, "pattern", "patterns")} ${toDelete.map((p) => `"${p.name}"`).join(", ")}`,
+              drift: [undeclared(firstDelete), ...restDelete.map(undeclared)],
+              change: () => ok([deleted(firstDelete), ...restDelete.map(deleted)] as const),
+            });
+          }
+          return plan;
+        }),
       );
-      const drift = divergent.map(([field, value]) => {
-        const liveValue = existing.fields[field as UpdatableKey];
-        // JSON.stringify(undefined) is not a string; spell absence out.
-        const liveRendered = liveValue === undefined ? "(absent)" : JSON.stringify(liveValue);
-        return valueDrift(`${key}[${entry.name}].${field}`, JSON.stringify(value), liveRendered);
-      });
-      if (!hasDrift(drift)) {
-        continue;
-      }
-      updates.push({
-        role: "update",
-        params: { pattern_id: String(existing.id) },
-        // The PATCH body REQUIRES the version key but accepts null: a version-less live pattern
-        // writes without the concurrency check.
-        payload: {
-          custom_pattern_version: existing.version ?? null,
-          ...Object.fromEntries(divergent),
-        },
-        describe: `updating secret scanning pattern "${existing.name}"`,
-        drift,
-        change: `updated secret scanning custom pattern "${existing.name}"`,
-      });
-    }
-
-    const toDelete: LivePattern[] = [];
-    for (const pattern of live) {
-      if (declaredNames.has(pattern.name)) {
-        continue;
-      }
-      if (policy === "keep") {
-        plan.notes.push(
-          undeclaredNote({
-            subject: `secret scanning custom pattern "${pattern.name}"`,
-            action: "DELETE it (its alerts are then resolved, not deleted)",
-          }),
-        );
-        continue;
-      }
-      toDelete.push(pattern);
-    }
-
-    const [firstCreate, ...restCreate] = toCreate;
-    if (firstCreate !== undefined) {
-      const missing = (p: SecretScanningPatternConfig): string => missingDrift(`${key}[${p.name}]`);
-      const created = (p: SecretScanningPatternConfig): string =>
-        `created secret scanning custom pattern "${p.name}"`;
-      plan.ops.push({
-        role: "create",
-        payload: { patterns: toCreate.map(createBody) },
-        describe: `creating secret scanning ${agree(toCreate.length, "pattern", "patterns")} ${toCreate.map((p) => `"${p.name}"`).join(", ")}`,
-        drift: [missing(firstCreate), ...restCreate.map(missing)],
-        change: () => [created(firstCreate), ...restCreate.map(created)] as const,
-      });
-    }
-    plan.ops.push(...updates);
-    const [firstDelete, ...restDelete] = toDelete;
-    if (firstDelete !== undefined) {
-      const undeclared = (p: LivePattern): string =>
-        undeclaredDrift(defaultUndeclaredPolicy(this), {
-          label: `${key}[${p.name}]`,
-          action: "DELETE it and resolve its alerts",
-        });
-      const deleted = (p: LivePattern): string =>
-        `DELETED undeclared secret scanning custom pattern "${p.name}" (alerts resolved, not deleted)`;
-      // post_delete_action is ALWAYS "resolve_alerts": this action never destroys alert history
-      // (upstream defaults to delete_alerts), and there is no user knob.
-      plan.ops.push({
-        role: "remove",
-        payload: { patterns: toDelete.map(deleteBody), post_delete_action: "resolve_alerts" },
-        describe: `deleting undeclared secret scanning ${agree(toDelete.length, "pattern", "patterns")} ${toDelete.map((p) => `"${p.name}"`).join(", ")}`,
-        drift: [undeclared(firstDelete), ...restDelete.map(undeclared)],
-        change: () => [deleted(firstDelete), ...restDelete.map(deleted)] as const,
-      });
-    }
-    return plan;
   },
   async snapshot(ctx) {
-    const live = await ctx.read.list.listAll(LivePatternEntry);
-    if (live.length === 0) {
-      return { value: undefined, notes: [] };
-    }
-    patternsByName(this, live);
-    const notes: string[] = [];
-    const entries: SecretScanningPatternConfig[] = [];
-    for (const pattern of live) {
-      const entry = projectOntoSchema(SecretScanningPatternConfig, pattern);
-      // A live value the syntax check cannot verify has no file-side fix: the entry is left out, the
-      // rest is written. A mis-shaped entry stays, for the engine's validation to name as the bug it is.
-      const unverifiable = unverifiableRegexFields(entry);
-      if (unverifiable.length > 0) {
-        notes.push(
-          leftOutOfSnapshot(
-            `${key}[${pattern.name}]`,
-            `its ${unverifiable.join(", ")} cannot be verified as ${agree(unverifiable.length, "a regular expression", "regular expressions")} by this tool; the pattern stays live and undeclared under the keep default`,
-          ),
-        );
-        continue;
+    return ctx.read.list.listAll(LivePatternEntry).andThen((live) => {
+      if (live.length === 0) {
+        return ok<SectionSnapshot<typeof key>, SectionFailure>({ value: undefined, notes: [] });
       }
-      entries.push(entry);
-    }
-    // Every entry left out still declares the section, empty: something exists on the repository,
-    // and the keep policy the empty declaration spells is what holds it.
-    return { value: knobbedSnapshot(this, entries), notes };
+      return patternsByName(this, live).map((): SectionSnapshot<typeof key> => {
+        const notes: string[] = [];
+        const entries: SecretScanningPatternConfig[] = [];
+        for (const pattern of live) {
+          const entry = projectOntoSchema(SecretScanningPatternConfig, pattern);
+          // A live value the syntax check cannot verify has no file-side fix: the entry is left out, the
+          // rest is written. A mis-shaped entry stays, for the engine's validation to name as the bug it is.
+          const unverifiable = unverifiableRegexFields(entry);
+          if (unverifiable.length > 0) {
+            notes.push(
+              leftOutOfSnapshot(
+                `${key}[${pattern.name}]`,
+                `its ${unverifiable.join(", ")} cannot be verified as ${agree(unverifiable.length, "a regular expression", "regular expressions")} by this tool; the pattern stays live and undeclared under the keep default`,
+              ),
+            );
+            continue;
+          }
+          entries.push(entry);
+        }
+        // Every entry left out still declares the section, empty: something exists on the repository,
+        // and the keep policy the empty declaration spells is what holds it.
+        return { value: knobbedSnapshot(this, entries), notes };
+      });
+    });
   },
 } satisfies SectionModule<"secret_scanning_custom_patterns", typeof ENDPOINTS>;

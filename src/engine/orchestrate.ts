@@ -3,18 +3,26 @@
  * share. All output goes through the Io sink; callers decide how to tag lines per repository.
  */
 
-import { err, type Result } from "neverthrow";
+import { err, ok, type Result } from "neverthrow";
 import type { RepoRef } from "../discovery/targets.js";
 import type { GitHubClient } from "../github/api.js";
 import type { Io } from "../io.js";
-import type { SettingsProblem, TopLevelShape } from "../problem.js";
+import {
+  badDirectiveIssue,
+  type SettingsProblem,
+  singleDocumentRemovalIssue,
+  type TopLevelShape,
+  unknownDirectivesIssue,
+  unknownSectionsIssue,
+} from "../problem.js";
 import {
   DOCUMENT_DIRECTIVE_KEYS,
   SECTION_KEYS,
   type SectionKey,
   type SettingsFile,
 } from "../schema.js";
-import { PermissionDenied } from "../sections/contract/errors.js";
+import { type SectionFailure, thrown } from "../sections/contract/errors.js";
+import type { ValidatedInput } from "../sections/contract/module.js";
 import {
   type ExecTools,
   type OnMissingPermission,
@@ -24,11 +32,12 @@ import {
 } from "../sections/contract/plan.js";
 import { SECTIONS } from "../sections/registry.js";
 import { agree, countNoun } from "../text.js";
-import type { MustBeNever } from "../types.js";
+import type { MustBeNever, UndeclaredPolicy } from "../types.js";
 import { executePlan } from "./execute.js";
+import { resolveUndeclaredPolicies, separateRemovals, UNDECLARED_POLICIES } from "./layers.js";
 import type { RunOutcome } from "./outcome.js";
-import { resolveSecretRefs, type SettingsSource, validateSecretRef } from "./secret-refs.js";
-import { collectSecretValues, type SectionSecretValue } from "./secrets.js";
+import { resolveSecretRefs, type SettingsSource } from "./secret-refs.js";
+import { collectSecretReferences } from "./secrets.js";
 import type { SectionSelection } from "./section-selection.js";
 import { validateSectionShapes } from "./validate.js";
 
@@ -53,10 +62,14 @@ export type SectionOutcome =
 
 /**
  * The brand has exactly one construction site (validateSettingsDoc's success return), so a RepoRunOptions built from an
- * unvalidated document is a compile error. The value is the PARSED document zod built, never the caller's object.
+ * unvalidated document is a compile error. The value is the PARSED document zod built, never the caller's object. Each
+ * section's value reads back as ValidatedInput, the per-section proof every plan() takes, so the document is the only
+ * source of planner input.
  */
 declare const validatedSettings: unique symbol;
-export type ValidatedSettings = SettingsFile & { readonly [validatedSettings]: true };
+export type ValidatedSettings = {
+  [K in keyof SettingsFile]: K extends SectionKey ? ValidatedInput<K> : SettingsFile[K];
+} & { readonly [validatedSettings]: true };
 
 export interface RepoRunOptions {
   repo: RepoRef;
@@ -64,8 +77,6 @@ export interface RepoRunOptions {
   mode: "apply" | "check";
   onMissingPermission: OnMissingPermission;
   sections: SectionSelection;
-  /** Omitted, "operator". The multi-repo flow passes "target" for a target's own settings.yml, so its secret references are refused. */
-  secretSource?: SettingsSource;
   secretEnv?: Record<string, string | undefined>;
 }
 
@@ -89,16 +100,29 @@ export function skippedSectionKeys(
   return outcomes.filter((o) => o.status === "skipped").map((o) => o.key);
 }
 
+export interface ValidateOptions {
+  /** The run's `undeclared` input: the fallback for a list whose wrapper and file set no policy, before the list's default. */
+  readonly undeclared?: UndeclaredPolicy | undefined;
+  /**
+   * Who authored the document; "operator" when omitted. The multi-repo flow passes "target" for a target's own
+   * settings.yml, so a secret reference in it is refused here, with the rest of the document's problems.
+   */
+  readonly secretSource?: SettingsSource | undefined;
+}
+
 /**
  * The ONE boundary that turns a raw parsed document into the ValidatedSettings the engine accepts. Unknown top-level
  * keys are errors, except outside a non-empty `sections` allowlist, where they downgrade to a warning; an unknown
  * underscore key is an error under every allowlist, since the underscore names this action's directives and nothing else.
+ * The branded document carries every undeclared policy explicit (resolveUndeclaredPolicies), so a planner reads one
+ * off its wrapper and never derives it; a rendered document arrives resolved already and passes through unchanged.
  */
 export function validateSettingsDoc(
   settings: unknown,
   sourceLabel: string,
   sections: SectionSelection,
   io: Io,
+  options: ValidateOptions = {},
 ): Result<ValidatedSettings, SettingsProblem> {
   if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
     return err({
@@ -121,35 +145,55 @@ export function validateSettingsDoc(
   const strangers = Object.keys(settings).filter(
     (key) => !knownSections.has(key) && !directives.has(key),
   );
+  // Every document problem is collected into one list, so one run names every fix: the strange keys first, then
+  // what each section's shape found.
+  const issues: string[] = [];
   const unknownDirectives = strangers.filter((key) => key.startsWith("_"));
   if (unknownDirectives.length > 0) {
-    return err({
-      code: "settings-unknown-directives",
-      source: sourceLabel,
-      unknown: unknownDirectives,
-    });
+    issues.push(unknownDirectivesIssue(unknownDirectives));
+  }
+  const directive = (settings as Record<string, unknown>)._undeclared;
+  const policy = UNDECLARED_POLICIES.find((value) => value === directive);
+  if (directive !== undefined && policy === undefined) {
+    issues.push(badDirectiveIssue("_undeclared", directive, UNDECLARED_POLICIES));
   }
   const unknownKeys = strangers.filter((key) => !key.startsWith("_"));
   if (unknownKeys.length > 0) {
     if (allowed.size === 0 || unknownKeys.some((key) => allowed.has(key))) {
-      return err({
-        code: "settings-unknown-sections",
-        source: sourceLabel,
-        unknown: unknownKeys,
-        known: SECTION_KEYS,
-      });
+      issues.push(unknownSectionsIssue(unknownKeys, SECTION_KEYS));
+    } else {
+      // A `sections` allowlist lets an older action version coexist with a config written for a newer one.
+      const them = agree(unknownKeys.length, "it", "them");
+      io.annotate(
+        "warning",
+        `ignoring unknown top-level ${agree(unknownKeys.length, "section", "sections")} outside the "sections" allowlist: ${unknownKeys.join(", ")}. ` +
+          `Upgrade the action to a version that knows ${them}, or remove ${them} from ${sourceLabel}`,
+      );
     }
-    // A `sections` allowlist lets an older action version coexist with a config written for a newer one.
-    const them = agree(unknownKeys.length, "it", "them");
-    io.annotate(
-      "warning",
-      `ignoring unknown top-level ${agree(unknownKeys.length, "section", "sections")} outside the "sections" allowlist: ${unknownKeys.join(", ")}. ` +
-        `Upgrade the action to a version that knows ${them}, or remove ${them} from ${sourceLabel}`,
-    );
   }
-  return validateSectionShapes(settings as Record<string, unknown>, sourceLabel).map(
-    (parsed) => parsed as ValidatedSettings,
+  // `_remove: true` drops a LOWER layer's entry; this document is nobody's higher layer (a layer of a fold arrives as
+  // its standalone view, removals already gone). Left to the shapes, an open entry shape would pass the marker to
+  // GitHub as a field. The shapes judge the rest, as the fold's per-layer validation does: a removal carries only its
+  // key, so judged as written it would fail every other required field, and a closed shape would name the marker again.
+  const removals = separateRemovals(settings);
+  issues.push(...removals.sites.map(singleDocumentRemovalIssue));
+  const shapes = validateSectionShapes(
+    (removals.sites.length === 0 ? settings : removals.rest) as Record<string, unknown>,
+    sourceLabel,
+    options.secretSource ?? "operator",
   );
+  if (shapes.isErr()) {
+    issues.push(...shapes.error.issues.map(removals.asWritten));
+  }
+  if (issues.length > 0) {
+    return err({ code: "settings-malformed-sections", source: sourceLabel, issues });
+  }
+  return shapes.map((parsed) => {
+    // validateSectionShapes copies the sections alone, so the directive admitted above is passed, never re-read.
+    const resolved: Record<string, unknown> = { ...parsed };
+    resolveUndeclaredPolicies(resolved, policy ?? options.undeclared);
+    return resolved as ValidatedSettings;
+  });
 }
 
 /** A non-mapping document's top level in typeof terms; the only object left by the caller's guard is null. */
@@ -177,13 +221,13 @@ export async function preflightProbe(
         `BUG: preflightProbe was given section "${section.key}" but the settings document does not declare it; the active list must be filtered to declared sections`,
       );
     }
-    try {
-      await section.plan(planContext(section, api, repo), declared);
-    } catch (error) {
-      if (error instanceof PermissionDenied) {
-        denied.push(`${section.key}: ${error.detail}`);
-      }
-      // Other preflight errors are left for the section loop, which surfaces them with full context.
+    // A client throw (an unmarked request's transport error) is not a denial; like every other preflight failure it
+    // is left for the section loop, which surfaces it with full context.
+    const planned = await section
+      .plan(planContext(section, api, repo), declared)
+      .catch((error: unknown) => err(thrown(error)));
+    if (planned.isErr() && planned.error.kind === "permission-denied") {
+      denied.push(`${section.key}: ${planned.error.detail}`);
     }
   }
   return denied;
@@ -210,9 +254,9 @@ export async function runForRepo(
   };
   const active = SECTIONS.filter((section) => disposition(section.key) === "active");
 
-  // Secret references are collected from the ACTIVE sections only (an excluded section's references must not fail the
-  // run) and their syntax and provenance checked in BOTH modes, before the preflight barrier and with no environment read.
-  const secretValues = collectSecretValues(settings, active, opts.secretSource ?? "operator");
+  // Validation judged every secret value's syntax and provenance, in the excluded sections too, so what is collected
+  // here is the ACTIVE sections' references, for apply to resolve; check mode reads no environment.
+  const secretReferences = collectSecretReferences(settings, active);
   const secretFailure = (errorsBySection: Map<SectionKey, string[]>): RepoRunResult => {
     const outcomes: SectionOutcome[] = [];
     for (const [key, errors] of errorsBySection) {
@@ -228,21 +272,6 @@ export async function runForRepo(
       preflightDenied: [],
     };
   };
-  const pushError = (map: Map<SectionKey, string[]>, key: SectionKey, message: string): void => {
-    const list = map.get(key) ?? [];
-    list.push(message);
-    map.set(key, list);
-  };
-  const syntaxErrors = new Map<SectionKey, string[]>();
-  for (const { section, value, source, label } of secretValues) {
-    const checked = validateSecretRef(value, source, label);
-    if (!checked.ok) {
-      pushError(syntaxErrors, section, checked.error);
-    }
-  }
-  if (syntaxErrors.size > 0) {
-    return secretFailure(syntaxErrors);
-  }
 
   // The API has no transactions, so a mid-apply permission failure would leave settings half-applied: under the strict
   // policy every active section is probed read-only FIRST. A token with read but not write access can still fail
@@ -267,18 +296,18 @@ export async function runForRepo(
   let tools: ExecTools | null = null;
   if (!check) {
     const resolved: Record<string, string> = {};
-    if (secretValues.length > 0) {
+    if (secretReferences.length > 0) {
       const env = opts.secretEnv ?? process.env;
-      const bySection = new Map<SectionKey, SectionSecretValue[]>();
-      for (const value of secretValues) {
-        const list = bySection.get(value.section) ?? [];
-        list.push(value);
-        bySection.set(value.section, list);
+      const bySection = new Map<SectionKey, string[]>();
+      for (const { section, name } of secretReferences) {
+        const list = bySection.get(section) ?? [];
+        list.push(name);
+        bySection.set(section, list);
       }
       const resolutionErrors = new Map<SectionKey, string[]>();
       const mask = new Set<string>();
-      for (const [key, values] of bySection) {
-        const resolution = resolveSecretRefs(values, env);
+      for (const [key, names] of bySection) {
+        const resolution = resolveSecretRefs(names, env);
         if (!resolution.ok) {
           resolutionErrors.set(key, resolution.errors);
           continue;
@@ -326,12 +355,12 @@ export async function runForRepo(
     const desired = settings[section.key];
     if (desired === undefined) {
       // disposition() classified this section active, which requires a declared value; planning on undefined would
-      // break plan()'s SectionInput contract.
+      // break plan()'s ValidatedInput contract.
       throw new Error(
         `BUG: section "${section.key}" was classified active but the settings document does not declare it`,
       );
     }
-    let result:
+    type Outcome =
       | { check: true; drift: string[]; notes: string[] }
       | { check: false; changes: string[]; notes: string[] };
     // What the section produced before an operation failed, reported with the failure instead of vanishing. `landed`
@@ -341,20 +370,27 @@ export async function runForRepo(
       changes: [],
       landed: 0,
     };
-    try {
-      const plan = await section.plan(planContext(section, api, repo), desired);
-      if (tools === null) {
-        result = { check: true, drift: planDrift(plan), notes: planCheckNotes(plan) };
-      } else {
-        const execution = await executePlan(plan, section, api, repo, tools);
-        const notes = [...plan.notes, ...plan.drift, ...execution.notes];
-        produced = { notes, changes: execution.changes, landed: execution.landed };
-        if (execution.status === "failed") {
-          throw execution.error;
-        }
-        result = { check: false, changes: [...execution.changes], notes };
+    // The section's plan and its execution, each ending in a value; the catch is for what still throws (the
+    // client's own transport error on an unmarked request, a BUG invariant), reported like any other failure.
+    const step = await (async (): Promise<Result<Outcome, SectionFailure>> => {
+      const planned = await section.plan(planContext(section, api, repo), desired);
+      if (planned.isErr()) {
+        return err(planned.error);
       }
-    } catch (error) {
+      const plan = planned.value;
+      if (tools === null) {
+        return ok({ check: true, drift: planDrift(plan), notes: planCheckNotes(plan) });
+      }
+      const execution = await executePlan(plan, section, api, repo, tools);
+      const notes = [...plan.notes, ...plan.drift, ...execution.notes];
+      produced = { notes, changes: execution.changes, landed: execution.landed };
+      if (execution.status === "failed") {
+        return err(execution.failure);
+      }
+      return ok({ check: false, changes: [...execution.changes], notes });
+    })().catch((error: unknown) => err(thrown(error)));
+    if (step.isErr()) {
+      const failure = step.error;
       for (const note of produced.notes) {
         io.annotate("notice", `${section.key}: ${note}`);
       }
@@ -362,17 +398,17 @@ export async function runForRepo(
         io.log(`${section.key}: ${line}`);
       }
       const before = [...produced.notes, ...produced.changes];
-      if (error instanceof PermissionDenied) {
+      if (failure.kind === "permission-denied") {
         const required = opts.sections.required.has(section.key);
         // A denial after some operations landed is a partial mutation, never a skip: the warn policy applies only when nothing was written.
         const landed = produced.landed;
         if (opts.onMissingPermission === "warn" && !required && landed === 0) {
-          io.annotate("warning", `${section.key}: skipped - ${error.detail}`);
+          io.annotate("warning", `${section.key}: skipped - ${failure.detail}`);
           outcomes.push({
             key: section.key,
             status: "skipped",
-            detail: [...before, error.detail],
-            httpStatus: error.status,
+            detail: [...before, failure.detail],
+            httpStatus: failure.status,
           });
           partial = true;
           continue;
@@ -385,23 +421,22 @@ export async function runForRepo(
               : "";
         io.annotate(
           "error",
-          `${section.key}: ${landed > 0 ? "partially applied" : "not applied"}${why} - ${error.detail}`,
+          `${section.key}: ${landed > 0 ? "partially applied" : "not applied"}${why} - ${failure.detail}`,
         );
         outcomes.push({
           key: section.key,
           status: "failed",
-          detail: [...before, error.detail],
-          httpStatus: error.status,
+          detail: [...before, failure.detail],
+          httpStatus: failure.status,
         });
         failed = true;
         continue;
       }
       // failureFor() messages already carry section, cause, and fix; anything else gets the section prefixed. A landed
       // request is a real mutation with or without its line, so say so.
-      const message = error instanceof Error ? error.message : String(error);
-      const prefixed = message.startsWith(`${section.key}:`)
-        ? message
-        : `${section.key}: ${message}`;
+      const prefixed = failure.message.startsWith(`${section.key}:`)
+        ? failure.message
+        : `${section.key}: ${failure.message}`;
       const annotated =
         produced.landed > 0
           ? `${prefixed} (${countNoun(produced.landed, "request", "requests")} landed before this failure, so the repository is partially applied)`
@@ -411,21 +446,22 @@ export async function runForRepo(
       failed = true;
       continue;
     }
-    for (const note of result.notes) {
+    const outcome = step.value;
+    for (const note of outcome.notes) {
       io.annotate("notice", `${section.key}: ${note}`);
     }
-    if (result.check) {
-      if (result.drift.length > 0) {
+    if (outcome.check) {
+      if (outcome.drift.length > 0) {
         drifted = true;
-        for (const line of result.drift) {
+        for (const line of outcome.drift) {
           io.log(`drift: ${line}`);
         }
-        outcomes.push({ key: section.key, status: "drift", detail: result.drift });
+        outcomes.push({ key: section.key, status: "drift", detail: outcome.drift });
       } else {
-        outcomes.push({ key: section.key, status: "clean", detail: result.notes });
+        outcomes.push({ key: section.key, status: "clean", detail: outcome.notes });
       }
     } else {
-      for (const line of result.changes) {
+      for (const line of outcome.changes) {
         io.log(`${section.key}: ${line}`);
       }
       outcomes.push({
@@ -434,10 +470,10 @@ export async function runForRepo(
         // A section that changed nothing but left notes (a tolerated 409, a personal-account skip) is NOT "already in
         // the desired state"; the notes are shown instead of claiming no changes were needed.
         detail:
-          result.changes.length > 0
-            ? result.changes
-            : result.notes.length > 0
-              ? result.notes
+          outcome.changes.length > 0
+            ? outcome.changes
+            : outcome.notes.length > 0
+              ? outcome.notes
               : ["no changes needed"],
       });
     }

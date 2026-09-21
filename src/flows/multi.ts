@@ -87,12 +87,8 @@ async function processTarget(ctx: {
   const { api, target, defaults, cfg, injectMarker, channel } = ctx;
   const fail = (richMessage: string): TargetResult => targetFailure(channel.io, richMessage);
 
-  // Marker injection is validity-preserving (it appends the constant marker label config, or strips a rename), so it
-  // happens after validation and keeps the brand.
-  const run = async (
-    settings: ValidatedSettings,
-    secretSource: SettingsSource,
-  ): Promise<TargetResult> => {
+  // Injection needs the typed labels, so it follows validation; the injected document is validated again inside.
+  const run = async (settings: ValidatedSettings): Promise<TargetResult> => {
     const injected = applyMarkerInjection(settings, injectMarker);
     if (injected.notice) {
       channel.io.annotate("notice", injected.notice);
@@ -105,7 +101,6 @@ async function processTarget(ctx: {
         mode: cfg.mode,
         onMissingPermission: cfg.onMissingPermission,
         sections: cfg.sections,
-        secretSource,
       },
       channel.io,
     );
@@ -133,20 +128,22 @@ async function processTarget(ctx: {
       "notice",
       `applying the defaults file: the repository has no ${DEFAULT_SETTINGS_FILE} on its default branch`,
     );
-    return run(defaults, "operator");
+    return run(defaults);
   }
 
-  // validateSettingsDoc names sourceLabel (the slug for remote targets) in its own warnings, so they go through the unprefixed sink.
+  // validateSettingsDoc names sourceLabel (the slug for remote targets) in its own warnings, so they go through the
+  // unprefixed sink. The document's provenance goes with it: a target-authored reference is refused there.
   const validated = validateSettingsDoc(
     read.doc,
     read.sourceLabel,
     cfg.sections,
     channel.unprefixed,
+    { undeclared: cfg.undeclared, secretSource: read.source },
   );
   if (validated.isErr()) {
     return fail(describeProblem(validated.error));
   }
-  return run(validated.value, read.source);
+  return run(validated.value);
 }
 
 /**
@@ -196,6 +193,10 @@ async function readTargetSettings(
     return {
       error: `${file.unproven}. To stop managing it instead, remove ${target.slug} from the "repos" input`,
     };
+  }
+  if ("failed" in file) {
+    // The client's line already names the request and the remedy; the target fails, the run goes on.
+    return { error: `reading ${sourceLabel} failed: ${file.failed}` };
   }
   if ("error" in file) {
     return {
@@ -386,7 +387,9 @@ export function runMulti(
     let defaults: ValidatedSettings | null = null;
     if (cfg.defaultsFile) {
       const doc = yield* readSettingsFile(cfg.defaultsFile, "defaults-file");
-      defaults = yield* validateSettingsDoc(doc, cfg.defaultsFile, cfg.sections, io);
+      defaults = yield* validateSettingsDoc(doc, cfg.defaultsFile, cfg.sections, io, {
+        undeclared: cfg.undeclared,
+      });
     }
 
     const { targets, plan, visibilityOf } = yield* resolveTargets(api, cfg, io);

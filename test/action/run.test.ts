@@ -8,7 +8,6 @@ import type { Layering } from "../../src/engine/layers.js";
 import { type Io, maskRegistry } from "../../src/io.js";
 import type { ArtifactUploader } from "../../src/report/artifact-report.js";
 import { REPORT_HEADING } from "../../src/report/composer.js";
-import { SECTION_KEYS } from "../../src/schema.js";
 import { MockApi } from "../mock-api.js";
 import { ROOT } from "../root.js";
 import { withTempDir } from "../temp-dir.js";
@@ -329,6 +328,7 @@ describe("run in multi-repo mode (env glue)", () => {
       const uploader: ArtifactUploader = {
         async upload(_name, file) {
           uploads.push(file.data);
+          return { uploaded: true as const };
         },
       };
       setDiscoveryEnv();
@@ -463,11 +463,10 @@ describe("run in mode: render", () => {
 
   /** fleet < team < repo under the default deep layering: what the three fixtures fold to. */
   const THREE_LAYERS_MERGED = {
-    repository: { has_wiki: false, description: "mine" },
+    repository: { has_wiki: false, has_projects: false, has_issues: true, description: "mine" },
     labels: {
       _undeclared: "delete",
       entries: [
-        { name: "bug", color: "d73a4a" },
         { name: "docs", color: "ffffff" },
         { name: "team", color: "00ff00" },
       ],
@@ -479,7 +478,7 @@ describe("run in mode: render", () => {
     pages: null,
   };
 
-  test("three layers fold into the merged file with no token and no API call; a null opts out with a notice, and pages: null is kept as the value", () =>
+  test("three layers fold into the merged file with no token and no API call; a removal drops an entry with a notice, and pages: null is the value", () =>
     withTempDir("render-mode-", async (dir) => {
       const layers = [layer("fleet.yml"), layer("team.yml"), layer("repo.yml")];
       const renderedFile = setRenderEnv(dir, layers);
@@ -489,7 +488,7 @@ describe("run in mode: render", () => {
       expect(parseYaml(readFileSync(renderedFile, "utf8"))).toEqual(THREE_LAYERS_MERGED);
       expect(outputs).toEqual({ result: "rendered", "skipped-sections": "", "repos-result": "{}" });
       expect(captured).toEqual([
-        `notice: ${layer("team.yml")}: null removed repository.has_projects declared by a lower layer`,
+        `notice: ${layer("team.yml")}: labels[0] carries _remove: true and dropped the entry a lower layer declared under its key`,
         `rendered 3 layers into ${renderedFile}`,
         "result: rendered",
       ]);
@@ -538,7 +537,11 @@ describe("run in mode: render", () => {
         expect(await run({ api: new MockApi({}), io: testIo })).toBe(1);
         expect(existsSync(renderedFile)).toBe(false);
         expect(captured).toEqual([
-          `error: unknown top-level section in ${top}: future (known: ${SECTION_KEYS.join(", ")}). Fix the typo, or set the "sections" input to limit processing`,
+          expect.stringMatching(
+            new RegExp(
+              `^error: ${top.replaceAll(".", "\\.")} has malformed section entries: unknown top-level section: future \\(known: `,
+            ),
+          ),
           "result: failed",
         ]);
       }),

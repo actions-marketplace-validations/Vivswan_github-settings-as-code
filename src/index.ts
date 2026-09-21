@@ -20,10 +20,10 @@ export {
   type Target,
 } from "./discovery/targets.js";
 export {
-  describeOptOut,
+  describeRemoval,
   type Layer,
   type Layering,
-  type OptOutNotice,
+  type RemovalNotice,
 } from "./engine/layers.js";
 export type { SectionOutcome, ValidatedSettings } from "./engine/orchestrate.js";
 export { RUN_RESULTS, type RunOutcome, worstOf } from "./engine/outcome.js";
@@ -75,6 +75,7 @@ export {
 } from "./flows/snapshot.js";
 export {
   type ApiError,
+  type ClientAnswer,
   DEFAULT_API_VERSION,
   GitHubApi,
   type GitHubApiOptions,
@@ -118,11 +119,15 @@ export {
   endpointPath,
   type Route,
 } from "./sections/contract/endpoints.js";
+export type { SectionFailure } from "./sections/contract/errors.js";
 export type { GraphqlOpDecl } from "./sections/contract/graphql.js";
 export {
+  type SectionInput,
   type SectionModule,
   type SectionSnapshot,
   sectionGrant,
+  type ValidatedBrand,
+  type ValidatedInput,
 } from "./sections/contract/module.js";
 export {
   type DenialPolicy,

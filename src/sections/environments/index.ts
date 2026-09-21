@@ -1,9 +1,20 @@
+import { ok, type Result, safeTry } from "neverthrow";
 import { z } from "zod";
-import { omittedDeltas, refuseOmitted, renderDelta, subsetDiff } from "../../engine/diff.js";
-import { raise } from "../contract/errors.js";
+import {
+  omittedDeltas,
+  phantomKeys,
+  phantomNote,
+  refuseOmitted,
+  renderDelta,
+  subsetDiff,
+} from "../../engine/diff.js";
+import type { SectionFailure } from "../contract/errors.js";
+
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   type DeclaredSecretValue,
+  declaredEntries,
+  duplicateFieldIssues,
   type KeyedListLayering,
   keyedBy,
   listEntries,
@@ -14,13 +25,18 @@ import {
 } from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
 import { hasDrift, plainData } from "../contract/plan.js";
-import { rejectDuplicates } from "../contract/requests.js";
 import { layeredList } from "../shared/schema-helpers.js";
 import { listSecretValues, secretKey } from "../shared/secrets-engine.js";
 import { projectOntoSchema, replaceSweep } from "../shared/snapshot-helpers.js";
 import { variableKey } from "../shared/variables-engine.js";
 import { ENDPOINTS } from "./endpoints.js";
-import { NESTED_KEYS, planNested, splitEntry } from "./nested.js";
+import {
+  NESTED_KEYS,
+  nestedDefaultPolicy,
+  planNested,
+  splitEntry,
+  validateNested,
+} from "./nested.js";
 import {
   type EnvironmentsPlan,
   environmentNodeId,
@@ -73,11 +89,19 @@ const permission: SectionPermission = { repo: ["environments"] };
 const NESTED_OVERRIDES_CAVEAT =
   'declared "deployment_branch_policies" and "deployment_protection_rules" keys additionally need "Actions" (read) and "Administration" (read and write)';
 
-/** A reviewer is a `type` and a numeric `id`; users and teams number from separate spaces, so the pair is the key. */
+/**
+ * A reviewer is a `type` and a numeric `id`; users and teams number from separate spaces, so the pair is the key. A
+ * removal entry reaches here unvalidated (the standalone view drops it before the schema), so the type is read only
+ * as a string: a list or mapping there is a keyless entry, not a coerced name.
+ */
 const REVIEWER_LAYERING: KeyedListLayering = {
   keyField: "id",
   keyKind: "numeric",
-  keys: (entry) => (typeof entry.id === "number" ? [`${String(entry.type)}:${entry.id}`] : null),
+  keys: (entry) =>
+    typeof entry.id === "number" && typeof entry.type === "string"
+      ? [`${entry.type}:${entry.id}`]
+      : null,
+  removalPaths: ["type", "id"],
 };
 
 export const environmentsSection = {
@@ -91,17 +115,25 @@ export const environmentsSection = {
   /**
    * Environment names fold as plan() probes them (case-insensitive). The nested lists union by the key each
    * planner reconciles by: variable and secret names uppercased as GitHub stores them, branch policies by their
-   * pattern, protection rules by App slug, reviewers by type and id. `deployment_branch_policy: null` is the entry's
-   * own "no restriction" value, never a delete marker.
+   * pattern, protection rules by App slug, reviewers by type and id.
    */
   layering: keyedBy("name", {
     fold: (name) => name.toLowerCase(),
-    nullValued: ["deployment_branch_policy"],
     nested: {
-      variables: keyedBy("name", { fold: variableKey }),
-      secrets: keyedBy("name", { fold: secretKey }),
-      deployment_branch_policies: keyedBy("name"),
-      deployment_protection_rules: keyedBy("app"),
+      variables: keyedBy("name", {
+        fold: variableKey,
+        undeclaredDefault: nestedDefaultPolicy("variables"),
+      }),
+      secrets: keyedBy("name", {
+        fold: secretKey,
+        undeclaredDefault: nestedDefaultPolicy("secrets"),
+      }),
+      deployment_branch_policies: keyedBy("name", {
+        undeclaredDefault: nestedDefaultPolicy("deployment_branch_policies"),
+      }),
+      deployment_protection_rules: keyedBy("app", {
+        undeclaredDefault: nestedDefaultPolicy("deployment_protection_rules"),
+      }),
       reviewers: REVIEWER_LAYERING,
     },
   }),
@@ -121,109 +153,128 @@ export const environmentsSection = {
       }));
     });
   },
-  async plan(ctx, desired) {
-    const environments = listEntries(desired);
-    raise(
-      rejectDuplicates(
-        this,
-        environments,
-        (env) => env.name.toLowerCase(),
-        (env) => env.name,
-      ),
+  // Environment names are case-insensitive on GitHub, the fold plan() probes and pins by.
+  validate(desired) {
+    const issues = duplicateFieldIssues(
+      desired,
+      { field: "name", fold: (name) => name.toLowerCase() },
+      "environment",
     );
-    const plan: EnvironmentsPlan = { ops: [], notes: [], drift: [] };
-    /** Each entry's declared pin state, in file order (order IS the pin order). */
-    const pins: PinDeclaration[] = [];
-    for (const env of environments) {
-      const { settings, nested, routed } = splitEntry(env);
-      const name = env.name;
-      const params = { environment_name: name };
-      const probe = await ctx.read.probe.probeAbsent(LiveEnvironmentBody, {
-        params,
-        describe: `environment "${name}"`,
-      });
-      const live = "missing" in probe ? undefined : probe.data;
-      const label = `environments[${name}]`;
-      const { drift, omitted } =
-        live === undefined
-          ? { drift: [missingDrift(label)], omitted: [] }
-          : environmentDrift(label, settings, flattenEnvironment(live));
-      // The pin mutations' node id, off the probe or a created environment's PUT response. A probed
-      // body is validated only when a mutation needs it.
-      const probedNodeId = live === undefined ? undefined : { node_id: live.node_id };
-      let createdNodeId: string | undefined;
-      const nodeId = (): string => {
-        if (probedNodeId !== undefined) {
-          return environmentNodeId(name, probedNodeId);
-        }
-        if (createdNodeId === undefined) {
-          throw new Error(
-            `BUG: environments: the pin of "${name}" ran before the PUT that creates the environment`,
-          );
-        }
-        return createdNodeId;
-      };
-      if (hasDrift(drift)) {
-        plan.ops.push({
-          role: "update",
+    const { entries: environments, path: at } = declaredEntries(desired);
+    environments.forEach((env, index) => {
+      issues.push(
+        ...validateNested(env).map((issue) => ({ ...issue, path: `${at}[${index}]${issue.path}` })),
+      );
+    });
+    return issues;
+  },
+  async plan(ctx, desired) {
+    const section = this;
+    return safeTry(async function* () {
+      const environments = listEntries(desired);
+      const plan: EnvironmentsPlan = { ops: [], notes: [], drift: [] };
+      /** Each entry's declared pin state, in file order (order IS the pin order). */
+      const pins: PinDeclaration[] = [];
+      for (const env of environments) {
+        const { settings, nested, routed } = splitEntry(env);
+        const name = env.name;
+        const params = { environment_name: name };
+        const probe = yield* ctx.read.probe.probeAbsent(LiveEnvironmentBody, {
           params,
-          payload: plainData(settings),
-          before: refuseOmitted(label, omitted),
-          drift,
-          change: `applied environment "${name}"`,
-          describe: `upserting environment "${name}"`,
-          capture:
-            live === undefined && routed.pinned !== undefined
-              ? (response) => {
-                  createdNodeId = environmentNodeId(name, response);
-                }
-              : undefined,
+          describe: `environment "${name}"`,
         });
+        const live = "missing" in probe ? undefined : probe.data;
+        const label = `environments[${name}]`;
+        const { drift, omitted, notes } =
+          live === undefined
+            ? { drift: [missingDrift(label)], omitted: [], notes: [] }
+            : environmentDrift(label, settings, flattenEnvironment(live));
+        plan.notes.push(...notes);
+        // The pin mutations' node id, off the probe or a created environment's PUT response. A probed
+        // body is validated only when a mutation needs it.
+        const probedNodeId = live === undefined ? undefined : { node_id: live.node_id };
+        let createdNodeId: string | undefined;
+        const nodeId = (): Result<string, SectionFailure> => {
+          if (probedNodeId !== undefined) {
+            return environmentNodeId(name, probedNodeId);
+          }
+          if (createdNodeId === undefined) {
+            throw new Error(
+              `BUG: environments: the pin of "${name}" ran before the PUT that creates the environment`,
+            );
+          }
+          return ok(createdNodeId);
+        };
+        if (hasDrift(drift)) {
+          plan.ops.push({
+            role: "update",
+            params,
+            payload: plainData(settings),
+            before: refuseOmitted(label, omitted),
+            drift,
+            change: `applied environment "${name}"`,
+            describe: `upserting environment "${name}"`,
+            capture:
+              live === undefined && routed.pinned !== undefined
+                ? (response) =>
+                    environmentNodeId(name, response).andThen((id) => {
+                      createdNodeId = id;
+                      return ok(undefined);
+                    })
+                : undefined,
+          });
+        }
+        if (routed.pinned !== undefined) {
+          pins.push({ name, pinned: routed.pinned, nodeId });
+        }
+        for (const key of NESTED_KEYS) {
+          const planned = yield* await planNested(ctx, section, key, name, nested, live);
+          plan.ops.push(...planned.ops);
+          plan.notes.push(...planned.notes);
+        }
       }
-      if (routed.pinned !== undefined) {
-        pins.push({ name, pinned: routed.pinned, nodeId });
+      // Pins plan after every environment op: a created environment's id comes from its PUT.
+      // Without a `pinned` key the section never touches /graphql.
+      if (pins.length > 0) {
+        const pinned = yield* planPinned(ctx, pins);
+        plan.ops.push(...pinned.ops);
+        plan.notes.push(...pinned.notes);
       }
-      for (const key of NESTED_KEYS) {
-        const planned = await planNested(ctx, this, key, name, nested, live);
-        plan.ops.push(...planned.ops);
-        plan.notes.push(...planned.notes);
-      }
-    }
-    // Pins plan after every environment op: a created environment's id comes from its PUT.
-    // Without a `pinned` key the section never touches /graphql.
-    if (pins.length > 0) {
-      const pinned = await planPinned(ctx, pins);
-      plan.ops.push(...pinned.ops);
-      plan.notes.push(...pinned.notes);
-    }
-    return plan;
+      return ok(plan);
+    });
   },
   async snapshot(ctx) {
-    const listed = await ctx.read.list.listAllEnveloped("environments", LiveEnvironment);
-    if (listed.length === 0) {
-      return { value: undefined, notes: [] };
-    }
-    // Environment names are case-insensitive on GitHub, the fold plan() probes and pins by.
-    raise(
-      liveByIdentity(
-        this,
+    const section = this;
+    return safeTry(async function* () {
+      const listed = yield* ctx.read.list.listAllEnveloped("environments", LiveEnvironment);
+      if (listed.length === 0) {
+        return ok({ value: undefined, notes: [] });
+      }
+      // Environment names are case-insensitive on GitHub, the fold plan() probes and pins by.
+      yield* liveByIdentity(
+        section,
         "environment",
         listed,
         (live) => live.name.toLowerCase(),
         (live) => liveIdentity(live.name, { environment_id: live.id }),
-      ),
-    );
-    const notes: string[] = [];
-    const entries: EnvironmentConfig[] = [];
-    for (const live of listed) {
-      const settings = projectOntoSchema(EnvironmentConfig, flattenEnvironment(live));
-      const { nested, notes: nestedNotes } = await snapshotNested(ctx, this, live.name, live);
-      entries.push({ ...settings, ...nested });
-      notes.push(...nestedNotes);
-    }
-    const pinned = withPins(entries, await snapshotPins(ctx));
-    notes.push(...pinned.notes, ...sharedSecretNotes(pinned.entries));
-    return { value: pinned.entries, notes };
+      );
+      const notes: string[] = [];
+      const entries: EnvironmentConfig[] = [];
+      for (const live of listed) {
+        const settings = projectOntoSchema(EnvironmentConfig, flattenEnvironment(live));
+        const { nested, notes: nestedNotes } = yield* await snapshotNested(
+          ctx,
+          section,
+          live.name,
+          live,
+        );
+        entries.push({ ...settings, ...nested });
+        notes.push(...nestedNotes);
+      }
+      const pinned = withPins(entries, yield* snapshotPins(ctx));
+      notes.push(...pinned.notes, ...sharedSecretNotes(pinned.entries));
+      return ok({ value: pinned.entries, notes });
+    });
   },
 } satisfies SectionModule<"environments", typeof ENDPOINTS, typeof GRAPHQL_OPS>;
 
@@ -231,17 +282,25 @@ export const environmentsSection = {
  * The PUT replaces the environment's settings whole (an omitted `reviewers` clears the reviewers rule), so a
  * non-empty live setting the entry omits is drift too, and the lines it makes (`omitted`) are what apply refuses
  * the write over. The live body is split the way the entry was, so only the PUT's own keys take part in that sweep.
+ * The entry passes unknown keys through, so a key the GET never echoes would re-PUT on every apply without
+ * converging; `notes` names it. An entry key the GET omits (deployment_branch_policy on an environment that never
+ * set one) is drift the PUT resolves, so only a key outside the entry shape is noted.
  */
 function environmentDrift(
   label: string,
   settings: Record<string, unknown>,
   live: Record<string, unknown>,
-): { drift: string[]; omitted: string[] } {
+): { drift: string[]; omitted: string[]; notes: string[] } {
   const liveSettings = splitEntry(projectOntoSchema(EnvironmentConfig, live)).settings;
   const omitted = omittedDeltas(settings, liveSettings, {
     sweep: replaceSweep(EnvironmentConfig),
   }).map((delta) => renderDelta(label, delta));
-  return { drift: [...subsetDiff(settings, live, label), ...omitted], omitted };
+  const phantom = phantomKeys(settings, live).filter(
+    (key) => !Object.hasOwn(EnvironmentConfig.shape, key),
+  );
+  const notes =
+    phantom.length > 0 ? [phantomNote(label, phantom, "environment", "this PUT will re-run")] : [];
+  return { drift: [...subsetDiff(settings, live, label), ...omitted], omitted, notes };
 }
 
 /**

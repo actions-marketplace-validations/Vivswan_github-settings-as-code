@@ -9,6 +9,9 @@
  * omits into an `omitted` delta, because that write would remove it.
  */
 
+import { err, type Result } from "neverthrow";
+import { type SectionFailure, sectionFailure } from "../sections/contract/errors.js";
+import { isMapping } from "../sections/shared/raw-values.js";
 import { agree } from "../text.js";
 
 type PathStep = string | number | { readonly key: string };
@@ -53,7 +56,7 @@ export interface DeltaOptions {
    * item key to pair by; a missing or repeated key is a declaration bug.
    *
    * a list not named here  -> object items pair by shape, others by value
-   * matchBy omitted        -> lists fall back to the legacy `type` sniffing subsetDiff callers rely on
+   * matchBy omitted        -> lists fall back to the default `type` pairing subsetDiff callers use
    */
   readonly matchBy?: Readonly<Record<string, MatchKey>>;
   /**
@@ -82,10 +85,6 @@ function isScalar(value: unknown): boolean {
   return typeof value !== "object" || value === null;
 }
 
-function isPlainMapping(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * Nothing a replacing write would need to preserve: GitHub's zero values, an empty list, or a mapping
  * whose every value is empty by the same rule (an actor holder with empty lists).
@@ -97,7 +96,7 @@ function isEmptySetting(value: unknown): boolean {
   if (Array.isArray(value)) {
     return value.length === 0;
   }
-  if (isPlainMapping(value)) {
+  if (isMapping(value)) {
     return Object.values(value).every(isEmptySetting);
   }
   return false;
@@ -142,7 +141,7 @@ function walk(
     return;
   }
   if (typeof desired === "object") {
-    if (!isPlainMapping(liveValue)) {
+    if (!isMapping(liveValue)) {
       out.push(
         absent
           ? { kind: "phantom", path, desired }
@@ -209,8 +208,8 @@ function describeKey(key: MatchKey): string {
  * declaration bug.
  */
 function itemKey(item: unknown, key: MatchKey, keyPath: string, side: "desired" | "live"): string {
-  const parts = isPlainMapping(item) ? fieldsOf(key).filter((field) => item[field] != null) : [];
-  if (!isPlainMapping(item) || parts.length === 0) {
+  const parts = isMapping(item) ? fieldsOf(key).filter((field) => item[field] != null) : [];
+  if (!isMapping(item) || parts.length === 0) {
     throw new Error(
       `BUG: matchBy pairs the list "${keyPath}" by ${describeKey(key)}, but a ${side} item carries no such key: ${JSON.stringify(item)}`,
     );
@@ -242,7 +241,7 @@ function walkList(
     return;
   }
   if (opts.matchBy === undefined) {
-    // Legacy sniffing pairs by `type` only when types are unique on both sides (ruleset rules); environment reviewers
+    // The default pairing matches by `type` only when types are unique on both sides (ruleset rules); environment reviewers
     // repeat types and fall through to shape pairing below.
     const desiredTypes = desired.map(typeOf);
     const liveTypes = live.map(typeOf);
@@ -340,7 +339,7 @@ function walkKeyed(
  * `rulesets[main].bypass_actors[Team 1]` under a root, or `rules[deletion].parameters.x` under an empty one:
  * the path as a settings-file reader would spell it.
  */
-function renderPath(root: string, path: readonly PathStep[]): string {
+export function renderPath(root: string, path: readonly PathStep[]): string {
   return path.reduce<string>(
     (at, step) =>
       typeof step === "string"
@@ -440,20 +439,18 @@ export function omittedDeltas(
 
 /**
  * Apply never issues a replacing write that would remove what the settings file omits: the operation's `before`
- * hook throws the omitted lines instead, so the run fails for that entry with its request never sent, while check
- * keeps reporting the same lines as drift. Undefined when nothing is omitted.
+ * hook fails with the omitted lines instead, so the run fails for that entry with its request never sent, while
+ * check keeps reporting the same lines as drift. Undefined when nothing is omitted.
  */
 export function refuseOmitted(
   label: string,
   omitted: readonly string[],
-): (() => never) | undefined {
+): (() => Result<never, SectionFailure>) | undefined {
   if (omitted.length === 0) {
     return undefined;
   }
   const message = `${label}: not applied - the update would remove ${agree(omitted.length, "a live value", "live values")} the settings file omits. ${omitted.join(" ")}`;
-  return () => {
-    throw new Error(message);
-  };
+  return () => err(sectionFailure("refused", message));
 }
 
 /** The phantom deltas as dotted paths (`security_and_analysis.foo`, `rules[deletion].x`), for the never-converges note. */

@@ -1,6 +1,7 @@
 /** The `branches:` section's entry-config declaration (see src/schema.ts). */
 
 import { z } from "zod";
+import { isMapping, stringItems } from "../shared/raw-values.js";
 import { BOOLEAN_CONTROL_SET, isGetOnlyKey, isUrlKey } from "./keys.js";
 
 // --- Actor vocabulary (branches force_push_bypassers) ------------------------
@@ -32,9 +33,10 @@ export function parseBypassActor(raw: string): BypassActor | null {
 const ACTOR_FORM_ERROR =
   'each force_push_bypassers actor must be a bare user login ("octocat"), "org/team-slug" for a team, or "app/slug" for a GitHub App';
 
-function duplicateIn(list: readonly string[]): string | null {
+/** The list may be raw beside its own shape issue (see ../shared/raw-values.ts): only the string items are judged. */
+function duplicateIn(list: unknown): string | null {
   const seen = new Set<string>();
-  for (const item of list) {
+  for (const item of stringItems(list)) {
     const key = item.toLowerCase();
     if (seen.has(key)) {
       return item;
@@ -42,10 +44,6 @@ function duplicateIn(list: readonly string[]): string | null {
     seen.add(key);
   }
   return null;
-}
-
-function isPlainMapping(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // --- Actor holders: restrictions, dismissal_restrictions, bypass_pull_request_allowances --------
@@ -58,7 +56,7 @@ const ACTOR_LIST_EXAMPLE = {
 type ActorList = keyof typeof ACTOR_LIST_EXAMPLE;
 
 function copiedActorName(item: unknown): string | null {
-  if (!isPlainMapping(item)) {
+  if (!isMapping(item)) {
     return null;
   }
   for (const nameKey of ["login", "slug"] as const) {
@@ -252,7 +250,7 @@ function refuseGetOnlyKeys(
   refineCtx: z.RefinementCtx,
   ancestors: Set<object> = new Set(),
 ): void {
-  if (!Array.isArray(value) && !isPlainMapping(value)) {
+  if (!Array.isArray(value) && !isMapping(value)) {
     return;
   }
   if (ancestors.has(value)) {
@@ -278,6 +276,19 @@ function refuseGetOnlyKeys(
   }
   ancestors.delete(value);
 }
+
+/**
+ * The keys the schema declares under each open protection mapping, by the mapping's dotted path.
+ * index.ts completes the PUT vocabulary with the controls that pass through (the boolean controls,
+ * the review booleans) and notes a declared key outside it that the GET never echoes.
+ */
+export const PROTECTION_MAPPING_KEYS = {
+  required_status_checks: Object.keys(RequiredStatusChecks.shape),
+  required_pull_request_reviews: Object.keys(RequiredPullRequestReviews.shape),
+  "required_pull_request_reviews.dismissal_restrictions": Object.keys(ACTOR_LIST_EXAMPLE),
+  "required_pull_request_reviews.bypass_pull_request_allowances": Object.keys(ACTOR_LIST_EXAMPLE),
+  restrictions: Object.keys(Restrictions.shape),
+} as const satisfies Readonly<Record<string, readonly string[]>>;
 
 export const BranchProtectionConfig = z
   .looseObject({
@@ -317,8 +328,8 @@ export const BranchConfig = z
     // replace wholesale, so a duplicate would apply "successfully" and then drift forever against
     // the deduplicated read-back.
     const routed = entry.protection;
-    if (routed !== null) {
-      const duplicateActor = duplicateIn(routed.force_push_bypassers ?? []);
+    if (isMapping(routed)) {
+      const duplicateActor = duplicateIn(routed.force_push_bypassers);
       if (duplicateActor !== null) {
         refineCtx.addIssue({
           code: "custom",
@@ -326,11 +337,7 @@ export const BranchConfig = z
           message: `force_push_bypassers lists "${duplicateActor}" more than once (actor names are case-insensitive); keep one entry per actor`,
         });
       }
-      const duplicateEnv = duplicateIn(
-        routed.required_deployments === null
-          ? []
-          : (routed.required_deployments?.environments ?? []),
-      );
+      const duplicateEnv = duplicateIn(routed.required_deployments?.environments);
       if (duplicateEnv !== null) {
         refineCtx.addIssue({
           code: "custom",

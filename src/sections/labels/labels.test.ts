@@ -4,7 +4,9 @@ import { planContext } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
+import type { SectionInput } from "../contract/module.js";
 import { labelsSection } from "./index.js";
 import { labelsMockHandlers } from "./mock.js";
 
@@ -13,8 +15,13 @@ const liveLabels = [
   { name: "bug", color: "d73a4a", description: "Something isn't working" },
   { name: "stale", color: "ffffff", description: null },
 ];
-const plan = (api: MockApi, desired: Parameters<typeof labelsSection.plan>[1]) =>
-  labelsSection.plan(planContext(labelsSection, api, REPO), desired);
+const plan = async (api: MockApi, desired: SectionInput<"labels">) =>
+  unwrap(
+    await labelsSection.plan(
+      planContext(labelsSection, api, REPO),
+      validatedInput("labels", desired),
+    ),
+  );
 
 describe("labels", () => {
   test("plans a create per missing label, an update per drifted one, and a delete per undeclared one, reading only", async () => {
@@ -25,6 +32,15 @@ describe("labels", () => {
     ]);
     expect(result).toEqual({
       ops: [
+        {
+          role: "remove",
+          params: { name: "stale" },
+          describe: 'deleting undeclared label "stale"',
+          drift: [
+            "labels[stale]: undeclared - not in the settings file, so apply will DELETE it; add it to the settings file to keep it",
+          ],
+          change: 'DELETED undeclared label "stale"',
+        },
         {
           role: "update",
           params: { name: "bug" },
@@ -44,15 +60,6 @@ describe("labels", () => {
             "labels[enhancement]: missing - declared in the settings file but not on the repo; apply will create it",
           ],
           change: 'created label "enhancement"',
-        },
-        {
-          role: "remove",
-          params: { name: "stale" },
-          describe: 'deleting undeclared label "stale"',
-          drift: [
-            "labels[stale]: undeclared - not in the settings file, so apply will DELETE it; add it to the settings file to keep it",
-          ],
-          change: 'DELETED undeclared label "stale"',
         },
       ],
       notes: [],
@@ -79,6 +86,15 @@ describe("labels", () => {
     expect(result).toEqual({
       ops: [
         {
+          role: "remove",
+          params: { name: "stale" },
+          describe: 'deleting undeclared label "stale"',
+          drift: [
+            "labels[stale]: undeclared - not in the settings file, so apply will DELETE it; add it to the settings file to keep it",
+          ],
+          change: 'DELETED undeclared label "stale"',
+        },
+        {
           role: "update",
           params: { name: "bug" },
           payload: { new_name: "bug", description: "", colr: "000000" },
@@ -89,15 +105,6 @@ describe("labels", () => {
           ],
           change: 'updated label "bug"',
         },
-        {
-          role: "remove",
-          params: { name: "stale" },
-          describe: 'deleting undeclared label "stale"',
-          drift: [
-            "labels[stale]: undeclared - not in the settings file, so apply will DELETE it; add it to the settings file to keep it",
-          ],
-          change: 'DELETED undeclared label "stale"',
-        },
       ],
       notes: [
         'labels[bug]: declared key "colr" does not exist on the live label, so if GitHub ignores it this update will re-run on every apply without converging. Fix the key name, or remove it from the settings file',
@@ -106,14 +113,7 @@ describe("labels", () => {
     });
   });
 
-  test.each<
-    [
-      form: string,
-      declared: Parameters<typeof labelsSection.plan>[1],
-      roles: string[],
-      notes: string[],
-    ]
-  >([
+  test.each<[form: string, declared: SectionInput<"labels">, roles: string[], notes: string[]]>([
     [
       "wrapped _undeclared:keep",
       { _undeclared: "keep", entries: [{ name: "bug", color: "d73a4a" }] },
@@ -156,19 +156,19 @@ describe("labels", () => {
     ]);
   });
 
-  test("two entries resolving to the same label (via name or new_name) are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("two entries resolving to the same label through their rename targets are a validate issue at the later new_name, so the document fails before any API call", () => {
+    expect(
+      labelsSection.validate([
         { name: "bug", new_name: "triage" },
         { name: "enhancement", new_name: "Triage" },
       ]),
-    ).rejects.toThrow(
-      new Error(
-        'labels: the settings file declares entries that name the same labels entry: "triage" and "Triage". Keep exactly one entry per resource',
-      ),
-    );
-    expect(api.calls).toHaveLength(0);
+    ).toEqual([
+      {
+        path: "[1].new_name",
+        message:
+          '"Triage" names the same label as "triage" declared earlier; keep exactly one entry per label',
+      },
+    ]);
   });
 
   test("a rename whose source and target both exist live cannot converge", async () => {
@@ -192,15 +192,15 @@ describe("labels", () => {
       { name: "enhancement", color: "a2eeef", description: "New feature or request" },
     ]);
     expect(changes).toEqual([
+      'DELETED undeclared label "wontfix"',
       'updated label "defect"',
       'created label "enhancement"',
-      'DELETED undeclared label "wontfix"',
     ]);
     expect(notes).toEqual([]);
     expect(api.writes).toEqual([
+      "DELETE /repos/o/r/labels/wontfix",
       "PATCH /repos/o/r/labels/bug",
       "POST /repos/o/r/labels",
-      "DELETE /repos/o/r/labels/wontfix",
     ]);
     expect(second).toEqual({ ops: [], notes: [], drift: [] });
     expect(api.state.labels.map((label) => [label.name, label.color, label.description])).toEqual([

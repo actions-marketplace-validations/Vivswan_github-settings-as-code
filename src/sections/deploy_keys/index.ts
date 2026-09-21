@@ -3,6 +3,7 @@
  * Immutable upstream (no update role), so a changed key or read_only flag is delete plus recreate.
  */
 
+import { ok } from "neverthrow";
 import { z } from "zod";
 import type { EndpointDecl } from "../contract/endpoints.js";
 import { exactName, listSection } from "../shared/list-section.js";
@@ -58,10 +59,13 @@ const ENDPOINTS = {
   },
 } as const satisfies Record<string, EndpointDecl>;
 
+/** The shape refused malformed material through the same parsePublicKey before plan() ran, so reaching one here is a bug. */
 function declaredMaterial(title: string, key: string): string {
   const parsed = parsePublicKey(key);
   if (!parsed.ok) {
-    throw new Error(`deploy_keys[${title}]: ${parsed.reason}`);
+    throw new Error(
+      `BUG: deploy_keys[${title}] reached plan() with material the shape refuses (${parsed.reason}); the shape refuses it first`,
+    );
   }
   return parsed.material;
 }
@@ -85,7 +89,7 @@ export const deployKeysSection = listSection({
       ...passthrough,
     }),
     // The algorithm is the section's own reading of the material, not a field GitHub echoes, so it stays out of the compare.
-    fromLive: ({ algorithm: _algorithm, ...live }) => live,
+    fromLive: ({ algorithm: _algorithm, ...live }) => ok(live),
     matchBy: {},
   },
   replaces: false,
@@ -114,13 +118,16 @@ export const deployKeysSection = listSection({
   conflicts: {
     declared: (writes) => {
       const titleByMaterial = new Map<string, string>();
-      return writes.flatMap((write) => {
+      return writes.flatMap((write, index) => {
         const first = titleByMaterial.get(String(write.key));
         titleByMaterial.set(String(write.key), write.title);
         return first === undefined
           ? []
           : [
-              `the entries "${first}" and "${write.title}" declare the same key material, and GitHub attaches a public key to one repository once, so the second create would be rejected - keep one entry per key`,
+              {
+                path: `[${index}].key`,
+                message: `the entries "${first}" and "${write.title}" declare the same key material, and GitHub attaches a public key to one repository once, so the second create would be rejected - keep one entry per key`,
+              },
             ];
       });
     },

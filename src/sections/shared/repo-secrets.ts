@@ -7,14 +7,16 @@
  *   .github/scripts/changed-sections.ts     -> derives this file's smoke fan-out from the import graph
  */
 
+import { ok, type Result } from "neverthrow";
 import { z } from "zod";
 import { snapshotSecretReference } from "../../engine/secrets.js";
-import type { SettingsFile } from "../../schema.js";
 import type { MustBeNever, UndeclaredPolicyList } from "../../types.js";
 import { ActionsSecretConfig } from "../actions_secrets/schema.js";
 import { AgentsSecretConfig } from "../agents_secrets/schema.js";
 import { CodespacesSecretConfig } from "../codespaces_secrets/schema.js";
+import type { SectionFailure } from "../contract/errors.js";
 import {
+  type DeclaredIssue,
   defaultUndeclaredPolicy,
   type GraphqlDict,
   type KeyedListLayering,
@@ -23,6 +25,7 @@ import {
   type SectionModule,
   type SectionSnapshot,
   undeclaredPolicy,
+  type ValidatedInput,
 } from "../contract/module.js";
 import type { PatResource } from "../contract/permissions.js";
 import type {
@@ -35,6 +38,7 @@ import type {
 import { DependabotSecretConfig } from "../dependabot_secrets/schema.js";
 import { knobbed, type sealedSecretConfig } from "./schema-helpers.js";
 import {
+  duplicateSecretNameIssues,
   LiveSecretName,
   listSecretValues,
   liveSecretsByKey,
@@ -107,8 +111,6 @@ type RepoSecretsEndpoints<P extends SecretsSegment> = {
   };
 };
 
-type RepoSecretsDeclared<K extends RepoSecretsKey> = Exclude<SettingsFile[K], undefined>;
-
 /**
  * One family's plan() over exactly its own dictionary and declared value (the
  * registry's exactness lockstep); indexed by K so the generic factory can
@@ -117,8 +119,10 @@ type RepoSecretsDeclared<K extends RepoSecretsKey> = Exclude<SettingsFile[K], un
 type RepoSecretsPlan<K extends RepoSecretsKey> = {
   [F in RepoSecretsKey]: (
     ctx: PlanContext<RepoSecretsEndpoints<SecretsSegment<F>>, GraphqlDict, F>,
-    declared: RepoSecretsDeclared<F>,
-  ) => Promise<SectionPlan<PlannedOp<RepoSecretsEndpoints<SecretsSegment<F>>>>>;
+    declared: ValidatedInput<F>,
+  ) => Promise<
+    Result<SectionPlan<PlannedOp<RepoSecretsEndpoints<SecretsSegment<F>>>>, SectionFailure>
+  >;
 }[K];
 
 /**
@@ -130,10 +134,20 @@ type WideEndpoints = RepoSecretsEndpoints<SecretsSegment>;
 
 type WideDeclared = SecretEntry[] | UndeclaredPolicyList<SecretEntry>;
 
-type SharedPlan = (
-  ctx: PlanContext<WideEndpoints>,
-  declared: WideDeclared,
-) => Promise<SectionPlan<PlannedOp<WideEndpoints>>>;
+type WideContext = PlanContext<WideEndpoints>;
+
+type WidePlanned = Promise<Result<SectionPlan<PlannedOp<WideEndpoints>>, SectionFailure>>;
+
+/** The shared implementation's signature at family F (the brand names the family); the lockstep below compares it to the family's own. */
+type SharedPlanAt<F extends RepoSecretsKey> = (
+  ctx: WideContext,
+  declared: ValidatedInput<F>,
+) => WidePlanned;
+
+/** The one implementation: SharedPlanAt, generic over the family it is called as. */
+type SharedPlan = <F extends RepoSecretsKey>(
+  ...args: Parameters<SharedPlanAt<F>>
+) => ReturnType<SharedPlanAt<F>>;
 
 /** What every family's snapshot reads back: one shape, since the four entry slices are identical. */
 type WideSnapshot = { value: UndeclaredPolicyList<SecretEntry> | undefined; notes: string[] };
@@ -142,7 +156,10 @@ type Invariant<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : fals
 
 type _SharedPlanIsEveryFamilyPlan = MustBeNever<
   {
-    [K in RepoSecretsKey]: Invariant<SharedPlan, KeyErasedPlan<RepoSecretsPlan<K>>> extends true
+    [K in RepoSecretsKey]: Invariant<
+      SharedPlanAt<K>,
+      KeyErasedPlan<RepoSecretsPlan<K>>
+    > extends true
       ? never
       : K;
   }[RepoSecretsKey]
@@ -156,7 +173,6 @@ type _SharedPlanIsEveryFamilyPlan = MustBeNever<
  */
 const CLOSED_SURFACE = {
   known: { name: true, value: true },
-  describe: (entry: SecretEntry) => entry.name,
   consequence: "the API body carries only the sealed value, so the key would silently do nothing",
 } satisfies ClosedSurfaceOf<"actions_secrets"> &
   ClosedSurfaceOf<"dependabot_secrets"> &
@@ -175,10 +191,11 @@ export interface RepoSecretsSectionModule<K extends RepoSecretsKey> {
   readonly secretValues: typeof listSecretValues;
   readonly closedSurface: typeof CLOSED_SURFACE;
   readonly layering: KeyedListLayering;
+  readonly validate: (declared: WideDeclared) => readonly DeclaredIssue[];
   readonly plan: RepoSecretsPlan<K>;
   readonly snapshot: (
     ctx: SnapshotContext<RepoSecretsEndpoints<SecretsSegment<K>>, GraphqlDict, K>,
-  ) => Promise<SectionSnapshot<K>>;
+  ) => Promise<Result<SectionSnapshot<K>, SectionFailure>>;
 }
 
 /**
@@ -229,14 +246,15 @@ export function repoSecretsSection<K extends RepoSecretsKey>(family: {
   const wide: WideEndpoints = endpoints;
   const plan: SharedPlan = async (ctx, declared) => {
     const defaultPolicy = defaultUndeclaredPolicy(section);
-    const { policy, entries } = undeclaredPolicy(declared, defaultPolicy);
+    const wideDeclared: WideDeclared = declared;
+    const { policy, entries } = undeclaredPolicy(wideDeclared, defaultPolicy);
     // Built where the routes are known, so params typecheck.
     type Op = PlannedOp<WideEndpoints>;
     type Described<R extends Op["role"]> = Extract<Op, { role: R }> & { readonly describe: string };
     const scope: SecretsPlanScope<Described<"put">, Described<"remove">> = {
       label: key,
       noun,
-      list: async () => ctx.read.list.listAllEnveloped("secrets", LiveSecretName),
+      list: () => ctx.read.list.listAllEnveloped("secrets", LiveSecretName),
       publicKey: (exec, describe) => ctx.read.publicKey.call(exec, z.unknown(), { describe }),
       publicKeyEndpoint: wide.publicKey,
       put: (write) => ({
@@ -261,21 +279,25 @@ export function repoSecretsSection<K extends RepoSecretsKey>(family: {
   // GitHub lists names only, so each entry carries the per-store reference the operator must
   // export before an apply, and a note says so per secret. The engine's index hands back the
   // uppercase keys GitHub stores and the planner compares by, so the reference grammar holds.
-  const snapshot = async (ctx: SnapshotContext<WideEndpoints>): Promise<WideSnapshot> => {
-    const live = await ctx.read.list.listAllEnveloped("secrets", LiveSecretName);
-    if (live.length === 0) {
-      return { value: undefined, notes: [] };
-    }
-    const references = [...liveSecretsByKey(section, noun, live).keys()].map((name) => ({
-      name,
-      ...snapshotSecretReference(pathSegment, name),
-    }));
-    const entries = references.map(({ name, reference }) => ({ name, value: reference }));
-    const notes = references.map(({ name, variable }) =>
-      unreadableSecretNote(`${key}[${name}]`, name, variable),
-    );
-    return { value: knobbedSnapshot(section, entries), notes };
-  };
+  const snapshot = async (
+    ctx: SnapshotContext<WideEndpoints>,
+  ): Promise<Result<WideSnapshot, SectionFailure>> =>
+    ctx.read.list.listAllEnveloped("secrets", LiveSecretName).andThen((live) => {
+      if (live.length === 0) {
+        return ok<WideSnapshot, SectionFailure>({ value: undefined, notes: [] });
+      }
+      return liveSecretsByKey(section, noun, live).map((byKey) => {
+        const references = [...byKey.keys()].map((name) => ({
+          name,
+          ...snapshotSecretReference(pathSegment, name),
+        }));
+        const entries = references.map(({ name, reference }) => ({ name, value: reference }));
+        const notes = references.map(({ name, variable }) =>
+          unreadableSecretNote(`${key}[${name}]`, name, variable),
+        );
+        return { value: knobbedSnapshot(section, entries), notes };
+      });
+    });
 
   const section: RepoSecretsSectionModule<K> = {
     key,
@@ -286,6 +308,7 @@ export function repoSecretsSection<K extends RepoSecretsKey>(family: {
     secretValues: listSecretValues,
     closedSurface: CLOSED_SURFACE,
     layering: keyedBy("name", { fold: secretKey }),
+    validate: (declared) => duplicateSecretNameIssues(declared, "secret"),
     plan,
     // The family's port is the wide port at one segment; the cast is that boundary.
     snapshot: (ctx) => snapshot(ctx as SnapshotContext<WideEndpoints, GraphqlDict, K>),

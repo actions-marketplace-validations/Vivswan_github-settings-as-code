@@ -148,17 +148,6 @@ const SPECIMENS = {
     { code: "settings-not-plain-mapping", source: "f.yml" },
     'f.yml must be a plain YAML mapping of section names to settings, but its top level parsed as another type (a YAML-tagged value like !!timestamp parses to a Date). Rewrite the top level as "section: ..." keys',
   ],
-  "settings-unknown-sections": [
-    { code: "settings-unknown-sections", source: "f.yml", unknown: ["labls"], known: SECTION_KEYS },
-    `unknown top-level section in f.yml: labls (known: ${KNOWN}). Fix the typo, or set the "sections" input to limit processing`,
-  ],
-  "settings-unknown-directives": [
-    { code: "settings-unknown-directives", source: "f.yml", unknown: ["_notes", "_layerin"] },
-    "unknown underscore keys in f.yml: _notes, _layerin. The underscore marks this action's " +
-      "directives, \"_layering\" (a file's top level or a list section's {entries} wrapper) and " +
-      '"_undeclared" (a wrapper), and nothing else; there are no private-note keys. Remove the key, ' +
-      "or keep the note as a YAML comment",
-  ],
   "settings-malformed-sections": [
     {
       code: "settings-malformed-sections",
@@ -219,6 +208,24 @@ const SPECIMENS = {
       second: 2,
     },
     'layer "repo": labels[0] and labels[2] both claim one name; each name belongs to one entry within a layer',
+  ],
+  "layer-remove-not-true": [
+    { code: "layer-remove-not-true", layer: "repo", site: "labels[1]._remove", actual: "yes" },
+    'layer "repo": labels[1]._remove takes only true; got a string. Write _remove: true to drop the lower entry, or remove the key to keep it',
+  ],
+  "layer-remove-with-fields": [
+    {
+      code: "layer-remove-with-fields",
+      layer: "repo",
+      site: "labels[1]",
+      keyPaths: ["name"],
+      extra: ["color", "description"],
+    },
+    'layer "repo": labels[1] carries _remove: true beside "color", "description"; a removal names its name and nothing else. Drop the fields, or the marker',
+  ],
+  "layer-remove-nothing": [
+    { code: "layer-remove-nothing", layer: "repo", site: "labels[1]", reason: "unmatched" },
+    'layer "repo": labels[1] carries _remove: true, but no lower layer declares an entry under its key. Remove the entry, or fix its key',
   ],
   "rendered-file-is-layer": [
     { code: "rendered-file-is-layer", renderedFile: "./repo.yml", index: 1, layer: "repo.yml" },
@@ -347,23 +354,6 @@ describe("describeProblem", () => {
       "one filter beside a single-repo snapshot reads in the singular",
       { code: "discovery-filters-without-wildcard", filters: ["forks"], targets: "snapshot-file" },
       'the discovery filter input "forks" only applies to repos: "*" discovery, but this snapshot targets one repository. Set repos: "*" with snapshot-dir to discover repositories, or remove the filter input',
-    ],
-    [
-      "two unknown sections read in the plural",
-      {
-        code: "settings-unknown-sections",
-        source: "f.yml",
-        unknown: ["labls", "rulesest"],
-        known: SECTION_KEYS,
-      },
-      `unknown top-level sections in f.yml: labls, rulesest (known: ${KNOWN}). Fix the typo, or set the "sections" input to limit processing`,
-    ],
-    [
-      "one unknown underscore key reads in the singular",
-      { code: "settings-unknown-directives", source: "f.yml", unknown: ["_notes"] },
-      "unknown underscore key in f.yml: _notes. The underscore marks this action's directives, " +
-        '"_layering" (a file\'s top level or a list section\'s {entries} wrapper) and "_undeclared" (a wrapper), and nothing else; ' +
-        "there are no private-note keys. Remove the key, or keep the note as a YAML comment",
     ],
     [
       "one invalid repos-dir file reads in the singular",

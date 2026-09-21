@@ -4,14 +4,17 @@
  * nested secrets (../environments/nested.ts) plan through it.
  */
 
+import { err, ok, type Result } from "neverthrow";
 import { z } from "zod";
-import type { UndeclaredPolicy } from "../../types.js";
+import type { UndeclaredPolicy, UndeclaredPolicyList } from "../../types.js";
 import { type EndpointDecl, endpointPath } from "../contract/endpoints.js";
-import { raise } from "../contract/errors.js";
+import { type SectionFailure, sectionFailure } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
   cannotVerifyNote,
+  type DeclaredIssue,
   type DeclaredSecretValue,
+  duplicateFieldIssues,
   missingDrift,
   type SectionMeta,
   secretValuesOf,
@@ -19,7 +22,6 @@ import {
   undeclaredNote,
 } from "../contract/module.js";
 import type { ExecTools, SectionPlan } from "../contract/plan.js";
-import { rejectDuplicates } from "../contract/requests.js";
 import { decodeBase64, SEALED_BOX_PUBLIC_KEY_BYTES, sealForGithub } from "./sealed-box.js";
 
 export interface SecretEntry {
@@ -49,8 +51,6 @@ export interface SecretsScopeProse {
   where?: string;
   /** Appended to change and describe lines (` in environment "prod"`). */
   suffix?: string;
-  /** What two declared entries under one name are reported as naming, when `<section> entry` understates it (`secret of the "prod" environment`). */
-  what?: string;
 }
 
 /** The payload thunk resolves and seals only when executed, so the plan carries the `$NAME` reference and nothing derived from a value. */
@@ -60,7 +60,7 @@ interface SealedSecretWrite {
   /** What the write is doing, in settings-file terms, for its error prose. */
   readonly describe: string;
   /** Reads the scope's sealing key (once per plan) and seals the resolved plaintext, at execution time. */
-  readonly payload: (exec: ExecTools) => Promise<SealedSecretPayload>;
+  readonly payload: (exec: ExecTools) => Promise<Result<SealedSecretPayload, SectionFailure>>;
   /** The missing-secret line, or empty when the name exists (the PUT recurs by declaration). */
   readonly drift: readonly string[];
   readonly change: string;
@@ -79,12 +79,15 @@ interface UndeclaredSecretDeletion {
 export interface SecretsPlanScope<Put extends AnyPlannedOp, Remove extends AnyPlannedOp>
   extends SecretsScopeProse {
   /** The parsed {name} identities of the enveloped secrets list, all pages. */
-  readonly list: () => Promise<LiveSecretName[]>;
+  readonly list: () => PromiseLike<Result<LiveSecretName[], SectionFailure>>;
   /**
    * GET the {key_id, key} sealing key for this scope, at EXECUTION time: an environment's key exists
    * only once the PUT that creates the environment has landed, so the read rides the first PUT's thunk.
    */
-  readonly publicKey: (exec: ExecTools, describe: string) => Promise<unknown>;
+  readonly publicKey: (
+    exec: ExecTools,
+    describe: string,
+  ) => PromiseLike<Result<unknown, SectionFailure>>;
   /** The declaration behind `publicKey`, named in the prose of a key the endpoint cannot supply. */
   readonly publicKeyEndpoint: EndpointDecl;
   /** The planned sealed PUT; function-valued so a builder demanding an unsupplied facet fails. */
@@ -112,24 +115,15 @@ export function listSecretValues(declared: unknown): DeclaredSecretValue[] {
 }
 
 /**
- * GitHub folds two names equal uppercased into one secret, so the last write would silently win on
- * every run. planSecrets runs it before its read, so no scope can skip it; `what` names the resource
- * when "<section> entry" understates it (a nested scope's).
+ * GitHub folds two names equal uppercased into one secret, so the last write would silently win on every
+ * run. Every scope's validate hook runs it over its declared value in either form (planSecrets trusts the
+ * document); `what` names the resource ("secret", `secret of the "prod" environment`).
  */
-export function rejectDuplicateSecretNames(
-  section: SectionMeta,
-  entries: readonly SecretEntry[],
-  what?: string,
-): void {
-  raise(
-    rejectDuplicates(
-      section,
-      entries,
-      (entry) => secretKey(entry.name),
-      (entry) => entry.name,
-      what,
-    ),
-  );
+export function duplicateSecretNameIssues(
+  declared: readonly SecretEntry[] | UndeclaredPolicyList<SecretEntry>,
+  what: string,
+): DeclaredIssue[] {
+  return duplicateFieldIssues(declared, { field: "name", fold: secretKey }, what);
 }
 
 export interface SealingKey {
@@ -144,9 +138,16 @@ export function parseSealingKey(
   scope: Pick<SecretsScopeProse, "label">,
   endpoint: EndpointDecl,
   data: unknown,
-): SealingKey {
+): Result<SealingKey, SectionFailure> {
   const advice = `Check the "api-version" input against the GitHub REST docs for this endpoint`;
   const where = `${section.key}: GET ${endpointPath(endpoint.route)} (the ${scope.label} sealing key)`;
+  const unusable = (reason: string): Result<never, SectionFailure> =>
+    err(
+      sectionFailure(
+        "live-shape",
+        `${where} returned ${reason}, so no value can be sealed. ${advice}`,
+      ),
+    );
   const body = (data ?? {}) as { key_id?: unknown; key?: unknown };
   const keyId = body.key_id;
   const publicKey = body.key;
@@ -165,35 +166,28 @@ export function parseSealingKey(
             ? `${label} is empty`
             : null;
     const defect = fieldDefect("key_id", keyId) ?? fieldDefect("key", publicKey);
-    throw new Error(
-      `${where} returned no usable {key_id, key} pair (${defect}), so no value can be sealed. ${advice}`,
-    );
+    return unusable(`no usable {key_id, key} pair (${defect})`);
   }
-  let keyBytes: Uint8Array;
-  try {
-    keyBytes = decodeBase64(publicKey);
-  } catch {
-    throw new Error(
-      `${where} returned a key that is not valid base64, so no value can be sealed. ${advice}`,
-    );
+  const decoded = decodeBase64(publicKey);
+  if (decoded.isErr()) {
+    return unusable("a key that is not valid base64");
   }
+  const keyBytes = decoded.value;
   if (keyBytes.length !== SEALED_BOX_PUBLIC_KEY_BYTES) {
-    throw new Error(
-      `${where} returned a key that decodes to ${keyBytes.length} bytes where an X25519 public key has ${SEALED_BOX_PUBLIC_KEY_BYTES}, so no value can be sealed. ${advice}`,
+    return unusable(
+      `a key that decodes to ${keyBytes.length} bytes where an X25519 public key has ${SEALED_BOX_PUBLIC_KEY_BYTES}`,
     );
   }
   // Right-sized bytes can still be an unusable point; one probe seal is the exact test.
   try {
     sealForGithub(keyBytes, "");
   } catch {
-    throw new Error(
-      `${where} returned a key that is not a usable X25519 public key, so no value can be sealed. ${advice}`,
-    );
+    return unusable("a key that is not a usable X25519 public key");
   }
-  return {
+  return ok({
     keyId,
     seal: (plaintext) => ({ encrypted_value: sealForGithub(keyBytes, plaintext), key_id: keyId }),
-  };
+  });
 }
 
 /** ONE note per scope (the LFS precedent): values are unverifiable by design. */
@@ -233,17 +227,14 @@ export function liveSecretsByKey(
   section: SectionMeta,
   noun: string,
   live: readonly LiveSecretName[],
-): Map<string, string> {
-  const byKey = raise(
-    liveByIdentity(
-      section,
-      noun,
-      live,
-      (item) => secretKey(item.name),
-      (item) => liveIdentity(item.name),
-    ),
-  );
-  return new Map([...byKey].map(([key, item]) => [key, item.name]));
+): Result<Map<string, string>, SectionFailure> {
+  return liveByIdentity(
+    section,
+    noun,
+    live,
+    (item) => secretKey(item.name),
+    (item) => liveIdentity(item.name),
+  ).map((byKey) => new Map([...byKey].map(([key, item]) => [key, item.name])));
 }
 
 export async function planSecrets<Put extends AnyPlannedOp, Remove extends AnyPlannedOp>(
@@ -258,21 +249,28 @@ export async function planSecrets<Put extends AnyPlannedOp, Remove extends AnyPl
      */
     defaultPolicy: UndeclaredPolicy;
   },
-): Promise<SectionPlan<Put | Remove>> {
+): Promise<Result<SectionPlan<Put | Remove>, SectionFailure>> {
   const { entries, policy, defaultPolicy } = opts;
   const suffix = scope.suffix ?? "";
   const plan: SectionPlan<Put | Remove> = { ops: [], notes: [], drift: [] };
 
-  rejectDuplicateSecretNames(section, entries, scope.what);
-  const liveByKey = liveSecretsByKey(section, scope.noun, await scope.list());
+  const indexed = (await scope.list()).andThen((live) =>
+    liveSecretsByKey(section, scope.noun, live),
+  );
+  if (indexed.isErr()) {
+    return err(indexed.error);
+  }
+  const liveByKey = indexed.value;
   const declaredKeys = new Set(entries.map((entry) => secretKey(entry.name)));
 
   // Read once per scope, by the first payload thunk that runs; the token it demands is the one the thunk received.
-  let sealingKey: Promise<SealingKey> | undefined;
-  const readSealingKey = (exec: ExecTools): Promise<SealingKey> => {
-    sealingKey ??= scope
-      .publicKey(exec, `reading the ${scope.label} sealing key`)
-      .then((body) => parseSealingKey(section, scope, scope.publicKeyEndpoint, body));
+  let sealingKey: Promise<Result<SealingKey, SectionFailure>> | undefined;
+  const readSealingKey = (exec: ExecTools): Promise<Result<SealingKey, SectionFailure>> => {
+    sealingKey ??= Promise.resolve(
+      scope.publicKey(exec, `reading the ${scope.label} sealing key`),
+    ).then((body) =>
+      body.andThen((data) => parseSealingKey(section, scope, scope.publicKeyEndpoint, data)),
+    );
     return sealingKey;
   };
   for (const entry of entries) {
@@ -285,7 +283,7 @@ export async function planSecrets<Put extends AnyPlannedOp, Remove extends AnyPl
         describe: `writing secret "${name}"${suffix}`,
         payload: async (exec) => {
           const plaintext = exec.resolveSecret(entry.value);
-          return (await readSealingKey(exec)).seal(plaintext);
+          return (await readSealingKey(exec)).map((key) => key.seal(plaintext));
         },
         drift: exists
           ? []
@@ -315,5 +313,5 @@ export async function planSecrets<Put extends AnyPlannedOp, Remove extends AnyPl
       );
     }
   }
-  return plan;
+  return ok(plan);
 }

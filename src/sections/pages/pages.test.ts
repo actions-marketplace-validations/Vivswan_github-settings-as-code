@@ -3,7 +3,9 @@ import type { GitHubClient } from "../../../src/github/api.js";
 import { type PlannedOp, planContext } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
+import type { SectionInput } from "../contract/module.js";
 import { pagesSection } from "./index.js";
 
 const GET = "GET /repos/o/r/pages";
@@ -72,8 +74,13 @@ describe("pages shape", () => {
 });
 
 describe("pages", () => {
-  const plan = (api: MockApi, desired: Parameters<typeof pagesSection.plan>[1]) =>
-    pagesSection.plan(planContext(pagesSection, api, REPO), desired);
+  const plan = async (api: MockApi, desired: SectionInput<"pages">) =>
+    unwrap(
+      await pagesSection.plan(
+        planContext(pagesSection, api, REPO),
+        validatedInput("pages", desired),
+      ),
+    );
 
   test("public drift carries the Enterprise Cloud note: github.com reports true and ignores the PUT, so it never converges", async () => {
     const api = new MockApi({ [GET]: { data: { build_type: "workflow", public: true } } });
@@ -168,6 +175,52 @@ describe("pages", () => {
     expect(matching).toEqual({ ops: [], notes: [], drift: [] });
   });
 
+  test("a declared key the site GET never echoes is drift with the never-converges note naming it", async () => {
+    // The site mapping is open so a field GitHub ships tomorrow is declarable, but a key the GET lacks
+    // (a typo of https_enforced here) would re-PUT on every apply; the note says so beside the drift.
+    const api = new MockApi({
+      [GET]: { data: { build_type: "workflow", cname: "docs.example.com", https_enforced: false } },
+    });
+    const result = await plan(api, {
+      cname: "docs.example.com",
+      https_enforce: true,
+    } as SectionInput<"pages">);
+    expect(result.notes).toEqual([
+      'pages: declared key "https_enforce" does not exist on the live Pages site, so if GitHub ignores it this PUT will re-run on every apply without converging. Fix the key name, or remove it from the settings file',
+    ]);
+    expect(result.ops.map((op) => [op.role, op.drift])).toEqual([
+      [
+        "update",
+        [
+          "pages.https_enforce: declared true but the API response has no such field (new or write-only field?)",
+        ],
+      ],
+    ]);
+    // Only a key the GET lacks earns the note: an ordinary value mismatch stays plain drift.
+    const mismatch = await plan(api, { https_enforced: true });
+    expect(mismatch.notes).toEqual([]);
+  });
+
+  test("a site key the GET omits is plain drift the PUT resolves: no note, one PUT, converged", async () => {
+    // GitHub marks https_enforced optional on the site: a site enabled through the create call alone
+    // reports without it until the update sets it. The key is in the site shape, so it is not a phantom.
+    const api = liveRepo({ build_type: "workflow", source: { branch: "main", path: "/" } });
+    const { first, second } = await provePlanIdempotent(pagesSection, api, {
+      https_enforced: true,
+    });
+    expect(first.notes).toEqual([]);
+    expect(first.ops.map((op) => [op.role, op.drift])).toEqual([
+      [
+        "update",
+        [
+          "pages.https_enforced: declared true but the API response has no such field (new or write-only field?)",
+        ],
+      ],
+    ]);
+    expect(api.writes).toEqual(["PUT /repos/o/r/pages"]);
+    expect(second).toEqual({ ops: [], notes: [], drift: [] });
+  });
+
   test("a source without a path gets the default path everywhere", async () => {
     const api = new MockApi({ [GET]: { data: {} } });
     const result = await plan(api, { source: { branch: "main" } });
@@ -191,22 +244,19 @@ describe("pages", () => {
     const result = await plan(api, {
       source: { branch: "main" },
       constructor: "rides along",
-    } as Parameters<typeof pagesSection.plan>[1]);
+    } as SectionInput<"pages">);
     expect(result.ops.map((op) => [op.role, op.payload])).toEqual([
       ["create", { source: { branch: "main", path: "/" } }],
       ["update", { source: { branch: "main", path: "/" }, constructor: "rides along" }],
     ]);
   });
 
-  test("a passthrough value JSON cannot carry is a BUG naming its path, never a wire body", async () => {
-    // The loose shape lets an arbitrary passthrough value through; plainData() is where only a JSON-plain one may leave.
-    const api = new MockApi({ [GET]: { data: {} } });
-    await expect(
-      plan(api, { cname: "docs.example.com", hook: () => "x" } as unknown as Parameters<
-        typeof pagesSection.plan
-      >[1]),
-    ).rejects.toThrow(/BUG: a planned payload carries a value JSON cannot carry at hook/);
-    expect(api.mutations()).toEqual([]);
+  test("a passthrough value JSON cannot carry is refused by validation naming its path, so plan() never meets it", () => {
+    // The loose shape lets an arbitrary passthrough value through; document validation walks the parsed output and
+    // refuses it, and plan() takes only validated input, so no planned payload can carry it to the wire.
+    expect(() => validatedInput("pages", { cname: "docs.example.com", hook: () => "x" })).toThrow(
+      "pages.hook is not plain YAML data (a function); replace it with a plain value",
+    );
   });
 
   test("pages: null disables a live site and notes the ambiguous absence of one", async () => {

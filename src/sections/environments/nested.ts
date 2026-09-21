@@ -1,16 +1,39 @@
+import { ok, okAsync, type Result } from "neverthrow";
 import { z } from "zod";
 import type { MustBeNever, UndeclaredPolicy, UndeclaredPolicyList } from "../../types.js";
-import { type EntryOf, type SectionMeta, undeclaredPolicy } from "../contract/module.js";
-import { LiveSecretName, planSecrets, type SecretsPlanScope } from "../shared/secrets-engine.js";
+import type { SectionFailure } from "../contract/errors.js";
 import {
+  type DeclaredIssue,
+  declaredEntries,
+  type EntryOf,
+  type SectionMeta,
+  undeclaredPolicy,
+} from "../contract/module.js";
+import type { Read } from "../contract/plan.js";
+import {
+  duplicateSecretNameIssues,
+  LiveSecretName,
+  planSecrets,
+  type SecretsPlanScope,
+} from "../shared/secrets-engine.js";
+import {
+  duplicateVariableNameIssues,
   LiveVariable,
   planVariables,
   type VariablesPlanScope,
 } from "../shared/variables-engine.js";
-import { BRANCH_POLICIES_DEFAULT_POLICY, planBranchPolicies } from "./branch-policies.js";
+import {
+  BRANCH_POLICIES_DEFAULT_POLICY,
+  duplicateBranchPolicyIssues,
+  planBranchPolicies,
+} from "./branch-policies.js";
 import { ENDPOINTS, type EnvironmentRestOp, type EnvironmentsRestContext } from "./endpoints.js";
 import type { LiveEnvironmentBody } from "./index.js";
-import { PROTECTION_RULES_DEFAULT_POLICY, planProtectionRules } from "./protection-rules.js";
+import {
+  duplicateProtectionRuleIssues,
+  PROTECTION_RULES_DEFAULT_POLICY,
+  planProtectionRules,
+} from "./protection-rules.js";
 import type {
   EnvironmentConfig,
   EnvironmentRoutedScalars,
@@ -57,7 +80,6 @@ export interface NestedPlan {
 /**
  * Function-valued properties, not method shorthand: method parameters check bivariantly,
  * properties strictly, so a planner paired with the wrong key's entry type is a compile error.
- * Each planner guards its own declared list against duplicates before its first read.
  */
 interface NestedPlanner<K extends NestedKey> {
   /**
@@ -70,6 +92,8 @@ interface NestedPlanner<K extends NestedKey> {
    * so every entry plans as a create against an empty environment.
    */
   missingNote: (envName: string) => string;
+  /** The list's file-only checks (two entries naming one resource), run by the section's validate hook; plan() trusts them. */
+  validate: (entries: readonly NestedEntry<K>[], envName: string) => readonly DeclaredIssue[];
   plan: (
     ctx: EnvironmentsRestContext,
     section: SectionMeta,
@@ -81,7 +105,7 @@ interface NestedPlanner<K extends NestedKey> {
      * so the planner reads nothing and plans every entry as a create.
      */
     liveEnv: LiveEnvironmentBody | undefined,
-  ) => Promise<NestedPlan>;
+  ) => Promise<Result<NestedPlan, SectionFailure>>;
 }
 
 const NESTED_PLANNERS: { [K in NestedKey]: NestedPlanner<K> } = {
@@ -91,6 +115,8 @@ const NESTED_PLANNERS: { [K in NestedKey]: NestedPlanner<K> } = {
     defaultPolicy: "delete",
     missingNote: (envName) =>
       `environments[${envName}].variables: not verifiable while the environment is missing; apply will create the environment and reconcile the declared variables`,
+    validate: (entries, envName) =>
+      duplicateVariableNameIssues(entries, `variable of the "${envName}" environment`),
     plan: planEnvironmentVariables,
   },
   secrets: {
@@ -99,23 +125,30 @@ const NESTED_PLANNERS: { [K in NestedKey]: NestedPlanner<K> } = {
     defaultPolicy: "keep",
     missingNote: (envName) =>
       `environments[${envName}].secrets: not verifiable while the environment is missing; apply will create the environment and reconcile the declared secrets`,
+    validate: (entries, envName) =>
+      duplicateSecretNameIssues(entries, `secret of the "${envName}" environment`),
     plan: planEnvironmentSecrets,
   },
   deployment_branch_policies: {
     defaultPolicy: BRANCH_POLICIES_DEFAULT_POLICY,
     missingNote: (envName) =>
       `environments[${envName}].deployment_branch_policies: not verifiable while the environment is missing; apply will create the environment and reconcile the declared patterns`,
+    validate: duplicateBranchPolicyIssues,
     plan: planBranchPolicies,
   },
   deployment_protection_rules: {
     defaultPolicy: PROTECTION_RULES_DEFAULT_POLICY,
     missingNote: (envName) =>
       `environments[${envName}].deployment_protection_rules: not verifiable while the environment is missing; apply will create the environment and reconcile the declared protection rules`,
+    validate: duplicateProtectionRuleIssues,
     plan: planProtectionRules,
   },
 };
 
 /**
+ * The policy a validated document carries on the nested wrapper is the resolved one (the wrapper's own, else the
+ * file's `_undeclared`, else the run's `undeclared` input, else this table's default, resolved once in
+ * engine/layers.ts); the table default here is the last fallback and the words the drift prose uses.
  * Generic over K so the table default and the declared value stay correlated to one literal key.
  * The parameter is spelled NonNullable<EnvironmentConfig[K]>, not the identical NestedDeclared[K]:
  * tsc relates the guarded env[key] to the former directly, while the mapped-type spelling falls
@@ -136,6 +169,22 @@ export function nestedDefaultPolicy(key: NestedKey): UndeclaredPolicy {
   return NESTED_PLANNERS[key].defaultPolicy;
 }
 
+/** Every nested list's file-only checks for one environment entry, each issue under `.<key>` (`.entries` in the wrapped form). */
+export function validateNested(env: EnvironmentConfig): DeclaredIssue[] {
+  return NESTED_KEYS.flatMap(<K extends NestedKey>(key: K): DeclaredIssue[] => {
+    const declared = env[key];
+    if (declared === undefined) {
+      return [];
+    }
+    const { entries, path } = declaredEntries(
+      declared as readonly NestedEntry<K>[] | UndeclaredPolicyList<NestedEntry<K>>,
+    );
+    return NESTED_PLANNERS[key]
+      .validate(entries, env.name)
+      .map((issue) => ({ ...issue, path: `.${key}${path}${issue.path}` }));
+  });
+}
+
 export async function planNested<K extends NestedKey>(
   ctx: EnvironmentsRestContext,
   section: SectionMeta,
@@ -143,18 +192,17 @@ export async function planNested<K extends NestedKey>(
   envName: string,
   nested: Pick<EnvironmentConfig, NestedKey>,
   liveEnv: LiveEnvironmentBody | undefined,
-): Promise<NestedPlan> {
+): Promise<Result<NestedPlan, SectionFailure>> {
   const declared = nested[key];
   if (declared === undefined) {
-    return { ops: [], notes: [] };
+    return ok({ ops: [], notes: [] });
   }
   const { policy, entries } = unwrapNested(key, declared);
   const planner = NESTED_PLANNERS[key];
-  const planned = await planner.plan(ctx, section, envName, policy, entries, liveEnv);
-  return {
+  return (await planner.plan(ctx, section, envName, policy, entries, liveEnv)).map((planned) => ({
     ops: planned.ops,
     notes: liveEnv === undefined ? [planner.missingNote(envName), ...planned.notes] : planned.notes,
-  };
+  }));
 }
 
 /**
@@ -197,10 +245,10 @@ export function splitEntry(env: EnvironmentConfig): {
 }
 
 /** One environment's live Actions variables. */
-export async function listEnvironmentVariables(
+export function listEnvironmentVariables(
   ctx: EnvironmentsRestContext,
   envName: string,
-): Promise<LiveVariable[]> {
+): Read<LiveVariable[]> {
   return ctx.read.listVariables.listAllEnveloped("variables", LiveVariable, {
     params: { environment_name: envName },
     describe: `environment "${envName}"`,
@@ -210,7 +258,7 @@ export async function listEnvironmentVariables(
 /**
  * The words the two engines render one environment's nested lists with. A variable's kept note names
  * the environment (two environments holding the same undeclared name would otherwise emit one note
- * twice); a secret's noun already carries it. `what` names a duplicate declared pair's resource.
+ * twice); a secret's noun already carries it.
  */
 function nestedProse(envName: string, key: "variables" | "secrets", noun: string) {
   return {
@@ -218,7 +266,6 @@ function nestedProse(envName: string, key: "variables" | "secrets", noun: string
     noun,
     where: key === "variables" ? `environment "${envName}"` : "the environment",
     suffix: ` in environment "${envName}"`,
-    what: `${key === "variables" ? "variable" : "secret"} of the "${envName}" environment`,
   };
 }
 
@@ -232,7 +279,7 @@ async function planEnvironmentVariables(
   policy: UndeclaredPolicy,
   entries: readonly EnvironmentVariableConfig[],
   liveEnv: LiveEnvironmentBody | undefined,
-): Promise<NestedPlan> {
+): Promise<Result<NestedPlan, SectionFailure>> {
   const params = { environment_name: envName };
   const scope: VariablesPlanScope<
     Op<"createVariable">,
@@ -240,7 +287,7 @@ async function planEnvironmentVariables(
     Op<"removeVariable">
   > = {
     ...nestedProse(envName, "variables", "variable"),
-    list: async () => (liveEnv === undefined ? [] : await listEnvironmentVariables(ctx, envName)),
+    list: () => (liveEnv === undefined ? okAsync([]) : listEnvironmentVariables(ctx, envName)),
     create: (write) => ({
       role: "createVariable",
       params,
@@ -265,19 +312,20 @@ async function planEnvironmentVariables(
       describe: deletion.describe,
     }),
   };
-  const planned = await planVariables(section, scope, {
-    entries,
-    policy,
-    defaultPolicy: NESTED_PLANNERS.variables.defaultPolicy,
-  });
-  return { ops: planned.ops, notes: planned.notes };
+  return (
+    await planVariables(section, scope, {
+      entries,
+      policy,
+      defaultPolicy: NESTED_PLANNERS.variables.defaultPolicy,
+    })
+  ).map((planned) => ({ ops: planned.ops, notes: planned.notes }));
 }
 
 /** One environment's live Actions secret names (GitHub never lists values). */
-export async function listEnvironmentSecrets(
+export function listEnvironmentSecrets(
   ctx: EnvironmentsRestContext,
   envName: string,
-): Promise<LiveSecretName[]> {
+): Read<LiveSecretName[]> {
   return ctx.read.listSecrets.listAllEnveloped("secrets", LiveSecretName, {
     params: { environment_name: envName },
     describe: `environment "${envName}"`,
@@ -296,11 +344,11 @@ async function planEnvironmentSecrets(
   policy: UndeclaredPolicy,
   entries: readonly EnvironmentSecretConfig[],
   liveEnv: LiveEnvironmentBody | undefined,
-): Promise<NestedPlan> {
+): Promise<Result<NestedPlan, SectionFailure>> {
   const params = { environment_name: envName };
   const scope: SecretsPlanScope<Op<"putSecret">, Op<"removeSecret">> = {
     ...nestedProse(envName, "secrets", `${envName} environment secret`),
-    list: async () => (liveEnv === undefined ? [] : await listEnvironmentSecrets(ctx, envName)),
+    list: () => (liveEnv === undefined ? okAsync([]) : listEnvironmentSecrets(ctx, envName)),
     publicKey: (exec, describe) =>
       ctx.read.secretsPublicKey.call(exec, z.unknown(), { params, describe }),
     publicKeyEndpoint: ENDPOINTS.secretsPublicKey,
@@ -320,10 +368,11 @@ async function planEnvironmentSecrets(
       describe: deletion.describe,
     }),
   };
-  const planned = await planSecrets(section, scope, {
-    entries,
-    policy,
-    defaultPolicy: NESTED_PLANNERS.secrets.defaultPolicy,
-  });
-  return { ops: planned.ops, notes: planned.notes };
+  return (
+    await planSecrets(section, scope, {
+      entries,
+      policy,
+      defaultPolicy: NESTED_PLANNERS.secrets.defaultPolicy,
+    })
+  ).map((planned) => ({ ops: planned.ops, notes: planned.notes }));
 }

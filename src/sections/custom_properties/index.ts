@@ -5,17 +5,22 @@
  * every value rides one write, so there is no per-item create, update, or delete to declare.
  */
 
+import { ok, type Result } from "neverthrow";
 import { z } from "zod";
 import type { EndpointDecl } from "../contract/endpoints.js";
-import { raise } from "../contract/errors.js";
+import type { SectionFailure } from "../contract/errors.js";
 import { liveByIdentity, liveIdentity } from "../contract/live.js";
 import {
+  type DeclaredIssue,
+  declaredEntries,
   defaultUndeclaredPolicy,
+  duplicateFieldIssues,
   keyedBy,
   loosen,
   ORG_PROBE,
   type SectionMeta,
   type SectionModule,
+  type SectionSnapshot,
   undeclaredDrift,
   undeclaredNote,
   undeclaredPolicy,
@@ -23,7 +28,6 @@ import {
 } from "../contract/module.js";
 import type { SectionPermission } from "../contract/permissions.js";
 import type { PlannedOp, SectionPlan } from "../contract/plan.js";
-import { rejectDuplicates } from "../contract/requests.js";
 import { knobbed } from "../shared/schema-helpers.js";
 import { knobbedSnapshot, projectOntoSchema } from "../shared/snapshot-helpers.js";
 import { CustomPropertyConfig } from "./schema.js";
@@ -65,24 +69,31 @@ function show(value: WireValue): string {
  * because GitHub does not document whether [] stores or normalizes to unset, so it could re-write
  * on every apply; value: null is the documented unset.
  */
-function rejectMalformedList(property: CustomPropertyConfig): void {
+function malformedListIssues(property: CustomPropertyConfig, path: string): DeclaredIssue[] {
   if (!Array.isArray(property.value)) {
-    return;
+    return [];
   }
   if (property.value.length === 0) {
-    throw new Error(
-      `custom_properties: the "${property.property_name}" entry declares an empty list; declare value: null to unset the property instead`,
-    );
+    return [
+      {
+        path,
+        message: `the "${property.property_name}" entry declares an empty list; declare value: null to unset the property instead`,
+      },
+    ];
   }
   const seen = new Set<string>();
-  for (const element of property.value) {
+  return property.value.flatMap((element) => {
     if (seen.has(element)) {
-      throw new Error(
-        `custom_properties: the "${property.property_name}" entry lists the value ${JSON.stringify(element)} more than once; a multi_select value is a set, so keep each option exactly once`,
-      );
+      return [
+        {
+          path,
+          message: `the "${property.property_name}" entry lists the value ${JSON.stringify(element)} more than once; a multi_select value is a set, so keep each option exactly once`,
+        },
+      ];
     }
     seen.add(element);
-  }
+    return [];
+  });
 }
 
 const ENDPOINTS = {
@@ -113,15 +124,13 @@ const LiveProperty = z.looseObject({
 function propertiesByName(
   section: SectionMeta,
   live: readonly z.infer<typeof LiveProperty>[],
-): Map<string, z.infer<typeof LiveProperty>> {
-  return raise(
-    liveByIdentity(
-      section,
-      "custom property",
-      live,
-      (p) => p.property_name,
-      (p) => liveIdentity(p.property_name),
-    ),
+): Result<Map<string, z.infer<typeof LiveProperty>>, SectionFailure> {
+  return liveByIdentity(
+    section,
+    "custom property",
+    live,
+    (p) => p.property_name,
+    (p) => liveIdentity(p.property_name),
   );
 }
 
@@ -135,9 +144,9 @@ interface PendingUpdate {
 export const customPropertiesSection = {
   key: "custom_properties",
   undeclaredDefault: "keep",
-  // Verbatim, as plan() passes to rejectDuplicates: GitHub documents no case folding for property names.
+  // Verbatim, the key validate() rejects duplicates by: GitHub documents no case folding for property names.
   // `value: null` unsets the property, so a higher layer's null is the value, never a marker for the lower one.
-  layering: keyedBy("property_name", { nullValued: ["value"] }),
+  layering: keyedBy("property_name"),
   permission,
   // Custom properties exist only under an organization owner; the registry's owner gate (contract/owner.ts)
   // probes the `org` role and no-ops with a note on a personal account.
@@ -148,116 +157,118 @@ export const customPropertiesSection = {
   // destination and is always a typo.
   closedSurface: {
     known: { property_name: true, value: true },
-    describe: (p) => p.property_name,
     consequence:
       "the key would silently never reach GitHub and the misdeclared property would keep its live value",
   },
+  // GitHub documents no case folding for property names, so entries are duplicates only when they match verbatim.
+  validate(declared) {
+    const { entries, path } = declaredEntries(declared);
+    return [
+      ...duplicateFieldIssues(declared, { field: "property_name" }, "custom property"),
+      ...entries.flatMap((property, index) =>
+        malformedListIssues(property, `${path}[${index}].value`),
+      ),
+    ];
+  },
   async plan(ctx, declared) {
     const { policy, entries: desired } = undeclaredPolicy(declared, defaultUndeclaredPolicy(this));
-    // GitHub documents no case folding for property names, so entries are duplicates only when they match verbatim.
-    raise(
-      rejectDuplicates(
-        this,
-        desired,
-        (p) => p.property_name,
-        (p) => p.property_name,
-      ),
-    );
-    for (const property of desired) {
-      rejectMalformedList(property);
-    }
     const plan: SectionPlan<PlannedOp<typeof ENDPOINTS>> = { ops: [], notes: [], drift: [] };
     // Not paginated upstream: one GET carries every value.
-    const live = await ctx.read.list.call(z.array(LiveProperty));
-    const liveByName = propertiesByName(this, live);
-    const declaredNames = new Set(desired.map((p) => p.property_name));
+    return ctx.read.list.call(z.array(LiveProperty)).andThen((live) =>
+      propertiesByName(this, live).map((liveByName) => {
+        const declaredNames = new Set(desired.map((p) => p.property_name));
 
-    // A live null and an absent live entry both mean "unset".
-    const updates: PendingUpdate[] = [];
-    for (const property of desired) {
-      const name = property.property_name;
-      const wanted = normalizeValue(property.value);
-      const current = liveByName.get(name)?.value ?? null;
-      if (sameValue(wanted, current)) {
-        continue;
-      }
-      const label = `custom_properties[${name}]`;
-      updates.push(
-        wanted === null
-          ? {
-              property_name: name,
-              value: null,
-              drift: `${label}: declared null but the live value is ${show(current)}; apply will unset it (reverting to the org default, if any)`,
-              change: `unset custom property "${name}"`,
-            }
-          : {
-              property_name: name,
-              value: wanted,
-              drift: valueDrift(label, show(wanted), show(current)),
-              change: `set custom property "${name}" to ${show(wanted)}`,
-            },
-      );
-    }
-    for (const property of live) {
-      const name = property.property_name;
-      if (declaredNames.has(name) || property.value === null) {
-        continue;
-      }
-      if (policy === "keep") {
-        plan.notes.push(
-          undeclaredNote({
-            subject: `custom property "${name}"`,
-            state: "is set on the repo but not declared",
-            action: "UNSET it",
-          }),
-        );
-        continue;
-      }
-      updates.push({
-        property_name: name,
-        value: null,
-        drift: undeclaredDrift(defaultUndeclaredPolicy(this), {
-          label: `custom_properties[${name}]`,
-          action: "unset it (reverting to the org default, if any)",
-        }),
-        change: `unset undeclared custom property "${name}"`,
-      });
-    }
-    const [first, ...rest] = updates;
-    if (first === undefined) {
-      return plan;
-    }
-    plan.ops.push({
-      role: "update",
-      payload: {
-        properties: updates.map(({ property_name, value }) => ({ property_name, value })),
-      },
-      describe: "updating custom property values",
-      drift: [first.drift, ...rest.map((update) => update.drift)],
-      change: () => [first.change, ...rest.map((update) => update.change)] as const,
-    });
-    return plan;
+        // A live null and an absent live entry both mean "unset".
+        const updates: PendingUpdate[] = [];
+        for (const property of desired) {
+          const name = property.property_name;
+          const wanted = normalizeValue(property.value);
+          const current = liveByName.get(name)?.value ?? null;
+          if (sameValue(wanted, current)) {
+            continue;
+          }
+          const label = `custom_properties[${name}]`;
+          updates.push(
+            wanted === null
+              ? {
+                  property_name: name,
+                  value: null,
+                  drift: `${label}: declared null but the live value is ${show(current)}; apply will unset it (reverting to the org default, if any)`,
+                  change: `unset custom property "${name}"`,
+                }
+              : {
+                  property_name: name,
+                  value: wanted,
+                  drift: valueDrift(label, show(wanted), show(current)),
+                  change: `set custom property "${name}" to ${show(wanted)}`,
+                },
+          );
+        }
+        for (const property of live) {
+          const name = property.property_name;
+          if (declaredNames.has(name) || property.value === null) {
+            continue;
+          }
+          if (policy === "keep") {
+            plan.notes.push(
+              undeclaredNote({
+                subject: `custom property "${name}"`,
+                state: "is set on the repo but not declared",
+                action: "UNSET it",
+              }),
+            );
+            continue;
+          }
+          updates.push({
+            property_name: name,
+            value: null,
+            drift: undeclaredDrift(defaultUndeclaredPolicy(this), {
+              label: `custom_properties[${name}]`,
+              action: "unset it (reverting to the org default, if any)",
+            }),
+            change: `unset undeclared custom property "${name}"`,
+          });
+        }
+        const [first, ...rest] = updates;
+        if (first === undefined) {
+          return plan;
+        }
+        plan.ops.push({
+          role: "update",
+          payload: {
+            properties: updates.map(({ property_name, value }) => ({ property_name, value })),
+          },
+          describe: "updating custom property values",
+          drift: [first.drift, ...rest.map((update) => update.drift)],
+          change: () => ok([first.change, ...rest.map((update) => update.change)] as const),
+        });
+        return plan;
+      }),
+    );
   },
   // An unset (null) live value is the org default, which no declaration needs to restate; an empty
-  // list is read the same way (the planner refuses `[]`, whose storage GitHub leaves undocumented).
+  // list is read the same way (the validate hook refuses a declared `[]`, whose storage GitHub
+  // leaves undocumented).
   // A list reads back as the SET the planner compares, so a live duplicate option is dropped.
   async snapshot(ctx) {
-    const live = await ctx.read.list.call(z.array(LiveProperty));
-    propertiesByName(this, live);
-    const set = live.flatMap((property) => {
-      if (property.value === null) {
-        return [];
-      }
-      if (!Array.isArray(property.value)) {
-        return [property];
-      }
-      const options = [...new Set(property.value)];
-      return options.length === 0 ? [] : [{ ...property, value: options }];
-    });
-    if (set.length === 0) {
-      return { value: undefined, notes: [] };
-    }
-    const entries = set.map((property) => projectOntoSchema(CustomPropertyConfig, property));
-    return { value: knobbedSnapshot(this, entries), notes: [] };
+    return ctx.read.list.call(z.array(LiveProperty)).andThen((live) =>
+      propertiesByName(this, live).map((): SectionSnapshot<"custom_properties"> => {
+        const set = live.flatMap((property) => {
+          if (property.value === null) {
+            return [];
+          }
+          if (!Array.isArray(property.value)) {
+            return [property];
+          }
+          const options = [...new Set(property.value)];
+          return options.length === 0 ? [] : [{ ...property, value: options }];
+        });
+        if (set.length === 0) {
+          return { value: undefined, notes: [] };
+        }
+        const entries = set.map((property) => projectOntoSchema(CustomPropertyConfig, property));
+        return { value: knobbedSnapshot(this, entries), notes: [] };
+      }),
+    );
   },
 } satisfies SectionModule<"custom_properties", typeof ENDPOINTS>;

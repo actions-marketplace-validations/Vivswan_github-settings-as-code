@@ -3,7 +3,9 @@ import type { GitHubClient } from "../../../src/github/api.js";
 import { type PlannedOp, planContext } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
+import type { SectionInput } from "../contract/module.js";
 import { workflowsSection } from "./index.js";
 
 /** A live workflow as the list endpoint returns it. */
@@ -47,8 +49,13 @@ describe("workflows", () => {
     ],
   };
   const route = "GET /repos/o/r/actions/workflows?per_page=100&page=1";
-  const plan = (api: MockApi, desired: Parameters<typeof workflowsSection.plan>[1]) =>
-    workflowsSection.plan(planContext(workflowsSection, api, REPO), desired);
+  const plan = async (api: MockApi, desired: SectionInput<"workflows">) =>
+    unwrap(
+      await workflowsSection.plan(
+        planContext(workflowsSection, api, REPO),
+        validatedInput("workflows", desired),
+      ),
+    );
 
   test("plans one toggle per divergent workflow by live id, matching bare file names", async () => {
     const api = new MockApi({ [route]: { data: liveWorkflows } });
@@ -100,15 +107,19 @@ describe("workflows", () => {
     ]);
   });
 
-  test("duplicate declarations for the same file are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("duplicate declarations for the same file under two spellings are a validate issue, so the document fails before any API call", () => {
+    expect(
+      workflowsSection.validate([
         { path: "ci.yml", state: "disabled" },
         { path: ".github/workflows/ci.yml", state: "active" },
       ]),
-    ).rejects.toThrow(/same workflows entry/);
-    expect(api.calls).toHaveLength(0);
+    ).toEqual([
+      {
+        path: "[1].path",
+        message:
+          '".github/workflows/ci.yml" names the same workflow as "ci.yml" declared earlier; keep exactly one entry per workflow',
+      },
+    ]);
   });
 
   test("the workflows envelope paginates past the first page", async () => {

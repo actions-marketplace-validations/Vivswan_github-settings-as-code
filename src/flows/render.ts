@@ -4,17 +4,16 @@
  */
 
 import { err, ok, type Result } from "neverthrow";
-import { describeOptOut, type Layering } from "../engine/layers.js";
+import { describeRemoval, type FoldOptions } from "../engine/layers.js";
 import type { Io } from "../io.js";
 import type { Problem, ProblemOf } from "../problem.js";
 import type { FinishedRender } from "./deliver.js";
 import { foldLayers, readLayerFiles } from "./layers.js";
 import { readEntries, renameEntry, writeReplacing } from "./settings-write.js";
 
-export interface RenderConfig {
+export interface RenderConfig extends FoldOptions {
   settingsFiles: string[];
   renderedFile: string;
-  layering: Layering;
 }
 
 const RENDERED_LABEL = "the rendered settings document";
@@ -44,10 +43,17 @@ function renderedFileCollision(
 export function runRender(cfg: RenderConfig, io: Io): Result<FinishedRender, Problem> {
   return renderedFileCollision(cfg)
     .andThen(() => readLayerFiles(cfg.settingsFiles))
-    .andThen((layers) => foldLayers(layers, RENDERED_LABEL, cfg.layering, io))
+    .andThen((layers) =>
+      foldLayers(
+        layers,
+        RENDERED_LABEL,
+        { layering: cfg.layering, undeclared: cfg.undeclared },
+        io,
+      ),
+    )
     .andThen((folded): Result<FinishedRender, Problem> => {
       for (const notice of folded.notices) {
-        io.annotate("notice", describeOptOut(notice));
+        io.annotate("notice", describeRemoval(notice));
       }
       return writeReplacing(cfg.renderedFile, folded.yaml)
         .mapErr(

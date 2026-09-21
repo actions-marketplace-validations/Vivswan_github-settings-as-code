@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { err } from "neverthrow";
+import { err, ok } from "neverthrow";
 
 import {
   preflightProbe,
@@ -11,7 +11,13 @@ import {
 } from "../../src/engine/orchestrate.js";
 import { SectionSelection } from "../../src/engine/section-selection.js";
 import { silentIo } from "../../src/io.js";
-import { describeProblem, type TopLevelShape } from "../../src/problem.js";
+import {
+  describeProblem,
+  singleDocumentRemovalIssue,
+  type TopLevelShape,
+  unknownDirectivesIssue,
+  unknownSectionsIssue,
+} from "../../src/problem.js";
 import { SECTION_KEYS, type SettingsFile } from "../../src/schema.js";
 import type { SectionModule } from "../../src/sections/contract/module.js";
 import type { SectionPlan } from "../../src/sections/contract/plan.js";
@@ -120,7 +126,7 @@ describe("runForRepo", () => {
       desired: unknown,
     ) => {
       received.push(desired);
-      return { ops: [], notes: [], drift: [] };
+      return ok({ ops: [], notes: [], drift: [] });
     }) as never);
     try {
       const result = await runForRepo(
@@ -165,7 +171,7 @@ describe("runForRepo", () => {
     expect(desired.extra).toBe(raw.pages.extra);
   });
 
-  test("a knobbed list section receives zod's parsed copy in both forms: a fresh list or wrapper, own __proto__ dropped on each entry", async () => {
+  test("a knobbed list section receives zod's parsed copy in both forms, resolved to the wrapper with its policy explicit, own __proto__ dropped on each entry", async () => {
     const plain = JSON.parse('{"rulesets":[{"name":"r","__proto__":{"planted":1}}]}');
     const wrapped = JSON.parse(
       '{"rulesets":{"_undeclared":"keep","entries":[{"name":"r","__proto__":{"planted":1}}]}}',
@@ -173,12 +179,14 @@ describe("runForRepo", () => {
     expect(Object.hasOwn(plain.rulesets[0], "__proto__")).toBe(true);
     expect(Object.hasOwn(wrapped.rulesets.entries[0], "__proto__")).toBe(true);
 
-    const [plainDesired] = (await receivedBy(rulesetsSection, plain)) as [object[]];
-    expect(plainDesired).not.toBe(plain.rulesets);
+    const [plainDesired] = (await receivedBy(rulesetsSection, plain)) as [
+      { _undeclared: string; entries: object[] },
+    ];
+    expect(plainDesired.entries).not.toBe(plain.rulesets);
     // The parsed copy also carries the slice's defaults (target, enforcement).
     const parsedEntry = { name: "r", target: "branch", enforcement: "active" };
-    expect(plainDesired).toEqual([parsedEntry]);
-    prototypeClean(plainDesired[0] as object);
+    expect(plainDesired).toEqual({ _undeclared: "keep", entries: [parsedEntry] });
+    prototypeClean(plainDesired.entries[0] as object);
 
     const [wrappedDesired] = (await receivedBy(rulesetsSection, wrapped)) as [
       { _undeclared: string; entries: object[] },
@@ -219,8 +227,6 @@ describe("runForRepo secret references", () => {
       api,
       opts({
         settings: webhookSettings("$WEBHOOK_SECRET"),
-        // Spelled out, the way multi.ts runs the defaults document for a fileless target; the unset-variable test below takes the default.
-        secretSource: "operator",
         secretEnv: { WEBHOOK_SECRET: "s3cret-plaintext" },
       }),
       io,
@@ -252,7 +258,7 @@ describe("runForRepo secret references", () => {
     expect(annotations.some((a) => a.includes("$WEBHOOK_SECRET is unset"))).toBe(true);
   });
 
-  test("check mode validates syntax only: an unset variable passes, a literal fails", async () => {
+  test("check mode reads no environment: an unset variable passes", async () => {
     const api = new MockApi({ [HOOKS_LIST]: { data: [] } });
     const { io } = captureIo();
     const unset = await runForRepo(
@@ -261,95 +267,75 @@ describe("runForRepo secret references", () => {
       io,
     );
     expect(unset.result).toBe("drift"); // the declared hook is missing; no env was read
-    const literalApi = new MockApi({});
-    const literal = await runForRepo(
-      literalApi,
-      opts({ mode: "check", settings: webhookSettings("hunter2") }),
-      io,
+  });
+});
+
+describe("validateSettingsDoc secret references", () => {
+  const LITERAL_HOOK = {
+    webhooks: [{ config: { url: "https://x.test/h", secret: "a-literal-that-would-fail" } }],
+    repository: { has_wiki: false },
+  };
+
+  test("a literal in a section the `sections` allowlist excludes is refused all the same", () => {
+    const { io } = captureIo();
+    const only = SectionSelection.of({ only: ["repository"] })._unsafeUnwrap();
+    expect(validateSettingsDoc(LITERAL_HOOK, "f.yml", only, io)).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "f.yml",
+        issues: [
+          'webhooks: the webhook "https://x.test/h" config.secret carries a literal value, but settings files are committed plaintext - ' +
+            "exactly what secret references exist to prevent. Set it to a whole-value $NAME reference and define NAME in the step's env block",
+        ],
+      }),
     );
-    expect(literal.result).toBe("failed");
-    expect(literal.outcomes[0]?.detail[0]).toContain("committed plaintext");
-    // Syntax validation fires before any API call.
-    expect(literalApi.calls).toEqual([]);
+    // The selected section's verdict is the same issue, byte for byte.
+    expect(validateSettingsDoc(LITERAL_HOOK, "f.yml", SectionSelection.ALL, io)).toEqual(
+      validateSettingsDoc(LITERAL_HOOK, "f.yml", only, io),
+    );
   });
 
-  test.each(["apply", "check"] as const)(
-    "a target-sourced reference is refused in %s mode, before any API call",
-    async (mode) => {
-      const api = new MockApi({});
-      const { io, annotations } = captureIo();
-      const result = await runForRepo(
-        api,
-        opts({
-          mode,
-          settings: webhookSettings("$WEBHOOK_SECRET"),
-          secretSource: "target",
-          secretEnv: { WEBHOOK_SECRET: "present-but-irrelevant" },
-        }),
-        io,
-      );
-      expect(result.result).toBe("failed");
-      expect(result.outcomes).toEqual([
-        {
-          key: "webhooks",
-          status: "failed",
-          detail: [expect.stringContaining("target-fetched settings file")],
-        },
-      ]);
-      expect(annotations).toEqual([
-        expect.stringMatching(/^error: webhooks: .*target-fetched settings file/),
-      ]);
-      expect(api.calls).toEqual([]);
-    },
-  );
-
-  test("a section excluded by `sections` cannot fail the run on its references", async () => {
-    const api = new MockApi({ "GET /repos/o/r": { data: { has_wiki: false } } }).allowMutations(
-      "PATCH /repos/o/r",
-    );
+  test("a target-fetched document's reference is refused; the operator default admits it", () => {
     const { io } = captureIo();
-    const result = await runForRepo(
-      api,
-      opts({
-        settings: validated({
-          ...webhookSettings("a-literal-that-would-fail"),
-          repository: { has_wiki: false },
-        }),
-        sections: SectionSelection.of({ only: ["repository"] })._unsafeUnwrap(),
+    const doc = { webhooks: [{ config: { url: "https://x.test/h", secret: "$WEBHOOK_SECRET" } }] };
+    expect(validateSettingsDoc(doc, "f.yml", SectionSelection.ALL, io).isOk()).toBe(true);
+    expect(
+      validateSettingsDoc(doc, "o/r:.github/settings.yml", SectionSelection.ALL, io, {
+        secretSource: "target",
       }),
-      io,
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "o/r:.github/settings.yml",
+        issues: [expect.stringContaining("in a target-fetched settings file")],
+      }),
     );
-    // The excluded section contributes no values, so its literal is never collected, let alone refused.
-    expect(result.result).toBe("applied");
-    expect(result.outcomes.map((o) => [o.key, o.status])).toEqual([
-      ["repository", "applied"],
-      ["webhooks", "excluded"],
-    ]);
   });
 });
 
 describe("validateSettingsDoc", () => {
-  test("unknown top-level keys are a problem naming the source and the known sections", () => {
+  test("unknown top-level keys are one collected line naming the known sections", () => {
     const { io } = captureIo();
     expect(validateSettingsDoc({ labls: [] }, "repos/x.yml", SectionSelection.ALL, io)).toEqual(
       err({
-        code: "settings-unknown-sections",
+        code: "settings-malformed-sections",
         source: "repos/x.yml",
-        unknown: ["labls"],
-        known: SECTION_KEYS,
+        issues: [unknownSectionsIssue(["labls"], SECTION_KEYS)],
       }),
     );
   });
 
-  test("an unknown underscore key is a problem under every allowlist, and it outranks the unknown sections; the document directive passes", () => {
+  test("an unknown underscore key is a problem under every allowlist, listed before the unknown sections; the document directive passes", () => {
     const { io, annotations } = captureIo();
     const doc = { _notes: "private", _layerin: "replace", labls: [], repository: {} };
-    const refused = err({
-      code: "settings-unknown-directives" as const,
-      source: "f.yml",
-      unknown: ["_notes", "_layerin"],
-    });
-    expect(validateSettingsDoc(doc, "f.yml", SectionSelection.ALL, io)).toEqual(refused);
+    const directives = unknownDirectivesIssue(["_notes", "_layerin"]);
+    expect(validateSettingsDoc(doc, "f.yml", SectionSelection.ALL, io)).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "f.yml",
+        issues: [directives, unknownSectionsIssue(["labls"], SECTION_KEYS)],
+      }),
+    );
     // Outside a `sections` allowlist an unknown SECTION only warns; the underscore rule has no such downgrade.
     expect(
       validateSettingsDoc(
@@ -358,8 +344,10 @@ describe("validateSettingsDoc", () => {
         SectionSelection.of({ only: ["repository"] })._unsafeUnwrap(),
         io,
       ),
-    ).toEqual(refused);
-    expect(annotations).toEqual([]);
+    ).toEqual(err({ code: "settings-malformed-sections", source: "f.yml", issues: [directives] }));
+    expect(annotations).toEqual([
+      expect.stringMatching(/^warning: ignoring unknown top-level section outside/),
+    ]);
     expect(
       validateSettingsDoc(
         { _layering: "replace", repository: {} },
@@ -368,6 +356,29 @@ describe("validateSettingsDoc", () => {
         io,
       ).isOk(),
     ).toBe(true);
+  });
+
+  // Each of these once stopped the run alone, so a file with all three took three runs to fix.
+  test("an unknown directive, an unknown section, and a bad enum are reported in one run, in that order", () => {
+    const { io } = captureIo();
+    expect(
+      validateSettingsDoc(
+        { _owner: "notes", labls: [], workflows: [{ path: "ci.yml", state: "paused" }] },
+        "f.yml",
+        SectionSelection.ALL,
+        io,
+      ),
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "f.yml",
+        issues: [
+          unknownDirectivesIssue(["_owner"]),
+          unknownSectionsIssue(["labls"], SECTION_KEYS),
+          expect.stringMatching(/^workflows\[0\]\.state: Invalid option/),
+        ],
+      }),
+    );
   });
 
   test.each<[what: string, doc: unknown, shape: TopLevelShape]>([
@@ -392,6 +403,252 @@ describe("validateSettingsDoc", () => {
       err({ code: "settings-not-plain-mapping" as const, source: "f.yml" }),
     );
   });
+
+  test("a duplicate label and a malformed deploy key beside a valid repository section refuse the document whole, so runForRepo never PATCHes the repository first", () => {
+    const verdict = validateSettingsDoc(
+      {
+        repository: { description: "should never be written" },
+        labels: [{ name: "bug" }, { name: "Bug" }],
+        deploy_keys: [{ title: "ci", key: "ssh-ed25519" }],
+      },
+      "settings.yml",
+      SectionSelection.ALL,
+      silentIo(),
+    );
+    expect(verdict).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "settings.yml",
+        issues: [
+          'labels[1].name: "Bug" names the same label as "bug" declared earlier; keep exactly one entry per label',
+          expect.stringMatching(
+            /^deploy_keys\[0\]\.key: entry "ci": the key has fewer than two fields separated by a space or tab/,
+          ),
+        ],
+      }),
+    );
+  });
+
+  test("a removal entry in a single document is refused by its site, never branded: the open label shape would have carried _remove to GitHub as a field", () => {
+    expect(
+      validateSettingsDoc(
+        {
+          labels: [
+            { name: "old", _remove: true },
+            { name: "new", color: "ffffff" },
+          ],
+        },
+        "settings.yml",
+        SectionSelection.ALL,
+        silentIo(),
+      ),
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "settings.yml",
+        issues: [
+          "labels[0]._remove: a single document has no lower layer to remove from; _remove: true belongs in a higher layer of a fold (mode: render)",
+        ],
+      }),
+    );
+  });
+
+  test.each<[form: string, doc: unknown, sites: string[]]>([
+    [
+      "a wrapper's entries",
+      { labels: { _undeclared: "keep", entries: [{ name: "old", _remove: true }] } },
+      ["labels[0]._remove"],
+    ],
+    [
+      "nested lists in both forms, the marker's value unjudged",
+      {
+        environments: [
+          {
+            name: "prod",
+            variables: { _undeclared: "keep", entries: [{ name: "V", _remove: true }] },
+            secrets: [{ name: "TOKEN", _remove: "yes" }],
+          },
+        ],
+      },
+      ["environments[0].variables[0]._remove", "environments[0].secrets[0]._remove"],
+    ],
+  ])("a removal entry under %s is refused by its site", (_form, doc, sites) => {
+    expect(validateSettingsDoc(doc, "s.yml", SectionSelection.ALL, silentIo())).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "s.yml",
+        issues: sites.map(singleDocumentRemovalIssue),
+      }),
+    );
+  });
+
+  test("the shapes judge a document with removals minus its removal entries and nothing else: a closed shape does not name the marker again, and a wrapper's bad directive is still reported", () => {
+    expect(
+      validateSettingsDoc(
+        {
+          labels: { _layering: "sideways", entries: [{ name: "kept" }] },
+          deploy_keys: [{ title: "ci", _remove: true }],
+        },
+        "s.yml",
+        SectionSelection.ALL,
+        silentIo(),
+      ),
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "s.yml",
+        issues: [
+          singleDocumentRemovalIssue("deploy_keys[0]._remove"),
+          expect.stringMatching(/^labels\._layering: Invalid option/),
+        ],
+      }),
+    );
+  });
+
+  test("a shape issue beside a refused removal names the entry by its index as written: the shapes judged the document minus the removal, and the index shifted", () => {
+    expect(
+      validateSettingsDoc(
+        {
+          labels: [
+            { name: "old", _remove: true },
+            { name: "new", color: null },
+          ],
+        },
+        "s.yml",
+        SectionSelection.ALL,
+        silentIo(),
+      ),
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "s.yml",
+        issues: [
+          singleDocumentRemovalIssue("labels[0]._remove"),
+          "labels[1].color has no empty state; write a string",
+        ],
+      }),
+    );
+  });
+
+  test("a closed-surface issue beside a refused removal names the entry by its index as written and carries the identity in the text: an all-digit identity is never read as an index", () => {
+    expect(
+      validateSettingsDoc(
+        {
+          custom_properties: [
+            { property_name: "old", _remove: true },
+            { property_name: "tier", value: "gold" },
+            { property_name: "0", value: "x", permision: "y" },
+          ],
+        },
+        "s.yml",
+        SectionSelection.ALL,
+        silentIo(),
+      ),
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "s.yml",
+        issues: [
+          singleDocumentRemovalIssue("custom_properties[0]._remove"),
+          expect.stringMatching(
+            /^custom_properties\[2\] \(property_name "0"\): declares "permision", /,
+          ),
+        ],
+      }),
+    );
+  });
+
+  test("a list whose named property shadows a method is refused by the plainness check, never met by the removal walk", () => {
+    // The walk for removals runs on the raw document, before the shapes; calling the list's own forEach would throw here.
+    expect(
+      validateSettingsDoc(
+        { labels: Object.assign([{ name: "bug" }], { forEach: 0 }) },
+        "s.yml",
+        SectionSelection.ALL,
+        silentIo(),
+      ),
+    ).toEqual(
+      err({
+        code: "settings-malformed-sections",
+        source: "s.yml",
+        issues: [
+          "labels is not plain YAML data (a list carrying named properties, which JSON drops); replace it with a plain value",
+        ],
+      }),
+    );
+  });
+
+  test("the validator resolves every undeclared policy once: the file's _undeclared over the run input over each list's default, the top-level key consumed", () => {
+    const { io } = captureIo();
+    const doc = {
+      _undeclared: "keep",
+      labels: [{ name: "bug" }],
+      milestones: { entries: [{ title: "v1" }] },
+      webhooks: { _undeclared: "delete", entries: [{ config: { url: "https://h" } }] },
+      environments: [
+        {
+          name: "prod",
+          variables: [{ name: "A", value: "1" }],
+          deployment_protection_rules: { _undeclared: "delete", entries: [{ app: "gate" }] },
+        },
+      ],
+    };
+    const branded: unknown = validateSettingsDoc(doc, "s.yml", SectionSelection.ALL, io, {
+      undeclared: "delete",
+    })._unsafeUnwrap();
+    expect(branded).toEqual({
+      labels: { _undeclared: "keep", entries: [{ name: "bug" }] },
+      milestones: { _undeclared: "keep", entries: [{ title: "v1" }] },
+      webhooks: { _undeclared: "delete", entries: [{ config: { url: "https://h" } }] },
+      environments: [
+        {
+          name: "prod",
+          variables: { _undeclared: "keep", entries: [{ name: "A", value: "1" }] },
+          deployment_protection_rules: { _undeclared: "delete", entries: [{ app: "gate" }] },
+        },
+      ],
+    });
+    // Without the file's directive the run input is the fallback, and without either the list's own default.
+    const { _undeclared: _file, ...bare } = doc;
+    const policies = (undeclared: "keep" | "delete" | undefined) =>
+      validateSettingsDoc(bare, "s.yml", SectionSelection.ALL, io, { undeclared })
+        .map((settings) => {
+          const env = (settings.environments as Array<Record<string, unknown>>)[0] ?? {};
+          const knob = (value: unknown) => (value as Record<string, unknown>)._undeclared;
+          return [knob(settings.labels), knob(settings.milestones), knob(env.variables)];
+        })
+        ._unsafeUnwrap();
+    expect(policies("delete")).toEqual(["delete", "delete", "delete"]);
+    expect(policies(undefined)).toEqual(["delete", "keep", "delete"]);
+  });
+
+  test.each<[string, unknown, string]>([
+    ["a string outside the two values", "remove", "a string that is none of them"],
+    ["null", null, "null"],
+  ])(
+    "a top-level _undeclared that is %s is one collected issue naming the two values and the fix, beside the document's other problems",
+    (_case, value, shape) => {
+      const { io } = captureIo();
+      // The bad directive does not cut the collection short: the unknown section and the malformed entry are reported in the same run.
+      const result = validateSettingsDoc(
+        { _undeclared: value, labls: [], labels: [{ name: "bug" }, { name: "Bug" }] },
+        "s.yml",
+        SectionSelection.ALL,
+        io,
+      );
+      expect(result).toEqual(
+        err({
+          code: "settings-malformed-sections",
+          source: "s.yml",
+          issues: [
+            `_undeclared must be one of "keep", "delete"; got ${shape}. Write _undeclared: keep or _undeclared: delete at the top of the file, or remove the key so each list's own policy applies`,
+            unknownSectionsIssue(["labls"], SECTION_KEYS),
+            'labels[1].name: "Bug" names the same label as "bug" declared earlier; keep exactly one entry per label',
+          ],
+        }),
+      );
+    },
+  );
 
   test("a valid document comes back branded, ready for runForRepo", () => {
     const { io } = captureIo();
@@ -561,11 +818,13 @@ describe("runForRepo plan sections", () => {
     });
     const stub = (section: SectionModule, ...ops: SectionPlan["ops"]) => {
       // A restored spy no longer intercepts, so each test arms its own.
-      stubbed = spyOn(section, "plan").mockResolvedValue({
-        ops: ops as never,
-        notes: [],
-        drift: [],
-      });
+      stubbed = spyOn(section, "plan").mockResolvedValue(
+        ok({
+          ops: ops as never,
+          notes: [],
+          drift: [],
+        }),
+      );
     };
     const disabling = (workflowId: string): SectionPlan["ops"][number] => ({
       role: "disable",

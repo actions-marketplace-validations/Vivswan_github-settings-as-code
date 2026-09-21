@@ -14,7 +14,7 @@ What it means: the token lacks that section's grant. Each section's permission i
 
 What to do: edit the PAT's permissions as the message says (see [Token permissions](../reference/permissions.md)). If you would rather skip sections the token cannot reach, set `on-missing-permission: warn`: denied sections are skipped with a warning instead of failing the run, and when nothing else drifts or fails the result is `partial` and the run stays green. The `required-sections` input names sections that must still fully apply even under `warn`.
 
-One related surprise: under the default `on-missing-permission: fail`, an apply run probes every declared section read-only before writing anything. If any probe is denied you get error annotations prefixed `preflight:` and nothing at all is applied, by design; the API has no transactions, so the barrier prevents a half-applied repository. See [Semantics](../reference/semantics.md).
+One related surprise: under the default `on-missing-permission: fail`, an apply run probes every active section (each declared section the `sections` input selects; all of them when that input is unset) read-only before writing anything. If any probe is denied you get error annotations prefixed `preflight:` and nothing at all is applied, by design; the API has no transactions, so the barrier prevents a half-applied repository. See [Semantics](../reference/semantics.md).
 
 ## A 404 for something that exists
 
@@ -22,7 +22,7 @@ Fine-grained tokens surface a missing Administration permission as a 404, not a 
 
 Where GitHub's response body names the definite meaning, the action reads the body instead of the status: the branch protection PUT's 404 "Branch not found" fails the `branches` section with "create the branch, or remove it from the settings file". That is never a permission denial, so `on-missing-permission: warn` does not skip it, and the outcome is the same whether or not the token also holds Contents (with Contents the section reads the missing branch off its probe and fails before the PUT).
 
-On the `secret_scanning_custom_patterns` endpoints a 404 has a third reading, which the denial message carries: secret scanning is not enabled for the repository (it requires GitHub Advanced Security on private repositories). Enabling scanning and declaring patterns cannot land in ONE apply under the default `on-missing-permission: fail`: the preflight barrier probes every declared section read-only before anything is written, so the patterns list 404s and aborts the run before the `repository` section could enable scanning via `security_and_analysis`. Either enable scanning first (a separate run, or by hand in the repository's security settings), or set `on-missing-permission: warn` for the bootstrap run - the first apply then enables scanning and skips the patterns section with a warning, and the next apply converges.
+On the `secret_scanning_custom_patterns` endpoints a 404 has a third reading, which the denial message carries: secret scanning is not enabled for the repository (it requires GitHub Advanced Security on private repositories). Enabling scanning and declaring patterns cannot land in ONE apply under the default `on-missing-permission: fail`: the preflight barrier probes every active section read-only before anything is written, so the patterns list 404s and aborts the run before the `repository` section could enable scanning via `security_and_analysis`. Either enable scanning first (a separate run, or by hand in the repository's security settings), or set `on-missing-permission: warn` for the bootstrap run - the first apply then enables scanning and skips the patterns section with a warning, and the next apply converges.
 
 ## A 412 on secret scanning custom patterns
 
@@ -34,7 +34,7 @@ What to do: re-run the workflow. The fresh run reads the current versions and co
 
 ## A 403 that is not about a grant
 
-Two other things arrive as 403. First, rate limiting: both the primary limit and secondary (abuse) limits can be delivered as 403. The action recognizes these by the API's own message and reports them as rate limits, never as missing permissions. Second, feature policies: on a few endpoints a 403 means something other than the token. An org- or enterprise-managed policy can lock the Actions cache limits, code scanning default setup needs Advanced Security on private repositories, and Git LFS can be disabled account-wide. For Git LFS the denial message itself carries a note saying so; for the others the caveat lives in that section's row of the [COVERAGE.md Supported table](https://github.com/Vivswan/github-settings-as-code/blob/main/COVERAGE.md#supported).
+Two other things arrive as 403. First, rate limiting: both the primary limit and secondary (abuse) limits can be delivered as 403. The action recognizes these by the API's own message and reports them as rate limits, never as missing permissions. Second, feature policies: on a few endpoints a 403 means something other than the token. An org- or enterprise-managed policy can lock the Actions cache limits, code scanning default setup needs Advanced Security on private repositories, and Git LFS can be disabled account-wide. For Git LFS the denial message itself carries a note saying so; for the others the caveat lives in that section's notes on the [coverage page](../reference/coverage.md#supported).
 
 ## Rate limited
 
@@ -44,9 +44,9 @@ What it means: the retries already happened, or were deliberately skipped becaus
 
 What to do: re-run after the reset. If a multi-repo run keeps hitting the limit, reduce its scope: fewer targets per run, or a `sections` allowlist so each target makes fewer calls.
 
-## "unknown top-level section in ..." (or "sections")
+## "... has malformed section entries: unknown top-level section: ..."
 
-What you see: the run fails during validation, naming the unknown keys and listing every known section name.
+What you see: the run fails during validation with one collected list: the unknown keys beside every known section name, then whatever else the file got wrong.
 
 What it means: a misspelled section that silently did nothing would break the loud-failure promise, so unknown top-level keys are hard errors (see [Forward compatibility](../reference/forward-compatibility.md)).
 

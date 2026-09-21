@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ok } from "neverthrow";
 import { executePlan } from "../../../src/engine/execute.js";
 import { runForRepo, validateSettingsDoc } from "../../../src/engine/orchestrate.js";
 import { type GitHubClient, SECRET_RESPONSE_WITHHELD } from "../../../src/github/api.js";
@@ -10,9 +11,11 @@ import {
 import { captureIo } from "../../../test/io/capture.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
 import { SectionSelection } from "../../engine/section-selection.js";
 import { describeProblem } from "../../problem.js";
+import type { SectionInput } from "../contract/module.js";
 import { driftOf, type ExecTools, type PlannedOp, planContext } from "../contract/plan.js";
 import { actionsSecretsSection } from "./index.js";
 
@@ -22,7 +25,7 @@ const KEY_ROUTE = { data: { key_id: "test-key-id", key: MOCK_SECRETS_PUBLIC_KEY 
 const CANNOT_VERIFY =
   "actions_secrets: Actions secret values cannot be read back from GitHub, so check mode cannot verify them, only that each declared secret exists; apply re-seals and rewrites every declared value on every run";
 
-type Declared = Parameters<typeof actionsSecretsSection.plan>[1];
+type Declared = SectionInput<"actions_secrets">;
 
 function listOf(...names: string[]) {
   return {
@@ -52,15 +55,20 @@ function tools(resolved: Record<string, string> = {}): ExecTools & { lookups: st
   };
 }
 
-const plan = (api: GitHubClient, declared: Declared) =>
-  actionsSecretsSection.plan(planContext(actionsSecretsSection, api, REPO), declared);
+const plan = async (api: GitHubClient, declared: Declared) =>
+  unwrap(
+    await actionsSecretsSection.plan(
+      planContext(actionsSecretsSection, api, REPO),
+      validatedInput("actions_secrets", declared),
+    ),
+  );
 
 /** Plan, then execute against the same client; a failed execution rethrows its error. */
 async function apply(api: GitHubClient, declared: Declared, exec: ExecTools = tools()) {
   const planned = await plan(api, declared);
   const execution = await executePlan(planned, actionsSecretsSection, api, REPO, exec);
   if (execution.status === "failed") {
-    throw execution.error;
+    throw new Error(execution.failure.message);
   }
   return { plan: planned, changes: execution.changes };
 }
@@ -159,7 +167,7 @@ describe("actions_secrets planning", () => {
     const payloads = await Promise.all(
       result.ops.map(async (op) =>
         typeof op.payload === "function"
-          ? sealedPayload({ payload: await op.payload(exec) })
+          ? sealedPayload({ payload: unwrap(await op.payload(exec)) })
           : null,
       ),
     );
@@ -216,15 +224,20 @@ describe("actions_secrets planning", () => {
     ]);
   });
 
-  test("case-insensitive duplicate names are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
-        { name: "token", value: "$A" },
-        { name: "TOKEN", value: "$B" },
-      ]),
-    ).rejects.toThrow(/same actions_secrets entry/);
-    expect(api.calls).toEqual([]);
+  test("case-insensitive duplicate names are a validate issue in both declared forms, so the document fails before any API call", () => {
+    const entries = [
+      { name: "token", value: "$A" },
+      { name: "TOKEN", value: "$B" },
+    ];
+    const issue = {
+      path: "[1].name",
+      message:
+        '"TOKEN" names the same secret as "token" declared earlier; keep exactly one entry per secret',
+    };
+    expect(actionsSecretsSection.validate(entries)).toEqual([issue]);
+    expect(actionsSecretsSection.validate({ _undeclared: "delete", entries })).toEqual([
+      { ...issue, path: ".entries[1].name" },
+    ]);
   });
 
   // Reference validation lives in engine/secret-refs.ts (test/engine/secret-refs.test.ts); the section only extracts and looks up values.
@@ -358,10 +371,7 @@ describe("actions_secrets execution", () => {
     );
     expect(execution.status).toBe("failed");
     expect(api.mutations().map((call) => call.carriesSecret)).toEqual([true]);
-    const message =
-      execution.status === "failed" && execution.error instanceof Error
-        ? execution.error.message
-        : "";
+    const message = execution.status === "failed" ? execution.failure.message : "";
     expect(message).toBe(
       `actions_secrets: writing secret "DENIED_WRITE" failed - PUT /repos/o/r/actions/secrets/DENIED_WRITE: 422 ${SECRET_RESPONSE_WITHHELD}. The API rejected the request; fix the "actions_secrets" values in the settings file to satisfy the message above`,
     );
@@ -463,7 +473,7 @@ describe("actions_secrets contract", () => {
     const sealed: Op = {
       role: "put",
       params: { secret_name: "A" },
-      payload: (exec) => ({ encrypted_value: exec.resolveSecret("$A"), key_id: "k" }),
+      payload: (exec) => ok({ encrypted_value: exec.resolveSecret("$A"), key_id: "k" }),
       // alwaysRewrite by declaration: no drift needed to justify the write.
       drift: [],
       change: "",

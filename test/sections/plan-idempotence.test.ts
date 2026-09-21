@@ -4,17 +4,24 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { ok } from "neverthrow";
 import { z } from "zod";
 import type { GitHubClient } from "../../src/github/api.js";
 import { actionsSecretsSection } from "../../src/sections/actions_secrets/index.js";
 import type { EndpointDecl } from "../../src/sections/contract/endpoints.js";
-import type { SectionModule } from "../../src/sections/contract/module.js";
+import { declaredEntries, type SectionModule } from "../../src/sections/contract/module.js";
 import type { ExecTools, PlannedOp } from "../../src/sections/contract/plan.js";
+import type { UndeclaredPolicyList } from "../../src/types.js";
 import { MockApi } from "../mock-api.js";
 import { identityOf, provePlanIdempotent, requestOf } from "./plan-idempotence.js";
 
 /** The listed secret's identity, the one field the synthetic sections read. */
 const LiveName = z.looseObject({ name: z.string() });
+
+interface Secret {
+  readonly name: string;
+  readonly value: string;
+}
 
 const LIST = {
   route: "GET /repos/{owner}/{repo}/actions/secrets",
@@ -37,15 +44,16 @@ const META = {
   permission: { repo: ["secrets"] },
   undeclaredDefault: "keep",
   shape: actionsSecretsSection.shape,
-  // A reading section must read back; these synthetic modules exercise plan() alone.
-  snapshot: async () => ({ value: undefined, notes: [] }),
+  // A reading section must read back, and a list section must carry its file-only checks; these synthetic modules exercise plan() alone.
+  snapshot: async () => ok({ value: undefined, notes: [] }),
+  validate: () => [],
 } as const;
 
-/** The declared entries, whichever form the knobbed section value takes. */
-function entriesOf(declared: unknown): ReadonlyArray<{ name: string; value: string }> {
-  return Array.isArray(declared)
-    ? (declared as ReadonlyArray<{ name: string; value: string }>)
-    : [];
+/** The declared entries: the validator hands a knobbed section over in wrapper form, its policy resolved. */
+function entriesOf(
+  declared: readonly Secret[] | UndeclaredPolicyList<Secret>,
+): ReadonlyArray<Secret> {
+  return declaredEntries(declared).entries;
 }
 
 /**
@@ -56,19 +64,18 @@ const sealed = {
   ...META,
   endpoints: SEALED_ENDPOINTS,
   async plan(ctx, desired) {
-    const live = await ctx.read.list.listAllEnveloped("secrets", LiveName);
-    return {
+    return ctx.read.list.listAllEnveloped("secrets", LiveName).map((live) => ({
       ops: entriesOf(desired).map((entry) => ({
         role: "put" as const,
         params: { secret_name: entry.name },
         // A fresh closure on every pass: the helper must compare operation identity, not function references.
-        payload: (exec: ExecTools) => ({ encrypted_value: exec.resolveSecret(entry.value) }),
+        payload: (exec: ExecTools) => ok({ encrypted_value: exec.resolveSecret(entry.value) }),
         drift: [],
         change: `${live.some((s) => s.name === entry.name) ? "updated" : "created"} secret "${entry.name}"`,
       })),
       notes: [],
       drift: [],
-    };
+    }));
   },
 } satisfies SectionModule<"actions_secrets", typeof SEALED_ENDPOINTS>;
 
@@ -80,8 +87,7 @@ const stuck = {
   ...META,
   endpoints: CONDITIONAL_ENDPOINTS,
   async plan(ctx, desired) {
-    const live = await ctx.read.list.listAllEnveloped("secrets", LiveName);
-    return {
+    return ctx.read.list.listAllEnveloped("secrets", LiveName).map((live) => ({
       ops: entriesOf(desired)
         .filter((entry) => !live.some((s) => s.name === entry.name))
         .map((entry) => ({
@@ -93,7 +99,7 @@ const stuck = {
         })),
       notes: [],
       drift: [],
-    };
+    }));
   },
 } satisfies SectionModule<"actions_secrets", typeof CONDITIONAL_ENDPOINTS>;
 
@@ -172,12 +178,11 @@ describe("provePlanIdempotent", () => {
     const drifting = {
       ...sealed,
       async plan(ctx, desired) {
-        const plan = await sealed.plan(ctx, desired);
         pass++;
-        return {
+        return (await sealed.plan(ctx, desired)).map((plan) => ({
           ...plan,
           ops: plan.ops.map((op) => ({ ...op, payload: { encrypted_value: `pass ${pass}` } })),
-        };
+        }));
       },
     } satisfies SectionModule<"actions_secrets", typeof SEALED_ENDPOINTS>;
     await expect(
@@ -196,14 +201,14 @@ describe("provePlanIdempotent", () => {
       ...META,
       endpoints: UNVERIFIABLE_ENDPOINTS,
       async plan(ctx, desired) {
-        const live = await ctx.read.list.listAllEnveloped("secrets", LiveName);
-        return {
+        return ctx.read.list.listAllEnveloped("secrets", LiveName).map((live) => ({
           ops: entriesOf(desired).map((entry) => {
             const exists = live.some((s) => s.name === entry.name);
             return {
               role: "put" as const,
               params: { secret_name: entry.name },
-              payload: (exec: ExecTools) => ({ encrypted_value: exec.resolveSecret(entry.value) }),
+              payload: (exec: ExecTools) =>
+                ok({ encrypted_value: exec.resolveSecret(entry.value) }),
               drift: exists
                 ? { unverifiable: `${entry.name} cannot be read back`, lines: [] }
                 : ([`actions_secrets[${entry.name}]: missing`] as [string]),
@@ -212,7 +217,7 @@ describe("provePlanIdempotent", () => {
           }),
           notes: [],
           drift: [],
-        };
+        }));
       },
     } satisfies SectionModule<"actions_secrets", typeof UNVERIFIABLE_ENDPOINTS>;
     const { first, second, changes } = await provePlanIdempotent(
@@ -233,11 +238,10 @@ describe("provePlanIdempotent", () => {
       ({
         ...recurring,
         async plan(ctx, desired) {
-          const planned = await recurring.plan(ctx, desired);
-          return {
+          return (await recurring.plan(ctx, desired)).map((planned) => ({
             ...planned,
             ops: planned.ops.map((op) => ({ ...op, drift: drift(op.params.secret_name) })),
-          };
+          }));
         },
       }) satisfies SectionModule<"actions_secrets", typeof UNVERIFIABLE_ENDPOINTS>;
     const plain = redrifted((name) => [`actions_secrets[${name}]: re-sent`]);
@@ -273,25 +277,25 @@ describe("identityOf", () => {
   test("folds every thunk to a marker and compares the remaining facets", () => {
     const rebuilt: Op = {
       ...base,
-      payload: () => ({ encrypted_value: "x" }),
-      change: () => "set A",
-      capture: () => {},
-      before: () => {},
+      payload: () => ok({ encrypted_value: "x" }),
+      change: () => ok("set A"),
+      capture: () => ok(undefined),
+      before: () => ok(undefined),
       tolerate: { statuses: [409], outcome: () => ({ note: "" }) },
     };
     const again: Op = {
       ...rebuilt,
-      payload: () => ({ encrypted_value: "y" }),
-      change: () => "set B",
-      capture: () => {},
-      before: async () => {},
+      payload: () => ok({ encrypted_value: "y" }),
+      change: () => ok("set B"),
+      capture: () => ok(undefined),
+      before: async () => ok(undefined),
       tolerate: { statuses: [409], outcome: () => ({ failure: "" }) },
     };
     expect(identityOf(rebuilt)).toEqual(identityOf(again));
     expect(identityOf(rebuilt)).not.toEqual(identityOf(base));
     // No literal can spell the marker: a change line reading like one is still a string, not a thunk.
     const spelled: Op = { ...base, change: "<sealed>" };
-    const thunk: Op = { ...base, change: () => "<sealed>" };
+    const thunk: Op = { ...base, change: () => ok("<sealed>") };
     expect(identityOf(spelled)).not.toEqual(identityOf(thunk));
   });
 
@@ -300,8 +304,8 @@ describe("identityOf", () => {
     ["params", { ...base, params: { secret_name: "B" } }],
     ["drift", { ...base, drift: ["stale"] }],
     ["a string change", { ...base, change: "set B" }],
-    ["capture presence", { ...base, capture: () => {} }],
-    ["before presence", { ...base, before: () => {} }],
+    ["capture presence", { ...base, capture: () => ok(undefined) }],
+    ["before presence", { ...base, before: () => ok(undefined) }],
     [
       "tolerated statuses",
       { ...base, tolerate: { statuses: [422], outcome: () => ({ note: "" }) } },
@@ -316,7 +320,7 @@ describe("identityOf", () => {
       drift: ["other"],
       change: "other",
       describe: "other",
-      capture: () => {},
+      capture: () => ok(undefined),
     };
     expect(requestOf(rendered)).toEqual(requestOf(base));
     expect(requestOf({ ...base, query: { ref: "main" } })).not.toEqual(requestOf(base));

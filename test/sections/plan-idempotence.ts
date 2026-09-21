@@ -5,9 +5,10 @@
 import { expect } from "bun:test";
 import { executePlan } from "../../src/engine/execute.js";
 import type { GitHubClient } from "../../src/github/api.js";
-import type { SectionModule } from "../../src/sections/contract/module.js";
+import type { SectionInput, SectionModule } from "../../src/sections/contract/module.js";
 import { type ExecTools, planContext, type SectionPlan } from "../../src/sections/contract/plan.js";
-import { NO_SECRETS, REPO } from "./section-run.js";
+import { NO_SECRETS, REPO, unwrap } from "./section-run.js";
+import { validatedInput } from "./validated-input.js";
 
 /** The marker a thunk folds to; a symbol, so no literal value can collide with it. */
 const SEALED = Symbol("a thunk the plan builds afresh on every pass");
@@ -71,7 +72,7 @@ export function unconvergedOps(section: SectionModule, plan: SectionPlan): Secti
 export async function provePlanIdempotent<M extends SectionModule>(
   section: M,
   api: GitHubClient,
-  desired: Parameters<M["plan"]>[1],
+  desired: SectionInput<M["key"]>,
   tools: ExecTools = NO_SECRETS,
 ): Promise<{
   first: SectionPlan;
@@ -79,14 +80,15 @@ export async function provePlanIdempotent<M extends SectionModule>(
   changes: readonly string[];
   notes: readonly string[];
 }> {
+  const validated = validatedInput(section.key, desired);
   const plan = async (): Promise<SectionPlan> =>
-    section.plan(planContext(section, api, REPO), desired);
+    unwrap(await section.plan(planContext(section, api, REPO), validated));
   const execute = async (
     of: SectionPlan,
   ): Promise<{ changes: readonly string[]; notes: readonly string[] }> => {
     const execution = await executePlan(of, section, api, REPO, tools);
     if (execution.status === "failed") {
-      throw execution.error;
+      throw new Error(execution.failure.message);
     }
     return execution;
   };

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ok } from "neverthrow";
 import {
   MOCK_SECRETS_PUBLIC_KEY,
   mockSodiumReady,
@@ -9,15 +10,16 @@ import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake, registryFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
 import {
+  failureOf,
   NO_SECRETS,
   REPO,
   secretTools,
   sectionRunners,
+  unwrap,
 } from "../../../test/sections/section-run.js";
 import { proveSnapshotRoundTrip } from "../../../test/sections/snapshot-roundtrip.js";
 import { executePlan } from "../../engine/execute.js";
 import type { GitHubClient } from "../../github/api.js";
-import { PermissionDenied } from "../contract/errors.js";
 import { type PlannedOp, planContext, planDrift, snapshotContext } from "../contract/plan.js";
 import { projectOntoSchema } from "../shared/snapshot-helpers.js";
 import { environmentsSection, flattenEnvironment } from "./index.js";
@@ -114,6 +116,40 @@ describe("environments plan", () => {
     expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       "GET /repos/o/r/environments/prod",
     ]);
+  });
+
+  test("a declared key the environment GET never echoes is drift with the never-converges note naming it", async () => {
+    // The entry is open so a field GitHub ships tomorrow is declarable, but a key the GET lacks (a typo
+    // of wait_timer here) would re-PUT on every apply; the note says so beside the drift.
+    const api = new MockApi({ "GET /repos/o/r/environments/prod": liveEnv("prod") });
+    const checked = await check(api, [{ name: "prod", wait_timers: 5 } as EnvironmentConfig]);
+    expect(checked.drift).toEqual([
+      "environments[prod].wait_timers: declared 5 but the API response has no such field (new or write-only field?)",
+    ]);
+    expect(checked.notes).toEqual([
+      'environments[prod]: declared key "wait_timers" does not exist on the live environment, so if GitHub ignores it this PUT will re-run on every apply without converging. Fix the key name, or remove it from the settings file',
+    ]);
+    // Only a key the GET lacks earns the note: an ordinary value mismatch stays plain drift.
+    const mismatch = await check(api, [{ name: "prod", wait_timer: 10 }]);
+    expect(mismatch.notes).toEqual([]);
+  });
+
+  test("an entry key the GET omits is plain drift the PUT resolves: no note, one PUT, converged", async () => {
+    // GitHub marks deployment_branch_policy optional on the environment: one that never set a policy
+    // reports without the key. The key is in the entry shape, so it is not a phantom.
+    const api = fragmentFake(environmentsSection, environmentsMockHandlers, {
+      environments: { prod: { name: "prod", protection_rules: [] } },
+    });
+    const policy = { protected_branches: true, custom_branch_policies: false };
+    const { first, second } = await provePlanIdempotent(environmentsSection, api, [
+      { name: "prod", deployment_branch_policy: policy },
+    ]);
+    expect(first.notes).toEqual([]);
+    expect(planDrift(first)).toEqual([
+      "environments[prod].deployment_branch_policy: expected object, live has undefined",
+    ]);
+    expect(api.writes).toEqual(["PUT /repos/o/r/environments/prod"]);
+    expect(second).toEqual({ ops: [], notes: [], drift: [] });
   });
 
   test("the disabled protection values are never omitted drift: a bare entry plans clean against no rules and against rules holding them", async () => {
@@ -222,7 +258,7 @@ describe("environments plan", () => {
     const sealed: Op = {
       role: "putSecret",
       params: { environment_name: "prod", secret_name: "S" },
-      payload: async () => ({ encrypted_value: "x", key_id: "k" }),
+      payload: async () => ok({ encrypted_value: "x", key_id: "k" }),
       // An alwaysRewrite endpoint may plan without drift.
       drift: [],
       change: "",
@@ -328,10 +364,9 @@ describe("environments variables case-insensitive matching", () => {
     expect(patch?.payload).toEqual({ value: "new" });
   });
 
-  test("two declared names that collapse case-insensitively are rejected before any write", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("two declared names that collapse case-insensitively are a validate issue under the nested list, so the document fails before any write", () => {
+    expect(
+      environmentsSection.validate([
         {
           name: "prod",
           variables: [
@@ -340,11 +375,13 @@ describe("environments variables case-insensitive matching", () => {
           ],
         },
       ]),
-    ).rejects.toThrow(
-      'environments: the settings file declares entries that name the same variable of the "prod" environment: "Region" and "REGION". Keep exactly one entry per resource',
-    );
-    // The engine guards the declared list ahead of its own read; the environment probe before it is the only request.
-    expect(api.mutations()).toEqual([]);
+    ).toEqual([
+      {
+        path: "[0].variables[1].name",
+        message:
+          '"REGION" names the same variable of the "prod" environment as "Region" declared earlier; keep exactly one entry per variable of the "prod" environment',
+      },
+    ]);
   });
 });
 
@@ -612,7 +649,7 @@ describe("environments nested secrets check mode", () => {
     expect(result.drift).toEqual([
       "environments[prod].secrets[DEPLOY_TOKEN]: missing - declared in the settings file but not on the environment; apply will create it",
     ]);
-    const cannotVerify = result.notes.filter((n) => n.includes("cannot be read back"));
+    const cannotVerify = result.notes.filter((n: string) => n.includes("cannot be read back"));
     expect(cannotVerify).toHaveLength(1);
     expect(cannotVerify[0]).toContain("prod environment secret values");
     expect(api.mutations()).toEqual([]);
@@ -621,21 +658,26 @@ describe("environments nested secrets check mode", () => {
 });
 
 describe("environments nested secrets validation and shape", () => {
-  test("case-insensitive duplicate names are rejected upfront, naming the environment", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("case-insensitive duplicate names are a validate issue naming the environment, in the wrapped form under .entries", () => {
+    expect(
+      environmentsSection.validate([
         {
           name: "prod",
-          secrets: [
-            { name: "token", value: "$A" },
-            { name: "TOKEN", value: "$B" },
-          ],
+          secrets: {
+            entries: [
+              { name: "token", value: "$A" },
+              { name: "TOKEN", value: "$B" },
+            ],
+          },
         },
       ]),
-    ).rejects.toThrow(/the same secret of the "prod" environment: "token" and "TOKEN"/);
-    // The engine guards the declared list ahead of its own read; the environment probe before it is the only request.
-    expect(api.mutations()).toEqual([]);
+    ).toEqual([
+      {
+        path: "[0].secrets.entries[1].name",
+        message:
+          '"TOKEN" names the same secret of the "prod" environment as "token" declared earlier; keep exactly one entry per secret of the "prod" environment',
+      },
+    ]);
   });
 
   test("secret entries are strict; the singular entry-level `secret` key is rejected by name", () => {
@@ -858,15 +900,18 @@ describe("environments parse rules", () => {
 });
 
 describe("environments deployment branch policies validation and shape", () => {
-  test("duplicate patterns are rejected upfront, naming the environment", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [envWithPolicies([{ name: "release/*" }, { name: "release/*", type: "tag" }])]),
-    ).rejects.toThrow(
-      'environments: the settings file declares entries that name the same deployment branch policy of the "prod" environment: "release/*" and "release/*". Keep exactly one entry per resource',
-    );
-    // The engine guards the declared list ahead of its own read; the environment probe before it is the only request.
-    expect(api.mutations()).toEqual([]);
+  test("duplicate patterns are a validate issue naming the environment, so the document fails before any write", () => {
+    expect(
+      environmentsSection.validate([
+        envWithPolicies([{ name: "release/*" }, { name: "release/*", type: "tag" }]),
+      ]),
+    ).toEqual([
+      {
+        path: "[0].deployment_branch_policies[1].name",
+        message:
+          '"release/*" names the same deployment branch policy of the "prod" environment as "release/*" declared earlier; keep exactly one entry per deployment branch policy of the "prod" environment',
+      },
+    ]);
   });
 
   test("both declared forms parse; entries stay loose and the wrapper strict", () => {
@@ -1240,20 +1285,21 @@ describe("environments missing-environment planning across the nested families",
 });
 
 describe("environments deployment protection rules validation and shape", () => {
-  test("duplicate App slugs are rejected upfront, naming the environment", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("duplicate App slugs are a validate issue naming the environment, so the document fails before any write", () => {
+    expect(
+      environmentsSection.validate([
         {
           name: "prod",
           deployment_protection_rules: [{ app: "deploy-gate" }, { app: "deploy-gate" }],
         },
       ]),
-    ).rejects.toThrow(
-      'environments: the settings file declares entries that name the same deployment protection rule App of the "prod" environment: "deploy-gate" and "deploy-gate". Keep exactly one entry per resource',
-    );
-    // The engine guards the declared list ahead of its own read; the environment probe before it is the only request.
-    expect(api.mutations()).toEqual([]);
+    ).toEqual([
+      {
+        path: "[0].deployment_protection_rules[1].app",
+        message:
+          '"deploy-gate" names the same deployment protection rule App of the "prod" environment as "deploy-gate" declared earlier; keep exactly one entry per deployment protection rule App of the "prod" environment',
+      },
+    ]);
   });
 
   test("both declared forms parse; entries are STRICT (the POST carries only the resolved id)", () => {
@@ -1552,8 +1598,8 @@ describe("environments snapshot", () => {
       },
       environment_secrets: { qa: [{ name: "release_pat", ...STAMPS }] },
     });
-    const snapshot = await environmentsSection.snapshot(
-      snapshotContext(environmentsSection, api, REPO, "fail"),
+    const snapshot = unwrap(
+      await environmentsSection.snapshot(snapshotContext(environmentsSection, api, REPO, "fail")),
     );
     expect(snapshot).toEqual({
       value: [
@@ -1628,8 +1674,8 @@ describe("environments snapshot", () => {
           : inner.tryRequest(method, path, payload, options),
       tryGraphql: (op, variables, slug) => inner.tryGraphql(op, variables, slug),
     };
-    const snapshot = await environmentsSection.snapshot(
-      snapshotContext(environmentsSection, api, REPO, "warn"),
+    const snapshot = unwrap(
+      await environmentsSection.snapshot(snapshotContext(environmentsSection, api, REPO, "warn")),
     );
     expect(snapshot).toEqual({
       value: [
@@ -1659,8 +1705,8 @@ describe("environments snapshot", () => {
 
   test("no environment reads back as nothing to declare", async () => {
     const api = fragmentFake(environmentsSection, environmentsMockHandlers, {});
-    const snapshot = await environmentsSection.snapshot(
-      snapshotContext(environmentsSection, api, REPO, "fail"),
+    const snapshot = unwrap(
+      await environmentsSection.snapshot(snapshotContext(environmentsSection, api, REPO, "fail")),
     );
     expect(snapshot).toEqual({ value: undefined, notes: [] });
   });
@@ -1725,11 +1771,11 @@ describe("environments snapshot", () => {
           },
         }),
     };
-    const failure = environmentsSection.snapshot(
-      snapshotContext(environmentsSection, api, REPO, "fail"),
+    const failure = failureOf(
+      await environmentsSection.snapshot(snapshotContext(environmentsSection, api, REPO, "fail")),
     );
-    await expect(failure).rejects.toBeInstanceOf(PermissionDenied);
-    await expect(failure).rejects.toThrow(
+    expect(failure.kind).toBe("permission-denied");
+    expect(failure.message).toContain(
       "environments: the token was denied GRAPHQL EnvironmentPinsSnapshot: 404 Could not resolve to a Repository " +
         'with the given name (a 404 here can also mean the resource does not exist). To fix, grant "Environments" ' +
         '(read and write) under the PAT\'s Repository permissions; declared "deployment_branch_policies" and ' +

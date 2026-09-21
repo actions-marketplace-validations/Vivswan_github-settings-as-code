@@ -27,6 +27,13 @@ export function quoteList(names: readonly string[]): string {
   return names.map((name) => `"${name}"`).join(", ");
 }
 
+/** Names as prose lists them: `a`, `a and b`, `a, b and c`. */
+function andList(names: readonly string[]): string {
+  return names.length < 2
+    ? names.join("")
+    : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
 function inputsWording(names: readonly string[]) {
   const count = names.length;
   const inputs = agree(count, "input", "inputs");
@@ -84,7 +91,8 @@ export type Problem =
       readonly value: string;
       readonly noun: string;
       readonly allowed: readonly string[];
-      readonly fallback: string;
+      /** The value an unset input means; null when unset means "no value" (the `undeclared` input). */
+      readonly fallback: string | null;
     }
   | {
       readonly code: "input-unknown-sections";
@@ -149,17 +157,6 @@ export type Problem =
     }
   | { readonly code: "settings-not-plain-mapping"; readonly source: string }
   | {
-      readonly code: "settings-unknown-sections";
-      readonly source: string;
-      readonly unknown: readonly string[];
-      readonly known: readonly string[];
-    }
-  | {
-      readonly code: "settings-unknown-directives";
-      readonly source: string;
-      readonly unknown: readonly string[];
-    }
-  | {
       readonly code: "settings-malformed-sections";
       readonly source: string;
       readonly issues: readonly string[];
@@ -199,6 +196,8 @@ export type Problem =
       readonly keyField: string;
       /** The field's kind in prose; "string" when the module says nothing else. */
       readonly keyKind?: string;
+      /** The other paths of a composite identity (a reviewer's `type` beside its `id`), when the module names one. */
+      readonly alongside?: readonly string[];
     }
   | {
       readonly code: "layer-duplicate-key";
@@ -207,6 +206,28 @@ export type Problem =
       readonly keyField: string;
       readonly first: number;
       readonly second: number;
+    }
+  | {
+      readonly code: "layer-remove-not-true";
+      readonly layer: string;
+      readonly site: string;
+      readonly actual: unknown;
+    }
+  | {
+      readonly code: "layer-remove-with-fields";
+      readonly layer: string;
+      readonly site: string;
+      /** The dotted paths a removal names its entry by: the key field's own, or a composite (`type` and `id`). */
+      readonly keyPaths: readonly string[];
+      /** The dotted paths riding beside the key and the marker (`color`, `config.secret`), in the entry's order. */
+      readonly extra: readonly string[];
+    }
+  | {
+      readonly code: "layer-remove-nothing";
+      readonly layer: string;
+      readonly site: string;
+      /** replace: the higher list already wins; swapped: the entry is copied whole; unmatched: no lower entry claims the key. */
+      readonly reason: "replace" | "swapped" | "unmatched";
     }
   // The section selection
   | { readonly code: "required-sections-excluded"; readonly excluded: readonly SectionKey[] }
@@ -266,11 +287,7 @@ export type LayerProblem = Extract<Problem, { readonly code: `layer-${string}` }
 
 /** The settings document's members: what validateSettingsDoc refuses (a file's read failure is not one). */
 export type SettingsProblem = ProblemOf<
-  | "settings-not-mapping"
-  | "settings-not-plain-mapping"
-  | "settings-unknown-sections"
-  | "settings-unknown-directives"
-  | "settings-malformed-sections"
+  "settings-not-mapping" | "settings-not-plain-mapping" | "settings-malformed-sections"
 >;
 
 const PAT_ADVICE =
@@ -283,8 +300,36 @@ const PAT_ADVICE =
  */
 const DIRECTIVES_ADVICE =
   "The underscore marks this action's directives, \"_layering\" (a file's top level or a list section's {entries} " +
-  'wrapper) and "_undeclared" (a wrapper), and nothing else; there are no private-note keys. Remove the key, or ' +
-  "keep the note as a YAML comment";
+  'wrapper) and "_undeclared" (a file\'s top level or a wrapper), and nothing else; there are no private-note keys. ' +
+  "Remove the key, or keep the note as a YAML comment";
+
+/** One line of the collected document problems: the strange underscore keys, with the rule they break. */
+export function unknownDirectivesIssue(unknown: readonly string[]): string {
+  return `unknown underscore ${agree(unknown.length, "key", "keys")}: ${unknown.join(", ")}. ${DIRECTIVES_ADVICE}`;
+}
+
+/** One line of the collected document problems: a file-wide `_undeclared` outside the two policies, with the values and the fix. */
+export function badDirectiveIssue(
+  key: "_undeclared",
+  actual: unknown,
+  allowed: readonly string[],
+): string {
+  return (
+    `${key} must be one of ${allowed.map(quote).join(", ")}; got ${describeShape(actual)}` +
+    `${typeof actual === "string" ? " that is none of them" : ""}. Write ${key}: keep or ` +
+    `${key}: delete at the top of the file, or remove the key so each list's own policy applies`
+  );
+}
+
+/** One line of the collected document problems: a removal entry in a document that is not a layer of a fold, by its site. */
+export function singleDocumentRemovalIssue(site: string): string {
+  return `${site}: a single document has no lower layer to remove from; _remove: true belongs in a higher layer of a fold (mode: render)`;
+}
+
+/** One line of the collected document problems: the misspelled section names beside every name the action knows. */
+export function unknownSectionsIssue(unknown: readonly string[], known: readonly string[]): string {
+  return `unknown top-level ${agree(unknown.length, "section", "sections")}: ${unknown.join(", ")} (known: ${known.join(", ")}). Fix the typo, or set the "sections" input to limit processing`;
+}
 
 const PASSTHROUGH_ADVICE =
   "Fix these values in the settings file (only the named keys are validated; extra fields pass " +
@@ -404,7 +449,8 @@ export function describeProblem(problem: Problem): string {
       const values = problem.allowed.map((v) =>
         v === problem.fallback ? `"${v}" (default)` : `"${v}"`,
       );
-      return `the "${problem.input}" input is "${problem.value}", which is not a supported ${problem.noun}. Set it to ${values.join(", ")}`;
+      const unset = problem.fallback === null ? ", or leave it unset" : "";
+      return `the "${problem.input}" input is "${problem.value}", which is not a supported ${problem.noun}. Set it to ${values.join(", ")}${unset}`;
     }
     case "input-unknown-sections":
       return problem.unknown
@@ -517,10 +563,6 @@ export function describeProblem(problem: Problem): string {
       return `${problem.source} must be a YAML mapping of section names to settings, but its top level parsed as a ${problem.shape}. Rewrite the top level as "section: ..." keys`;
     case "settings-not-plain-mapping":
       return `${problem.source} must be a plain YAML mapping of section names to settings, but its top level parsed as another type (a YAML-tagged value like !!timestamp parses to a Date). Rewrite the top level as "section: ..." keys`;
-    case "settings-unknown-sections":
-      return `unknown top-level ${agree(problem.unknown.length, "section", "sections")} in ${problem.source}: ${problem.unknown.join(", ")} (known: ${problem.known.join(", ")}). Fix the typo, or set the "sections" input to limit processing`;
-    case "settings-unknown-directives":
-      return `unknown underscore ${agree(problem.unknown.length, "key", "keys")} in ${problem.source}: ${problem.unknown.join(", ")}. ${DIRECTIVES_ADVICE}`;
     case "settings-malformed-sections":
       return `${problem.source} has malformed section entries: ${problem.issues.join("; ")}. ${PASSTHROUGH_ADVICE}`;
     case "yaml-invalid":
@@ -534,9 +576,15 @@ export function describeProblem(problem: Problem): string {
     case "layer-bad-directive":
       return `${layerSite(problem)} must be one of ${problem.allowed.map(quote).join(", ")}; got ${describeShape(problem.actual)}${typeof problem.actual === "string" ? " that is none of them" : ""}`;
     case "layer-no-key":
-      return `${layerSite(problem)} carries no ${problem.keyKind ?? "string"} ${quote(problem.keyField)}, which every entry needs to layer by`;
+      return `${layerSite(problem)} carries no ${problem.keyKind ?? "string"} ${quote(problem.keyField)}${problem.alongside === undefined ? "" : ` paired with its ${quoteList(problem.alongside)}`}, which every entry needs to layer by`;
     case "layer-duplicate-key":
       return `${layerSite(problem)}[${problem.first}] and ${problem.site}[${problem.second}] both claim one ${problem.keyField}; each ${problem.keyField} belongs to one entry within a layer`;
+    case "layer-remove-not-true":
+      return `${layerSite(problem)} takes only true; got ${describeShape(problem.actual)}. Write _remove: true to drop the lower entry, or remove the key to keep it`;
+    case "layer-remove-with-fields":
+      return `${layerSite(problem)} carries _remove: true beside ${quoteList(problem.extra)}; a removal names its ${andList(problem.keyPaths)} and nothing else. Drop the ${agree(problem.extra.length, "field", "fields")}, or the marker`;
+    case "layer-remove-nothing":
+      return `${layerSite(problem)} carries _remove: true, but ${describeNothingToRemove(problem.reason)}. Remove the entry, or fix its key`;
     case "rendered-file-is-layer":
       return (
         `the "rendered-file" input "${problem.renderedFile}" is layer ${problem.index + 1} of the ` +
@@ -588,4 +636,15 @@ export function describeProblem(problem: Problem): string {
 /** The `layer "<name>": <site>` prefix every layer refusal opens with. */
 function layerSite(problem: LayerProblem): string {
   return `layer ${quote(problem.layer)}: ${problem.site}`;
+}
+
+function describeNothingToRemove(reason: "replace" | "swapped" | "unmatched"): string {
+  switch (reason) {
+    case "replace":
+      return "under _layering: replace the higher list already wins, so there is nothing to remove";
+    case "swapped":
+      return "its entry is copied whole (a new key, or a same-key swap under shallow), so its nested lists meet nothing to remove";
+    case "unmatched":
+      return "no lower layer declares an entry under its key";
+  }
 }

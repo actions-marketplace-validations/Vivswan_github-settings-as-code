@@ -3,7 +3,9 @@ import { planContext } from "../../../src/sections/contract/plan.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
+import type { SectionInput } from "../contract/module.js";
 import { autolinksSection } from "./index.js";
 import { autolinksMockHandlers } from "./mock.js";
 
@@ -15,8 +17,13 @@ const liveAutolinks = [
 ];
 const KEEP_NOTE =
   'autolink "OLD-" exists on the repo but is not declared in the settings file; kept under "_undeclared: keep" - add it to the settings file to manage it, or set "_undeclared: delete" to have apply DELETE it';
-const plan = (api: MockApi, desired: Parameters<typeof autolinksSection.plan>[1]) =>
-  autolinksSection.plan(planContext(autolinksSection, api, REPO), desired);
+const plan = async (api: MockApi, desired: SectionInput<"autolinks">) =>
+  unwrap(
+    await autolinksSection.plan(
+      planContext(autolinksSection, api, REPO),
+      validatedInput("autolinks", desired),
+    ),
+  );
 
 describe("autolinks", () => {
   test("plans a delete-and-recreate for a changed autolink, a create for a missing one, and a delete for the undeclared one, reading once", async () => {
@@ -27,6 +34,15 @@ describe("autolinks", () => {
     ]);
     expect(result).toEqual({
       ops: [
+        {
+          role: "remove",
+          params: { autolink_id: "2" },
+          describe: 'deleting undeclared autolink "OLD-"',
+          drift: [
+            "autolinks[OLD-]: undeclared - not in the settings file, so apply will DELETE it; add it to the settings file to keep it",
+          ],
+          change: 'DELETED undeclared autolink "OLD-"',
+        },
         {
           role: "remove",
           params: { autolink_id: "1" },
@@ -58,15 +74,6 @@ describe("autolinks", () => {
             "autolinks[NEW-]: missing - declared in the settings file but not on the repo; apply will create it",
           ],
           change: 'created autolink "NEW-"',
-        },
-        {
-          role: "remove",
-          params: { autolink_id: "2" },
-          describe: 'deleting undeclared autolink "OLD-"',
-          drift: [
-            "autolinks[OLD-]: undeclared - not in the settings file, so apply will DELETE it; add it to the settings file to keep it",
-          ],
-          change: 'DELETED undeclared autolink "OLD-"',
         },
       ],
       notes: [],
@@ -116,14 +123,7 @@ describe("autolinks", () => {
     ]);
   });
 
-  test.each<
-    [
-      form: string,
-      declared: Parameters<typeof autolinksSection.plan>[1],
-      roles: string[],
-      notes: string[],
-    ]
-  >([
+  test.each<[form: string, declared: SectionInput<"autolinks">, roles: string[], notes: string[]]>([
     [
       "wrapped _undeclared:keep",
       {
@@ -156,33 +156,38 @@ describe("autolinks", () => {
     },
   );
 
-  test("duplicate prefixes inside the wrapper are rejected before any API call", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, {
+  test("duplicate prefixes inside the wrapper are a validate issue under .entries, so the document fails before any API call", () => {
+    expect(
+      autolinksSection.validate({
         entries: [
           { key_prefix: "JIRA-", url_template: "https://x.test/<num>" },
           { key_prefix: "JIRA-", url_template: "https://y.test/<num>" },
         ],
       }),
-    ).rejects.toThrow(/same autolinks entry/);
-    expect(api.calls).toHaveLength(0);
+    ).toEqual([
+      {
+        path: ".entries[1].key_prefix",
+        message:
+          '"JIRA-" names the same autolink as "JIRA-" declared earlier; keep exactly one entry per autolink',
+      },
+    ]);
   });
 
-  test("a prefix that begins another prefix is refused as a pair before any API call: GitHub rejects the second create, which would half-apply the run", async () => {
-    const api = new MockApi({});
-    await expect(
-      plan(api, [
+  test("a prefix that begins another prefix is refused as a pair before any API call: GitHub rejects the second create, which would half-apply the run", () => {
+    expect(
+      autolinksSection.validate([
         { key_prefix: "TICKET-A", url_template: "https://a.test/<num>" },
         { key_prefix: "JIRA-", url_template: "https://j.test/<num>" },
         { key_prefix: "TICKET-", url_template: "https://t.test/<num>" },
       ]),
-    ).rejects.toThrow(
-      'autolinks: the settings file declares conflicting autolinks: the key_prefix "TICKET-" begins the key_prefix "TICKET-A", ' +
-        "and GitHub rejects an autolink whose prefix begins or extends another, so the second create would fail - " +
-        "choose prefixes where neither begins the other. Fix the settings file, then re-run",
-    );
-    expect(api.calls).toHaveLength(0);
+    ).toEqual([
+      {
+        path: "[2].key_prefix",
+        message:
+          'the key_prefix "TICKET-" begins the key_prefix "TICKET-A", and GitHub rejects an autolink whose prefix begins or extends another, ' +
+          "so the second create would fail - choose prefixes where neither begins the other",
+      },
+    ]);
   });
 
   test.each<[entry: Record<string, unknown>, issues: [path: string, message: string][]]>([
@@ -254,15 +259,15 @@ describe("autolinks", () => {
       },
     ]);
     expect(changes).toEqual([
+      'DELETED undeclared autolink "JIRA-"',
       'deleted autolink "TICKET-" to recreate it with the declared settings',
       'recreated autolink "TICKET-"',
-      'DELETED undeclared autolink "JIRA-"',
     ]);
     expect(notes).toEqual([]);
     expect(api.writes).toEqual([
+      "DELETE /repos/o/r/autolinks/20",
       "DELETE /repos/o/r/autolinks/10",
       "POST /repos/o/r/autolinks",
-      "DELETE /repos/o/r/autolinks/20",
     ]);
     expect(second).toEqual({ ops: [], notes: [], drift: [] });
     expect(

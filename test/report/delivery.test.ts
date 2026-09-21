@@ -23,6 +23,7 @@ import {
 } from "../../src/report/delivery.js";
 import { MARKER_LABEL_CONFIG } from "../../src/report/issue-report.js";
 import type { SettingsFile } from "../../src/schema.js";
+import type { LabelConfig } from "../../src/sections/labels/schema.js";
 import { captureIo } from "../io/capture.js";
 import { MockApi } from "../mock-api.js";
 
@@ -243,6 +244,7 @@ describe("the artifact channel", () => {
     const uploader: ArtifactUploader = {
       async upload(name, file) {
         uploads.push({ name, file });
+        return { uploaded: true as const };
       },
     };
     const decrypt = async (data: Uint8Array): Promise<string> => {
@@ -324,8 +326,13 @@ describe("applyMarkerInjection", () => {
     /^refused to rename the "settings-as-code-report" marker label/,
   );
 
+  // The validator resolves a bare list to its wrapper with the section default, so the injection meets the wrapper form.
+  const resolved = (entries: LabelConfig[]): SettingsFile["labels"] => ({
+    _undeclared: "delete",
+    entries,
+  });
   test.each<[string, SettingsFile, boolean, SettingsFile["labels"], unknown]>([
-    ["off: untouched, no notice", { labels: [bug] }, false, [bug], undefined],
+    ["off: untouched, no notice", { labels: [bug] }, false, resolved([bug]), undefined],
     [
       "on, no labels section: nothing to inject",
       { repository: { has_wiki: false } },
@@ -337,28 +344,28 @@ describe("applyMarkerInjection", () => {
       "on, marker absent: appended with a notice",
       { labels: [bug] },
       true,
-      [bug, MARKER_LABEL_CONFIG],
+      resolved([bug, MARKER_LABEL_CONFIG]),
       INJECTED,
     ],
     [
       "on, marker declared: no duplicate, no notice",
       { labels: [marker] },
       true,
-      [marker],
+      resolved([marker]),
       undefined,
     ],
     [
       "on, marker renamed away: the rename is dropped with its own notice",
       { labels: [{ ...marker, new_name: "something-else" }] },
       true,
-      [{ ...marker, new_name: undefined }],
+      resolved([{ ...marker, new_name: undefined }]),
       REFUSED,
     ],
   ])("%s", (_name, doc, on, labels, notice) => {
     const settings = validated(doc);
     const result = applyMarkerInjection(settings, on);
     expect<unknown>(result.notice).toEqual(notice);
-    expect(result.settings.labels).toEqual(labels);
+    expect<unknown>(result.settings.labels).toEqual(labels);
     expect(result.settings.repository).toEqual(settings.repository);
   });
 });

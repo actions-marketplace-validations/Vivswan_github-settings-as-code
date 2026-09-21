@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { GitHubClient } from "../../../src/github/api.js";
-import type { SectionModule } from "../../../src/sections/contract/module.js";
+import type { SectionInput, SectionModule } from "../../../src/sections/contract/module.js";
 import { planContext, type SectionPlan } from "../../../src/sections/contract/plan.js";
 import { sectionModule } from "../../../src/sections/registry.js";
 import { MockApi } from "../../../test/mock-api.js";
 import { fragmentFake } from "../../../test/sections/fragment-fake.js";
 import { provePlanIdempotent } from "../../../test/sections/plan-idempotence.js";
-import { REPO } from "../../../test/sections/section-run.js";
+import { REPO, unwrap } from "../../../test/sections/section-run.js";
+import { validatedInput } from "../../../test/sections/validated-input.js";
 import { customPropertiesSection, normalizeValue } from "./index.js";
 import { customPropertiesMockHandlers } from "./mock.js";
 
@@ -22,12 +23,14 @@ function orgRoutes(values: Array<{ property_name: string; value: unknown }>) {
   };
 }
 
-const plan = (api: MockApi, desired: Parameters<typeof customPropertiesSection.plan>[1]) =>
-  gated.plan(planContext(gated, api, REPO), desired);
+const plan = async (api: MockApi, desired: SectionInput<"custom_properties">) =>
+  unwrap(
+    await gated.plan(planContext(gated, api, REPO), validatedInput("custom_properties", desired)),
+  );
 
 /** The lines an op's change renders; the section builds them at plan time, so no response is needed. */
 function changeLines(op: SectionPlan["ops"][number]): readonly string[] {
-  return typeof op.change === "function" ? [op.change(null)].flat() : [op.change];
+  return typeof op.change === "function" ? [unwrap(op.change(null))].flat() : [op.change];
 }
 
 /**
@@ -174,11 +177,11 @@ describe("custom_properties", () => {
     });
   });
 
-  test.each<[form: string, declared: Parameters<typeof plan>[1], error: RegExp]>([
+  test.each<[form: string, declared: Parameters<typeof plan>[1], issue: RegExp]>([
     [
       "a multi_select listing one option twice",
       [{ property_name: "compliance", value: ["soc2", "hipaa", "soc2"] }],
-      /"compliance" entry lists the value "soc2" more than once/,
+      /^\[0\]\.value: the "compliance" entry lists the value "soc2" more than once/,
     ],
     [
       "the same, in the wrapped form",
@@ -186,12 +189,12 @@ describe("custom_properties", () => {
         _undeclared: "delete",
         entries: [{ property_name: "compliance", value: ["soc2", "soc2"] }],
       },
-      /"compliance" entry lists the value "soc2" more than once/,
+      /^\.entries\[0\]\.value: the "compliance" entry lists the value "soc2" more than once/,
     ],
     [
       "an empty list",
       [{ property_name: "compliance", value: [] }],
-      /"compliance" entry declares an empty list; declare value: null/,
+      /^\[0\]\.value: the "compliance" entry declares an empty list; declare value: null/,
     ],
     [
       "two entries naming one property",
@@ -199,13 +202,18 @@ describe("custom_properties", () => {
         { property_name: "team", value: "a" },
         { property_name: "team", value: "b" },
       ],
-      /same custom_properties entry/,
+      /^\[1\]\.property_name: "team" names the same custom property as "team" declared earlier/,
     ],
-  ])("%s is rejected after the owner probe alone", async (_form, declared, error) => {
-    const api = new MockApi({ "GET /orgs/o": { data: { login: "o" } } });
-    await expect(plan(api, declared)).rejects.toThrow(error);
-    expect(api.calls.map((c) => `${c.method} ${c.path}`)).toEqual(["GET /orgs/o"]);
-  });
+  ])(
+    "%s is one validate issue at the offending field, so the document fails before the owner probe",
+    (_form, declared, issue) => {
+      expect(
+        customPropertiesSection
+          .validate(declared)
+          .map((found) => `${found.path}: ${found.message}`),
+      ).toEqual([expect.stringMatching(issue)]);
+    },
+  );
 
   test("a live entry without a string property_name fails loudly as a contract violation", async () => {
     const api = new MockApi(orgRoutes([{ value: "x" } as never]));
