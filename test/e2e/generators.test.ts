@@ -877,6 +877,7 @@ describe("seed determinism (byte-equal JSON)", () => {
     { name: "genScenario", draw: () => genScenario(new Rng(42)) },
     { name: "genMultiScenario", draw: () => genMultiScenario(new Rng(9)).scenario },
     { name: "genDiscoveryScenario", draw: () => genDiscoveryScenario(new Rng(31)).scenario },
+    { name: "genMergeScenario", draw: () => genMergeScenario(new Rng(77)) },
   ];
   test.each(cases)("$name is deterministic for a seed", ({ draw }) => {
     expect(JSON.stringify(draw())).toBe(JSON.stringify(draw()));
@@ -1122,6 +1123,7 @@ describe("genMergeScenario", () => {
     expect(MERGE_REFUSAL_KINDS.filter((kind) => !refusals.has(kind))).toEqual([]);
   });
 
+  // 720 forced generator runs, each probing the validator per layer: ~1.4 s alone, near bun's 5 s default on a loaded runner.
   test("forces construct their eligibility: a pinned run layering, or the named refusal", () => {
     for (let seed = 0; seed < 60; seed++) {
       for (const layering of LAYERING_DIRECTIVES) {
@@ -1142,7 +1144,7 @@ describe("genMergeScenario", () => {
         expect(predictMerge(meta)).toEqual({ kind: "refused", layer: meta.refusal.layer });
       }
     }
-  });
+  }, 20_000);
 
   test("honors the sections option", () => {
     const pool: SectionKey[] = ["labels", "rulesets", "milestones", "pages"];
@@ -1157,11 +1159,6 @@ describe("genMergeScenario", () => {
         }
       }
     }
-  });
-
-  test("is deterministic for a seed", () => {
-    const draw = () => JSON.stringify(genMergeScenario(new Rng(77)));
-    expect(draw()).toBe(draw());
   });
 });
 
@@ -1222,21 +1219,24 @@ describe("standaloneViewOf (the harness's per-layer view)", () => {
 describe("mergeFeaturesOf (the axes read off a finished stack)", () => {
   // The feature read pairs a layer's labels with the held ones the way the fold does: through every claim, the rename
   // target included, and only against what the fold still holds. The controls are stacks the pairing must NOT see.
+  // A higher null is the section's or the key's value, so the section stays held and a later declaration over it is an
+  // override.
+  const site = { build_type: "workflow", source: { branch: "main", path: "/" } };
   const cases: Array<[string, Record<string, unknown>[], string[]]> = [
     [
       "a higher label naming a held rename target pairs through the alias",
       [{ labels: [{ name: "a", new_name: "b" }] }, { labels: [{ name: "b" }] }],
-      ["union-labels", "label-rename-union"],
+      ["override", "union-labels", "label-rename-union"],
     ],
     [
       "the alias pairing folds case too",
       [{ labels: [{ name: "a", new_name: "b" }] }, { labels: [{ name: "B" }] }],
-      ["union-labels", "label-case-fold", "label-rename-union"],
+      ["override", "union-labels", "label-case-fold", "label-rename-union"],
     ],
     [
       "a higher rename claiming a held name pairs through its current name",
       [{ labels: [{ name: "a" }] }, { labels: [{ name: "a", new_name: "z" }] }],
-      ["union-labels", "label-rename-union"],
+      ["override", "union-labels", "label-rename-union"],
     ],
     [
       "a superseded label is not held: a later layer naming it pairs with nothing",
@@ -1245,27 +1245,27 @@ describe("mergeFeaturesOf (the axes read off a finished stack)", () => {
         { labels: [{ name: "b" }] },
         { labels: [{ name: "A" }] },
       ],
-      ["union-labels", "label-rename-union"],
+      ["override", "union-labels", "label-rename-union"],
     ],
     [
       "a higher rename claiming two held labels reads its case fold off the second one too",
       [{ labels: [{ name: "a" }, { name: "b" }] }, { labels: [{ name: "B", new_name: "a" }] }],
-      ["union-labels", "label-case-fold", "label-rename-union"],
+      ["override", "union-labels", "label-case-fold", "label-rename-union"],
     ],
     [
       "the same pairing read in the other held order",
       [{ labels: [{ name: "b" }, { name: "a" }] }, { labels: [{ name: "B", new_name: "a" }] }],
-      ["union-labels", "label-case-fold", "label-rename-union"],
+      ["override", "union-labels", "label-case-fold", "label-rename-union"],
     ],
     [
       "control: disjoint names pair with nothing",
       [{ labels: [{ name: "a" }] }, { labels: [{ name: "b" }] }],
-      ["union-labels"],
+      ["override", "union-labels"],
     ],
     [
       "control: a same-name pairing without a rename is not a rename union",
       [{ labels: [{ name: "a" }] }, { labels: [{ name: "A" }] }],
-      ["union-labels", "label-case-fold"],
+      ["override", "union-labels", "label-case-fold"],
     ],
     [
       "control: under replace nothing is held to pair with",
@@ -1273,26 +1273,8 @@ describe("mergeFeaturesOf (the axes read off a finished stack)", () => {
         { labels: [{ name: "a", new_name: "b" }] },
         { labels: { _layering: "replace", entries: [{ name: "b" }] } },
       ],
-      ["wrapper-layering-replace"],
+      ["override", "wrapper-layering-replace"],
     ],
-  ];
-  test.each(cases)("%s", (_name, docs, expected) => {
-    const layers = docs.map((doc, i) => ({
-      name: i === docs.length - 1 ? "settings.yml" : `layer-${i}.yml`,
-      doc,
-    }));
-    const always: string[] = ["override", "run-layering-deep", "run-undeclared-default"];
-    expect(mergeFeaturesOf(layers, "deep", false)).toEqual(
-      MERGE_FEATURES.filter((feature) => always.includes(feature) || expected.includes(feature)),
-    );
-  });
-});
-
-describe("mergeFeaturesOf (nulls and removals read the way the fold writes them)", () => {
-  // A higher null is the section's or the key's value, so the section stays held and a later declaration over it is an
-  // override; a removal is its own axis, at the top level and inside a deep-merged ruleset.
-  const site = { build_type: "workflow", source: { branch: "main", path: "/" } };
-  const cases: Array<[string, Record<string, unknown>[], string[]]> = [
     [
       "a null over a held pages declaration is the section's value",
       [{ pages: site }, { pages: null }],
@@ -1313,13 +1295,9 @@ describe("mergeFeaturesOf (nulls and removals read the way the fold writes them)
       name: i === docs.length - 1 ? "settings.yml" : `layer-${i}.yml`,
       doc,
     }));
+    const always: string[] = ["run-layering-deep", "run-undeclared-default"];
     expect(mergeFeaturesOf(layers, "deep", false)).toEqual(
-      MERGE_FEATURES.filter(
-        (feature) =>
-          feature === "run-layering-deep" ||
-          feature === "run-undeclared-default" ||
-          expected.includes(feature),
-      ),
+      MERGE_FEATURES.filter((feature) => always.includes(feature) || expected.includes(feature)),
     );
   });
 });
