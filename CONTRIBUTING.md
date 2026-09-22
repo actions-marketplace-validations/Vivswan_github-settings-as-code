@@ -5,7 +5,7 @@ The fleet-wide conventions - Conventional Commit titles, squash merges, the `all
 ## Toolchain
 
 - `src/` is TypeScript built with [bun](https://bun.com). The scripts in `package.json` are the commands; `bun run check` is the whole local gate.
-- `bun run test`, `bun run test:e2e`, and `bun run fuzz` start with `bun run test:artifacts`, which fetches the two gitignored test artifacts (the trimmed OpenAPI spec, the GraphQL schema) when one is absent or was fetched from a URL other than the one its script builds (the pinned ref, and the API version for the spec). A fresh checkout fetches once (a few seconds); a current file costs no network. CI restores the same files from cache and then runs the same command.
+- GitHub's OpenAPI descriptor and GraphQL schema come from the `@octokit/openapi` and `@octokit/graphql-schema` devDependencies, so no test or generator touches the network. Dependabot moves the pins; a bump that stops documenting a path the action calls, starts documenting an upstream gap, or retires a field a query selects fails the schema tests on that PR by name.
 - Committed generated output is the table in `.github/scripts/generated.ts`: `lib/settings.schema.json`, `src/upstream-gaps/index.ts`, and the generated regions of `action.yml` and the docs pages.
 - `bun run build:check` regenerates every table entry and fails on drift.
 - `lib/index.js` (the action bundle) and `lib/pkg/` (the npm library) are built where they are needed and never committed on `main`. Every runtime dependency is compiled into them.
@@ -39,7 +39,7 @@ The end-to-end tests build the bundle to a temp path and run it as a subprocess 
 - Every section ships the standard scenario set under `test/sections/<key>/scenarios/`, named after the section's dashed key: `<slug>-apply-converges`, `<slug>-check-drift` (a section with a planning read), `<slug>-snapshot-roundtrip` (a section with snapshot()), and for a section under the undeclared policy `<slug>-undeclared-delete` and `<slug>-undeclared-keep-note`; `test/sections/scenario-set.test.ts` derives the set from the registry.
 - `bun run fuzz` runs seeded property fuzzing: random scenarios, each checked against an oracle that predicts the outcome class from the token mask, policy, and mode.
 - The mock serves the section endpoints plus the core routes the action calls outside the sections. A request that matches no registered route fails loudly; the mock never invents a response.
-- PR CI runs the sections a pull request changed. The nightly workflow's `e2e` job runs the full corpus and files a red night under the `nightly-failure` issue; the fuzz nightly runs the full fuzz and files under `fuzz-nightly` with a replay command.
+- PR CI runs the full scenario corpus, the endpoint-coverage tripwire, and 25 fuzz iterations on every pull request. The nightly workflow's `e2e` job runs the full corpus and files a red night under the `nightly-failure` issue; the fuzz nightly runs the full fuzz and files under `fuzz-nightly` with a replay command.
 
 The fuzzer is deterministic. It prints a master seed and a per-iteration seed:
 
